@@ -1,0 +1,13 @@
+[package]
+name = "scx_crfuzz_gen"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone strace-based scenario config generator for scx_crfuzz."
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+scx_crfuzz = { path = "../scx_crfuzz" }
+tempfile = "3"
+thiserror = "2"
