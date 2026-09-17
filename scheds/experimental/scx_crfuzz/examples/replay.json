@@ -1,0 +1,20 @@
+{
+  "scenario_id": "runc-exec-pathswap",
+  "cgroup": "/sys/fs/cgroup/crfuzz",
+  "roles": [
+    { "id": "victim", "comm": "runc" },
+    { "id": "racer", "comm": "racer", "cardinality": "pool" }
+  ],
+  "checkpoints": [
+    { "id": "lstat", "kind": "syscall", "target": "lstat", "category": "resolving" },
+    { "id": "symlink", "kind": "syscall", "target": "symlink", "category": "mutating" },
+    { "id": "mount", "kind": "syscall", "target": "mount", "category": "mutating" }
+  ],
+  "on_divergence": "abort",
+  "steps": [
+    { "role": "victim", "until": "lstat" },
+    { "role": "racer#0", "until": "symlink" },
+    { "role": "victim", "until": "mount" },
+    { "role": "victim", "until": "exit" }
+  ]
+}

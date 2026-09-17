@@ -1,0 +1,10 @@
+{
+  "scenario_id": "toctou-rename-swap",
+  "cgroup": "/crfuzz",
+  "roles": [
+    { "id": "victim", "comm": "victim" },
+    { "id": "racer", "comm": "racer" }
+  ],
+  "on_divergence": "block",
+  "policy": { "type": "random_walk", "seed": 1 }
+}

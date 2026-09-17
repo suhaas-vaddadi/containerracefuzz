@@ -1,0 +1,25 @@
+libbpf/
+*.gitignore
+PKGBUILD
+target
+build/
+*.swp
+.cache/
+.vscode/
+tags
+*.o
+*.skel.h
+selftest
+selftest_noasan
+lib/selftests/compat/test_enum64_recovery
+CLAUDE.md
+**/.claude
+**/*.ll
+**/*.s
+**/*.tmp
+.agent/
+.agents/
+
+# Guest-side build dir, so a macOS host cargo run and a Linux guest cargo run
+# sharing this checkout over a VM mount do not clobber each other's artifacts.
+/target-linux
