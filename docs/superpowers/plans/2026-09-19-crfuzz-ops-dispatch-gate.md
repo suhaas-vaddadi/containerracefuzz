@@ -254,11 +254,19 @@ EOF
 
 ---
 
-### Task 2: The kick mechanism — VERIFY FIRST, this can force a redesign
+### Task 2: The kick mechanism
 
 Gating only affects a task at its next `ops.enqueue`. A sibling already running on a CPU keeps running until something preempts it. `scx_bpf_kick_cpu` is a BPF-side kfunc, so userspace needs a `SEC("syscall")` program to call it (`rs_select_cpu` in `rust/scx_rustland_core/assets/bpf/main.bpf.c:637` is the in-tree precedent for calling scx kfuncs from a syscall program, invoked via `prog.test_run`).
 
-**This task exists because it is not certain `scx_bpf_kick_cpu` is callable from `BPF_PROG_TYPE_SYSCALL`.** If the verifier rejects it, take the fallback in Step 5 and **amend the spec's boundary claim** before continuing — the fallback has a materially different window.
+**Pre-verified on this kernel (2026-09-19), so Step 5's fallback should not be needed.** A standalone `SEC("syscall")` program calling `scx_bpf_kick_cpu(0, SCX_KICK_PREEMPT)` loads clean on the Lima `sched-ext` VM (kernel 6.19, aarch64):
+
+```
+660: syscall  name kick_from_syscall  tag 16e223eec1d13ee9  gpl
+```
+
+That is a real result rather than an absent error: the identical kfunc call from a `SEC("xdp")` program is rejected with `calling kernel function scx_bpf_kick_cpu is not allowed` / `-EACCES`, so the verifier does enforce the prog-type allowlist for this kfunc.
+
+What remains unverified is *runtime* behaviour with a scheduler attached, which is what Step 3 checks. Keep Step 5 as the contingency.
 
 **Files:**
 - Modify: `scheds/experimental/scx_crfuzz_gate/src/bpf/main.bpf.c`
