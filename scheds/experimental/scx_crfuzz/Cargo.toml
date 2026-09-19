@@ -16,6 +16,9 @@ serde_json = "1"
 simplelog = "0.12"
 thiserror = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
 # Linux-only. The engine, policies, role algebra and log are pure Rust and
 # test on any host; only the backend that actually holds a process needs a
 # kernel. Keeping these behind a target cfg is what preserves that.

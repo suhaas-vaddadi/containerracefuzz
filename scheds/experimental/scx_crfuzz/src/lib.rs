@@ -47,6 +47,15 @@
 //! `ops.dispatch` half of the base design is what closes the gap. Until that
 //! exists, treat results against multi-threaded targets as unsound.
 //!
+//! [`backend_freezer::FreezerBackend`] is a proof of concept that closes the
+//! *measurable* part of that gap with the cgroup v2 freezer:
+//! `tests/thread_group_holding.rs` shows a sibling thread writing ~255 bytes
+//! during a 300 ms hold under seccomp alone and zero under the freezer. It is
+//! explicitly not the answer -- freezing interrupts the held task's
+//! notification and restarts its syscall, so the instrument perturbs what it
+//! measures. See that module's header and the crate README's `ops.dispatch`
+//! TODO.
+//!
 //! ## Seams
 //!
 //! Components the design doc specifies but that are deliberately not in this
@@ -147,6 +156,14 @@
 //! fix, with the reasoning that motivates it, not as a doc amendment.
 
 pub mod backend;
+/// The cgroup v2 freezer decorator -- a proof of concept that extends a
+/// per-thread hold to a whole thread group.
+///
+/// Linux-only. Not the intended mechanism: see the module header and the
+/// `ops.dispatch` TODO in the crate README for why its asynchronous boundary
+/// makes it a measuring stick rather than an answer.
+#[cfg(target_os = "linux")]
+pub mod backend_freezer;
 /// The seccomp user-notification backend -- the one that holds real processes.
 ///
 /// Linux-only, and deliberately so: keeping it behind a target cfg is what

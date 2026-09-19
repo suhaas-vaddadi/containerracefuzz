@@ -1,0 +1,14 @@
+{
+  "scenario_id": "runc-create",
+  "cgroup": "/crfuzz",
+  "roles": [
+    { "id": "runc", "comm": "runc", "comm_match": "substring", "cardinality": "pool" }
+  ],
+  "checkpoints": [
+    { "id": "mount",      "kind": "syscall", "target": "mount",      "category": "mutating" },
+    { "id": "symlinkat",  "kind": "syscall", "target": "symlinkat",  "category": "mutating" },
+    { "id": "readlinkat", "kind": "syscall", "target": "readlinkat", "category": "resolving" }
+  ],
+  "on_divergence": "block",
+  "policy": { "type": "ordered_walk", "seed": 1 }
+}

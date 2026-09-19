@@ -5,7 +5,7 @@
 # two syscalls.
 CFLAGS ?= -O0 -g -Wall -Wextra -static
 
-all: victim racer
+all: victim racer threaded_victim go_victim
 
 victim: victim.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -13,7 +13,17 @@ victim: victim.c
 racer: racer.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# -pthread: the sibling thread is the entire point of this fixture.
+threaded_victim: threaded_victim.c
+	$(CC) $(CFLAGS) -pthread -o $@ $<
+
+# CGO_ENABLED=0: a cgo binary drags in the dynamic loader, whose own
+# path-touching syscalls before main() are all structural checkpoints. Static
+# keeps the trace down to the two syscalls the scenario is about.
+go_victim: go_victim.go
+	CGO_ENABLED=0 go build -o $@ $<
+
 clean:
-	rm -f victim racer
+	rm -f victim racer threaded_victim go_victim
 
 .PHONY: all clean

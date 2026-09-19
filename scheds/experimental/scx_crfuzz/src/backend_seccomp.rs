@@ -113,6 +113,18 @@ struct Listener {
     child: Pid,
     fd: OwnedFd,
     reaped: bool,
+    /// The child's exit status in shell convention -- its exit code, or
+    /// `128 + signo` if a signal killed it. `None` until it has been reaped.
+    ///
+    /// Kept because a wrapper standing in for the process it instruments has to
+    /// report *its* status, not the engine's verdict on the scheduling run.
+    exit_code: Option<i32>,
+    /// The child is gone but `waitpid` has not caught up yet. Its fd reports
+    /// POLLHUP, which is level-triggered and never clears, so leaving it in the
+    /// poll set turns every subsequent `poll` into a no-op that returns
+    /// immediately. See `poll` for why that is a correctness bug and not just a
+    /// busy-wait.
+    hung_up: bool,
 }
 
 /// Holds real processes at real syscalls via `SECCOMP_RET_USER_NOTIF`.
@@ -136,6 +148,19 @@ pub struct SeccompNotifyBackend {
     /// pids already announced via `TaskAppeared`.
     announced: Vec<Pid>,
     poll_timeout: Duration,
+    /// Place each `--spawn` in its own `<cgroup>/spawn<i>` subdirectory rather
+    /// than all of them in `cgroup` directly.
+    ///
+    /// Off by default, so the cgroup layout of an ordinary run is unchanged.
+    /// `backend_freezer::FreezerBackend` needs it on: the freezer acts on
+    /// whatever cgroup the held task is in, so with one shared cgroup the first
+    /// role to reach a checkpoint freezes every other role along with it --
+    /// measured, as a second role that then never reaches a checkpoint at all.
+    ///
+    /// Safe with role resolution because a role's cgroup matcher is a prefix
+    /// test (`role.rs`, `resolve_role`), so a task in `<cgroup>/spawn0` still
+    /// matches a role declaring `<cgroup>`.
+    per_spawn_cgroups: bool,
     /// Every notification, in the order it was received, as
     /// `<spawn index>:<checkpoint>`.
     ///
@@ -166,7 +191,23 @@ impl SeccompNotifyBackend {
             pending: HashMap::new(),
             announced: Vec::new(),
             poll_timeout: Duration::from_millis(50),
+            per_spawn_cgroups: false,
             arrival: Vec::new(),
+        }
+    }
+
+    pub fn with_per_spawn_cgroups(mut self, yes: bool) -> Self {
+        self.per_spawn_cgroups = yes;
+        self
+    }
+
+    /// The cgroup a given `--spawn` index is placed in, as it appears in
+    /// `/proc/<pid>/cgroup`.
+    pub fn spawn_cgroup(&self, idx: usize) -> String {
+        if self.per_spawn_cgroups {
+            format!("{}/spawn{idx}", self.cgroup.trim_end_matches('/'))
+        } else {
+            self.cgroup.clone()
         }
     }
 
@@ -246,7 +287,7 @@ impl SeccompNotifyBackend {
         unresolved
     }
 
-    fn spawn(&self, spec: &ProcessSpec) -> Result<Listener> {
+    fn spawn(&self, spec: &ProcessSpec, idx: usize) -> Result<Listener> {
         let (parent_sock, child_sock) = socketpair(
             AddressFamily::Unix,
             SockType::Stream,
@@ -257,7 +298,7 @@ impl SeccompNotifyBackend {
 
         let watched: Vec<i32> = self.watched.keys().copied().collect();
         let cgroup_procs = PathBuf::from(CGROUP_MOUNT)
-            .join(self.cgroup.trim_start_matches('/'))
+            .join(self.spawn_cgroup(idx).trim_start_matches('/'))
             .join("cgroup.procs");
 
         // SAFETY: the engine is single-threaded, and the child does a bounded
@@ -289,6 +330,8 @@ impl SeccompNotifyBackend {
                     child: child.as_raw(),
                     fd,
                     reaped: false,
+                    exit_code: None,
+                    hung_up: false,
                 })
             }
         }
@@ -297,11 +340,20 @@ impl SeccompNotifyBackend {
     /// Reap any child that has exited, newest state first.
     fn reap(&mut self, events: &mut Vec<BackendEvent>) {
         loop {
-            match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            let status = waitpid(None, Some(WaitPidFlag::WNOHANG));
+            match status {
                 Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
                     let raw = pid.as_raw();
+                    // Shell convention, so a wrapper can pass it straight to
+                    // `exit` and have a caller read it the usual way.
+                    let code = match status {
+                        Ok(WaitStatus::Exited(_, c)) => c,
+                        Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                        _ => unreachable!("outer match admitted only these two"),
+                    };
                     if let Some(i) = self.listeners.iter().position(|l| l.child == raw) {
                         self.listeners[i].reaped = true;
+                        self.listeners[i].exit_code = Some(code);
                         // An exit becomes a ready-set entry too (the engine
                         // turns it into a synthetic `exit` checkpoint), so
                         // section 14-A applies to exits exactly as it does to
@@ -322,6 +374,17 @@ impl SeccompNotifyBackend {
 
     fn live(&self) -> bool {
         self.listeners.iter().any(|l| !l.reaped)
+    }
+
+    /// The first spawn's exit status, in shell convention, once it has been
+    /// reaped.
+    ///
+    /// The *first* specifically: this exists for the wrapper case, where
+    /// `scx_crfuzz` stands in for a single binary and has to answer for it.
+    /// With several spawns there is no single status to report, and the caller
+    /// is expected not to ask -- `main` refuses the flag rather than picking.
+    pub fn child_exit_code(&self) -> Option<i32> {
+        self.listeners.first().and_then(|l| l.exit_code)
     }
 }
 
@@ -480,14 +543,15 @@ impl CheckpointBackend for SeccompNotifyBackend {
             self.cgroup
         );
 
-        std::fs::create_dir_all(
-            PathBuf::from(CGROUP_MOUNT).join(self.cgroup.trim_start_matches('/')),
-        )
-        .with_context(|| format!("creating cgroup {}", self.cgroup))?;
+        for idx in 0..self.specs.len() {
+            let cg = self.spawn_cgroup(idx);
+            std::fs::create_dir_all(PathBuf::from(CGROUP_MOUNT).join(cg.trim_start_matches('/')))
+                .with_context(|| format!("creating cgroup {cg}"))?;
+        }
 
-        for spec in self.specs.clone() {
+        for (idx, spec) in self.specs.clone().into_iter().enumerate() {
             let l = self
-                .spawn(&spec)
+                .spawn(&spec, idx)
                 .with_context(|| format!("spawning `{}`", spec.argv.join(" ")))?;
             log::debug!("spawned pid {} for `{}`", l.child, spec.argv.join(" "));
             self.listeners.push(l);
@@ -505,7 +569,7 @@ impl CheckpointBackend for SeccompNotifyBackend {
             .listeners
             .iter()
             .enumerate()
-            .filter(|(_, l)| !l.reaped)
+            .filter(|(_, l)| !l.reaped && !l.hung_up)
             .map(|(i, l)| (i, l.fd.as_raw_fd()))
             .collect();
 
@@ -529,10 +593,15 @@ impl CheckpointBackend for SeccompNotifyBackend {
 
             if ready > 0 {
                 for (i, pfd) in pollfds.iter().enumerate() {
-                    if !pfd
-                        .revents()
-                        .is_some_and(|r| r.contains(nix::poll::PollFlags::POLLIN))
-                    {
+                    let revents = pfd.revents().unwrap_or(nix::poll::PollFlags::empty());
+                    if !revents.contains(nix::poll::PollFlags::POLLIN) {
+                        // No notification, and the writer is gone: nothing will
+                        // ever arrive on this fd again. Retire it from the poll
+                        // set so the exit can be reaped at leisure instead of
+                        // being raced by a spin.
+                        if revents.contains(nix::poll::PollFlags::POLLHUP) {
+                            self.listeners[fds[i].0].hung_up = true;
+                        }
                         continue;
                     }
                     let (spawn_idx, fd) = fds[i];
@@ -574,6 +643,14 @@ impl CheckpointBackend for SeccompNotifyBackend {
                     });
                 }
             }
+        } else if self.live() {
+            // Every live child has hung up but none has been reaped yet. There
+            // is nothing to wait *on*, and returning straight away would spend
+            // the engine's whole idle budget in microseconds -- so wait anyway,
+            // for as long as the poll would have. An idle poll has to cost real
+            // time, because the engine's stall detector counts polls and has
+            // nothing else with which to measure a stall.
+            std::thread::sleep(self.poll_timeout);
         }
 
         if !events.is_empty() {

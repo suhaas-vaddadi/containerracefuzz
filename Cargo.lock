@@ -5961,6 +5961,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simplelog",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

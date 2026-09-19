@@ -1,0 +1,15 @@
+{
+  "scenario_id": "toctou-rename-swap-go",
+  "cgroup": "/crfuzz",
+  "roles": [
+    { "id": "victim", "comm": "go_victim" },
+    { "id": "racer", "comm": "racer" }
+  ],
+  "checkpoints": [
+    { "id": "newfstatat", "kind": "syscall", "target": "newfstatat", "category": "resolving" },
+    { "id": "openat", "kind": "syscall", "target": "openat", "category": "mutating" },
+    { "id": "renameat", "kind": "syscall", "target": "renameat", "category": "mutating" }
+  ],
+  "on_divergence": "block",
+  "policy": { "type": "ordered_walk", "seed": 1 }
+}
