@@ -24,7 +24,8 @@ const PIN_DIR: &str = "/sys/fs/bpf/crfuzz";
 /// pinned program's fd gives us here (the daemon does not expose its
 /// skeleton to us). `Program::fd_from_pinned_path` hands back just the fd, so
 /// this calls the same libbpf function the safe wrapper calls, directly --
-/// the same workaround `rust/scx_arena` uses for the identical reason.
+/// the same workaround upstream scx's `rust/scx_arena` used for the identical
+/// reason (that crate is not part of this repository).
 fn test_run(fd: &OwnedFd, ctx_in: Option<&[u8]>) -> Result<u32> {
     let mut opts = libbpf_rs::libbpf_sys::bpf_test_run_opts::default();
     opts.sz = std::mem::size_of_val(&opts) as _;

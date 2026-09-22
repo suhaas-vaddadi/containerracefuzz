@@ -24,3 +24,6 @@ CLAUDE.md
 # Guest-side build dir, so a macOS host cargo run and a Linux guest cargo run
 # sharing this checkout over a VM mount do not clobber each other's artifacts.
 /target-linux
+
+# Thesis working documents: kept on disk, not tracked.
+docs/
