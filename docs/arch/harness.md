@@ -1,7 +1,7 @@
 # Harness
 
 Everything outside the engine: the CLI, the runc wrapper, the OCI preflight.
-`src/main.rs` (409), `src/oci_preflight.rs` (419), `scenarios/`.
+`src/main.rs` (442), `src/oci_preflight.rs` (419), `scenarios/`.
 
 These are placeholders for the harness the design doc specifies, which is why
 `--spawn` and `--cgroup-path` are not in §8's schema.

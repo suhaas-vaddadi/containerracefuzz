@@ -61,14 +61,17 @@ The mode is a property of the config, not a flag: a config carries either
 ## Current state
 
 **Working and measured:** the engine, the role algebra, all four policies, the
-canonical log and its projection; seccomp holding of real processes; the cgroup
-freezer extending a hold to a whole thread group; instrumentation of `runc`
-directly and of the `runc` that containerd's shim invokes; deterministic
-control of interleaving on an 11-thread Go target.
+canonical log and its projection; seccomp holding of real processes; both
+thread-group backends — the cgroup freezer and the `sched_ext` gate;
+instrumentation of `runc` directly and of the `runc` that containerd's shim
+invokes; deterministic control of interleaving on an 11-thread Go target.
 
-**Not built:** the `ops.dispatch` backend (the intended holding mechanism), the
-mutator, the oracle, the campaign driver. See [gaps.md](gaps.md).
+**Not built:** the mutator, the oracle, the campaign driver. See
+[gaps.md](gaps.md).
 
-**Soundness caveat, unchanged:** results against multi-threaded targets are not
-sound. The freezer makes the thread-group gap *measurable*, not closed — it
-perturbs the syscall it holds. See [backends.md](backends.md).
+**Soundness caveat, narrowed:** `--gate` holds a thread group without touching
+the held thread, so it does not restart the syscall it holds — the perturbation
+the freezer introduces is gone. What remains open is §14-A: run-to-run
+reproducibility against a multi-threaded target is still not guaranteed. The
+freezer stays as the baseline the gate is measured against. See
+[backends.md](backends.md).

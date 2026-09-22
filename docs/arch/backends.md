@@ -174,30 +174,26 @@ build, including threads a Go runtime raises later.
 
 Gating is a map lookup on the enqueue path; a sleeping task is off-CPU already
 and gets gated on its way back in; and nothing touches the syscall path, so
-there is no restart to correct for. It is also the only route to
-`uprobe`/`kprobe`/`lsm` checkpoints.
+there is no restart to correct for.
 
-The kick itself is one scheduling round, but that overstates the boundary: the
-userspace round trip *before* the kick — from the seccomp notification
-arriving to `map.gate()` being called — is not bounded by a scheduling round
-at all, and siblings run for the whole of it. Per commit `d61ad4ff`, the
-gate's measured latency and the freezer's measured latency are not comparable
-quantities, so the honest comparison states what each clock covers rather than
-contrasting them: `max_gate_latency` (`backend_gate.rs:141-147`) starts before
-`map.gate()` and stops after `map.kick()` — the cost to *issue* the hold, ~98-112
-µs over three runs. `max_freeze_latency` (`backend_freezer.rs:176-180`) starts
-after the `cgroup.freeze` write and stops when `wait_until_frozen` returns —
-the kernel *converging*, ~343-346 µs over three runs. Closing the gate's
-residual window to zero needs the gate written in-kernel, in the trapping
-task's own context, which is phase 2 of the design and not yet built.
+**The perturbation is gone**: no `ERESTARTSYS`, no fresh notification id, a
+`NotifyHandle` stable across the hold. `tests/handle_stability.rs` asserts
+this, and asserts the freezer's opposite behaviour alongside it, so the
+distinction cannot quietly stop being true.
 
-System-wide risk is smaller than it looks: `SCX_OPS_SWITCH_PARTIAL` schedules
-only tasks explicitly moved to `SCHED_EXT`, leaving the rest of the machine on
-CFS, and `ops.timeout_ms` (30000, the kernel's maximum) ejects a stuck
-scheduler — something the freezer had no equivalent of.
+**The boundary is sharper, not zero.** The kick is one scheduling round, but
+the userspace round trip before it — notification arriving until `map.gate()`
+is called — is not, and siblings run for the whole of it. Closing that to zero
+needs the gate written in-kernel in the trapping task's own context, which is
+phase 2 and not built. The two backends' latency counters measure disjoint
+intervals and are not a ratio; see
+[measurements.md](measurements.md#hold-latency).
 
-**`GateBackend` eliminates the freezer's syscall perturbation**: no
-`ERESTARTSYS`, no fresh notification id, a `NotifyHandle` stable across the
-hold (`tests/handle_stability.rs`). Section 14-A remains open — the gate stops
-the other threads in a group, it does not order their arrival — so run-to-run
-reproducibility against a multi-threaded target is still not guaranteed.
+System-wide risk is bounded: `SCX_OPS_SWITCH_PARTIAL` schedules only tasks
+explicitly moved to `SCHED_EXT`, and `ops.timeout_ms` (30000, the kernel
+maximum) ejects a stuck scheduler — something the freezer had no equivalent
+of.
+
+Section 14-A remains open: the gate stops the other threads in a group, it
+does not order their arrival, so run-to-run reproducibility against a
+multi-threaded target is still not guaranteed.

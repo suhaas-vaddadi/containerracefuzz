@@ -56,8 +56,9 @@ blast-radius note in [engine.md](engine.md).
 { "id": "openat", "kind": "syscall", "target": "openat", "category": "mutating" }
 ```
 
-`kind` is `syscall`, `uprobe`, `kprobe` or `lsm`. Only `syscall` has a backend;
-the rest need `ops.dispatch`.
+`kind` is `syscall`, `uprobe`, `kprobe` or `lsm`. Only `syscall` is implemented —
+it is the seccomp listener that traps. The other three need their own probe
+attachment and are unrelated to which backend holds the trapped task.
 
 ### The structural set
 

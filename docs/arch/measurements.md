@@ -12,25 +12,41 @@ Architecture matters — see the syscall-availability note below.
 | Target | Count |
 |---|---|
 | macOS host | **90** |
-| Linux VM as root | **112** |
+| Linux VM as root | **120** |
 
-Split on Linux: 78 lib unit, 11 binary unit (OCI preflight), 18 `engine_run`,
-3 `thread_group_holding`, 1 `exit_observation`, 1 `exit_status`. The last three
-files skip themselves unless run as root.
+Split on Linux: 81 lib unit, 11 binary unit (OCI preflight), 18 `engine_run`,
+5 `thread_group_holding`, 2 `handle_stability`, 1 `sched_ext_enrollment`,
+1 `exit_observation`, 1 `exit_status`. The five integration files skip
+themselves unless run as root; the gate rows additionally skip unless
+`scx_crfuzz_gated` is attached.
 
 ## Thread-group holding
 
 Sibling threads writing 1 byte/ms during a 300 ms hold:
 
-| Fixture | OS threads | seccomp alone | with `--freezer` |
-|---|---|---|---|
-| `threaded_victim.c` (pthreads) | 2 | 255 bytes | **0** |
-| `go_victim.go` (goroutines) | 11 | 920 bytes | **0** |
+| Fixture | OS threads | seccomp alone | with `--freezer` | with `--gate` |
+|---|---|---|---|---|
+| `threaded_victim.c` (pthreads) | 2 | 255 bytes | **0** | **0** |
+| `go_victim.go` (goroutines) | 11 | 920 bytes | **0** | **0** |
 
 The fixture pins 5 threads; the Go runtime raised the other 6 on its own.
 
-Freeze convergence latency: ~350 µs against fixtures, **702 µs** max against
-runc. Siblings run for that whole window.
+### Hold latency
+
+The two backends' latency counters do **not** measure comparable intervals, so
+no ratio between them is quoted:
+
+| Counter | Measured | What the clock covers |
+|---|---|---|
+| `max_freeze_latency` | ~343–346 µs (346.438, 343.07, 345.428) | *after* the `cgroup.freeze` write until the kernel has converged |
+| `max_gate_latency` | ~98–112 µs (111.677, 104.983, 97.238) | *before* `map.gate()` until `map.kick()` returns — the cost to issue the hold |
+
+Three runs each against `race_wins.json`. The freezer's number is a
+convergence wait, during which siblings are still running; the gate's is an
+issue cost, and excludes the scheduling round in which the hold takes effect.
+
+Separately, and on the older broader sweep: freeze convergence reached
+**702 µs** max against runc, against ~350 µs on the fixtures.
 
 ## The POLLHUP stall bug
 
@@ -136,4 +152,6 @@ resolves them to negative pseudo-numbers; `fstatat` fails to resolve entirely;
   `--exit-with-child` single-spawn rule).
 - Anything on x86-64. All figures above are aarch64.
 - Whether a freezer-induced syscall restart has ever changed an outcome, as
-  opposed to being papered over.
+  opposed to being papered over. `--gate` sidesteps the question rather than
+  answering it: `handle_stability` shows the restart happens under the freezer
+  and does not under the gate, but not what it cost.
