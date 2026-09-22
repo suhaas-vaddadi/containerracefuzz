@@ -60,15 +60,29 @@ what makes discovery capable of finding something novel.
 No seed sweep, no deduplication, no corpus, no triage. `scenarios/flake.sh` and
 `experiment.sh` are measurement scripts, not a campaign.
 
-## Blocking soundness
+## Closed
 
-### 7. `ops.dispatch` backend
+### 7. `ops.dispatch` backend — CLOSED
 
-The intended holding mechanism, unimplemented. Until it exists, **results
-against multi-threaded targets are not sound** — the freezer restarts the
-syscall it holds, so a finding could be an artifact of the instrument. It is
-also the only route to `uprobe`/`kprobe`/`lsm` checkpoints. See
-[backends.md](backends.md).
+The intended holding mechanism. Implemented as `GateBackend`
+(`src/backend_gate.rs`) over a `sched_ext` scheduler in a separate crate,
+`scx_crfuzz_gate` — see the spec at
+`docs/superpowers/specs/2026-09-19-crfuzz-ops-dispatch-gate-design.md` and
+[backends.md](backends.md)'s `GateBackend` section. It eliminates the
+freezer's syscall restart: `tests/handle_stability.rs` holds a fixture under
+each mechanism and asserts opposite outcomes — the gate's `NotifyHandle`
+survives the hold, a raw `cgroup.freeze` write does not — at the mechanism
+level, below the `CheckpointBackend` trait that `FreezerBackend`'s contract
+deliberately hides that churn behind.
+
+What remains open: phase 2 (writing the gate entry in-kernel, in the trapping
+task's own context, to close the residual userspace-round-trip window rather
+than merely shrink it) is not built, and the 30 s `ops.timeout_ms` ceiling —
+which the freezer had no equivalent of — caps how long any single hold can
+last before the kernel ejects the scheduler for every concurrent run on the
+machine, not just the one that overstayed.
+
+## Still open
 
 ### 8. §14-A is answered but not eliminated
 
@@ -101,4 +115,3 @@ Class A.
 3. **Racer lifetime** bounded by the victim rather than a count.
 4. **Mutator + racer vocabulary** — turns replay-with-jitter into discovery.
 5. **Campaign driver.**
-6. **`ops.dispatch`** — needed before any finding can be called sound.

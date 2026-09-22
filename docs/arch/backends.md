@@ -1,7 +1,10 @@
 # Backends
 
 How a task is actually stopped. `src/backend.rs` (272), `src/backend_seccomp.rs`
-(683), `src/backend_freezer.rs` (440).
+(712), `src/backend_freezer.rs` (440), `src/backend_gate.rs` (294) — plus the
+`sched_ext` side of the gate, in a separate crate:
+`scx_crfuzz_gate/src/bpf/main.bpf.c` (217), `scx_crfuzz_gate/src/client.rs`
+(238).
 
 ## The interface
 
@@ -116,17 +119,85 @@ open and the shell hangs forever.
    convergence has no upper bound in principle.
 3. **It costs milliseconds per step**, capping interleavings per second.
 
-### What `ops.dispatch` would fix
+## GateBackend
 
-Gating is a map lookup on the enqueue path, so the boundary is one scheduling
-round rather than a convergence wait; a sleeping task is off-CPU already and
-gets gated on its way back in; and nothing touches the syscall path, so there is
-no restart to correct for. It is also the only route to `uprobe`/`kprobe`/`lsm`
-checkpoints.
+A decorator over `SeccompNotifyBackend`, sitting exactly where `FreezerBackend`
+sits and for the same reason: seccomp supplies the precision, the gate
+supplies the coverage. It talks to a separate crate, `scx_crfuzz_gate`, which
+owns the `sched_ext` `struct_ops` half of the mechanism — split out because
+BPF needs a `build.rs`, and a `build.rs` runs on every host, which would break
+this crate's "builds and tests anywhere, macOS included" property.
+
+`scx_crfuzz_gate`'s BPF program (`src/bpf/main.bpf.c`) is small:
+
+- **The map.** `gate`, a `BPF_MAP_TYPE_HASH` keyed by `tgid`, value an epoch
+  stamp. `is_gated(tgid)` is a lookup against it. `GateMap` (the userspace
+  client, `scx_crfuzz_gate::client`) opens it pinned at
+  `/sys/fs/bpf/crfuzz/gate` and writes an entry per `gate(tgid)` call.
+- **`HOLD_DSQ`.** A dispatch queue (id 1) created in `ops.init` that nothing
+  ever consumes except the ungating path in `ops.dispatch` itself — it exists
+  purely as a parking place.
+- **`ops.enqueue`.** A gated task's tgid routes it into `HOLD_DSQ` with
+  `SCX_SLICE_INF` (it isn't competing for time; the slice that matters comes
+  from wherever it lands once ungated). An ungated task goes to
+  `SCX_DSQ_GLOBAL` as normal.
+- **`ops.dispatch`.** Walks `HOLD_DSQ`. Anything still gated is skipped in
+  place; anything whose gate has since been deleted is moved back to
+  `SCX_DSQ_GLOBAL` with a fresh default slice. This is what makes `release()`
+  a map delete plus a kick rather than something that has to reach into the
+  DSQ itself.
+- **`ops.exit_task`.** The first of three cleanup layers: deletes a gated
+  leader's map entry on its own exit, so an ordinary exit never leaves a
+  stale gate. (The other two, both in userspace: `GateBackend::Drop` clears
+  the current run's epoch, and `scx_crfuzz_gated --reset` clears the map
+  wholesale.)
+
+**`SWITCH_PARTIAL` enrollment.** The scheduler sets
+`SCX_OPS_SWITCH_PARTIAL`, so only tasks explicitly moved into `SCHED_EXT` are
+scheduled by it; everything else on the machine stays on CFS, untouched.
+`SeccompNotifyBackend::with_sched_ext(true)` is what does the moving — between
+fork and exec, the spawned target calls `sched_setscheduler(0, SCHED_EXT, …)`
+on itself, and because scheduling policy is inherited across fork and
+`CLONE_THREAD`, that one call enrolls the whole tree the target goes on to
+build, including threads a Go runtime raises later.
+
+**Failure modes**, from the spec's error-handling table:
+
+| Failure | Handling |
+|---|---|
+| Daemon not running, or map not pinned | `GateBackend::attach` fails the run outright. Never degrades to seccomp-only — that would look identical to a successful multi-threaded hold. |
+| Scheduler ejected mid-run (watchdog, `ops.error`) | Gates evaporate and every gated task runs free. `GateBackend` polls `/sys/kernel/sched_ext/state` every `poll()` and fails the run on any transition away from `enabled`. |
+| Daemon dies mid-run | The same condition, reached a second way: the `struct_ops` link is deliberately not pinned, so it releases when the daemon process dies and `state` flips to `disabled` within a couple of seconds — caught by the same per-round check above. |
+| Stale gates from a crashed run | Three layers: `ops.exit_task` on leader exit, `GateBackend::Drop` clearing this run's epoch, and `scx_crfuzz_gated --reset` clearing the map wholesale as an explicit operator action. |
+
+## What `ops.dispatch` fixed
+
+Gating is a map lookup on the enqueue path; a sleeping task is off-CPU already
+and gets gated on its way back in; and nothing touches the syscall path, so
+there is no restart to correct for. It is also the only route to
+`uprobe`/`kprobe`/`lsm` checkpoints.
+
+The kick itself is one scheduling round, but that overstates the boundary: the
+userspace round trip *before* the kick — from the seccomp notification
+arriving to `map.gate()` being called — is not bounded by a scheduling round
+at all, and siblings run for the whole of it. Per commit `d61ad4ff`, the
+gate's measured latency and the freezer's measured latency are not comparable
+quantities, so the honest comparison states what each clock covers rather than
+contrasting them: `max_gate_latency` (`backend_gate.rs:141-147`) starts before
+`map.gate()` and stops after `map.kick()` — the cost to *issue* the hold, ~98-112
+µs over three runs. `max_freeze_latency` (`backend_freezer.rs:176-180`) starts
+after the `cgroup.freeze` write and stops when `wait_until_frozen` returns —
+the kernel *converging*, ~343-346 µs over three runs. Closing the gate's
+residual window to zero needs the gate written in-kernel, in the trapping
+task's own context, which is phase 2 of the design and not yet built.
 
 System-wide risk is smaller than it looks: `SCX_OPS_SWITCH_PARTIAL` schedules
 only tasks explicitly moved to `SCHED_EXT`, leaving the rest of the machine on
-CFS, and `ops.timeout_ms` ejects a stuck scheduler.
+CFS, and `ops.timeout_ms` (30000, the kernel's maximum) ejects a stuck
+scheduler — something the freezer had no equivalent of.
 
-**Until it lands, results against multi-threaded targets are not sound**,
-freezer or not.
+**`GateBackend` eliminates the freezer's syscall perturbation**: no
+`ERESTARTSYS`, no fresh notification id, a `NotifyHandle` stable across the
+hold (`tests/handle_stability.rs`). Section 14-A remains open — the gate stops
+the other threads in a group, it does not order their arrival — so run-to-run
+reproducibility against a multi-threaded target is still not guaranteed.

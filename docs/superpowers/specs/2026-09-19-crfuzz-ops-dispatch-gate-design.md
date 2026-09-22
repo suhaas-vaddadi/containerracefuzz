@@ -144,10 +144,28 @@ Ops:
 
 | Callback | Behaviour |
 |---|---|
+| `ops.select_cpu` | `scx_bpf_select_cpu_dfl`, and **nothing else** — see below |
 | `ops.enqueue` | `gated(p->tgid)` → `scx_bpf_dsq_insert(p, HOLD_DSQ, SCX_SLICE_INF, 0)`; else → `scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0)` |
-| `ops.dispatch` | `scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL)`, then `bpf_for_each(scx_dsq, p, HOLD_DSQ, 0)` moving out anything no longer gated |
+| `ops.dispatch` | `bpf_for_each(scx_dsq, p, HOLD_DSQ, 0)` moving out anything no longer gated, via `scx_bpf_dsq_move` after `scx_bpf_dsq_move_set_slice` |
 | `ops.exit_task` | delete the tgid entry when the thread-group leader exits |
 | flags | `SCX_OPS_SWITCH_PARTIAL`, `timeout_ms = 30000` |
+
+**`ops.select_cpu` is load-bearing, and its absence is a silent hole.** Found by building this,
+not by reasoning about it. With no `ops.select_cpu` defined, sched_ext supplies a default that
+direct-dispatches an idle-CPU wakeup straight to the local DSQ — and *"dispatching directly
+from `ops.select_cpu()` will cause the `ops.enqueue()` callback to be skipped"*
+(`OVERVIEW.md:403`). The gate check lives only in `enqueue`. So a gated task waking onto an idle
+CPU **bypassed the gate entirely and kept running**, with the map entry correctly in place and
+nothing reporting an error: exactly the silent under-holding this backend exists to prevent.
+Measured with `bpf_stats_enabled` — `enqueue`'s `run_cnt` stayed at zero while `dispatch`'s
+climbed. The fix is an `ops.select_cpu` that calls `scx_bpf_select_cpu_dfl` and **never** calls
+`scx_bpf_dsq_insert`, so `enqueue` is guaranteed to run for every wakeup. Every scheduler in the
+scx tree defines `select_cpu`; none of them documents this as the reason.
+
+**`ops.dispatch` must not drain `SCX_DSQ_GLOBAL`.** Also found by building it: `SCX_DSQ_GLOBAL`
+is not a valid *source* for `scx_bpf_dsq_move_to_local` — the kernel rejects it ("invalid DSQ
+ID") and disables the scheduler immediately. The core drains it after `ops.dispatch()` returns.
+It remains a valid *destination*, which is what `enqueue` and the drain both rely on.
 
 All three primitives are already in tree: `SCX_OPS_SWITCH_PARTIAL` via
 `scx_utils::compat`, `SCX_SLICE_INF` in `scx_tickless`, `bpf_for_each(scx_dsq,
@@ -202,10 +220,46 @@ The gate's boundary is **sharper, not zero**, and the spec says so rather than
 letting a later measurement say it.
 
 Between the seccomp notification arriving and userspace writing `gate[T]`,
-siblings still run: one userspace round trip, tens of µs, against the freezer's
-measured ~350 µs. Step 2 then costs one scheduling round. So the honest claim
-is roughly an order of magnitude sharper *and* the perturbation eliminated —
-not synchronous holding of the thread group.
+siblings still run: one userspace round trip, tens of µs. Step 2 then costs one
+scheduling round.
+
+**The "roughly an order of magnitude sharper" claim this section used to make is
+withdrawn — permanently, not pending anything, because the two numbers it
+rested on do not measure comparable events.** Found while reviewing Task 8, by
+tracing both call sites rather than comparing their printed values:
+
+| | clock starts | clock stops | so it measures |
+|---|---|---|---|
+| `max_gate_latency` (`backend_gate.rs:141-147`) | before `map.gate()` | after `map.kick()` | the cost to **issue** the hold |
+| `max_freeze_latency` (`backend_freezer.rs:176-180`) | **after** the `cgroup.freeze` write | when `wait_until_frozen` returns | the kernel **converging** |
+
+The intervals are disjoint. The gate's number excludes the scheduling round in
+which the hold actually takes effect; the freezer's excludes the write that
+starts it. An incidental Task 8 run printed 115.735 µs against 335.564 µs, which
+looks like ~2.9× and is in fact a comparison between an issue cost and a
+convergence cost — a ratio of two things neither of which contains what the
+other measures.
+
+Note the gate's measurement matches what this spec's Testing section asked for
+("notification to kick-complete"), so `GateBackend` is not at fault. The defect
+is here: this section compared that number to the freezer's as though the two
+were the same kind of quantity.
+
+Task 9 measured both, framed correctly this time, across three runs each
+against `race_wins.json`: `max_gate_latency` ~98-112 µs (111.677, 104.983,
+97.238) and `max_freeze_latency` ~343-346 µs (346.438, 343.07, 345.428). The
+spec had given Task 9 two options — measure a genuinely comparable gate
+interval (notification until the siblings have actually stopped, the quantity
+`sibling_progress_while_held` already establishes behaviourally), or report
+both numbers with an explicit statement of what each one covers and quote no
+ratio. It took the second: the two figures above are reported next to their
+definitions, and no ratio is quoted between them, because the intervals are
+disjoint — dividing them would compare an issue cost to a convergence cost,
+the same mistake this section exists to correct.
+
+What survives this correction intact is the load-bearing claim: the perturbation
+is eliminated. No `ERESTARTSYS`, no fresh notification id, and a `NotifyHandle`
+that is stable across the hold — none of which depends on any latency number.
 
 Closing it to zero requires setting the gate **in-kernel, in the trapping
 task's own context**, before it blocks — an `fentry` or `kprobe` program on the
@@ -232,6 +286,25 @@ ordinary holds fit comfortably underneath. A `Barrier` waiting on a role that
 never appears does not obviously fit, and the freezer had no equivalent limit.
 `GateBackend` therefore treats an approaching timeout as a run failure of its
 own rather than waiting for the kernel to eject the scheduler underneath it.
+
+Two consequences, both measured while building Task 3 rather than predicted:
+
+**Ejection is global, not per-run.** Letting one task sit gated past 30 s fired
+the watchdog ("runnable task stall") and force-disabled the *entire* scheduler,
+releasing every gate at once — including gates belonging to other concurrent
+runs. The blast radius of one over-long hold is every run on the machine, which
+is a stronger argument for `GateBackend`'s per-round ejection check than the
+original "the run would be wrong" framing.
+
+**A gated task cannot be killed.** This follows from the mechanism and is worth
+stating plainly: a gated task is runnable-but-never-dispatched, and a task must
+run to process a fatal signal, so `SIGKILL` on a held process does not take
+effect until it is ungated. `ops.exit_task` therefore *cannot* reap the entry
+for a task killed while gated — it never reaches its own exit path. That does
+not make `exit_task` useless (it reaps the ordinary case, where a role exits
+after being released), but it does mean the other two layers —
+`GateBackend::Drop` and `scx_crfuzz_gated --reset` — are the ones that matter
+for recovery, not belt-and-braces.
 
 ## CLI
 
@@ -266,6 +339,7 @@ releasing the interesting half of runc. Each of these is loud.
 |---|---|
 | Daemon not running, or map not pinned | `GateBackend::attach` fails the run. **Never** degrade to seccomp-only: that looks identical to a successful multi-threaded hold and is unsound. |
 | Scheduler ejected mid-run (watchdog, `ops.error`) | Gates evaporate, every gated task runs free, and the engine goes on believing it holds them — a clean-looking bogus verdict. The backend polls `/sys/kernel/sched_ext/state` each `poll()` and fails the run on any transition away from `enabled`. |
+| **Daemon dies mid-run** | The same condition, reached a second way. The `struct_ops` link is deliberately *not* pinned — only the maps and the kick program are — so the attach is released when the daemon process dies, and `state` flips to `disabled` within a couple of seconds. Measured in Task 4. One consequence worth stating: the daemon is a single point of failure for every concurrent run, and the *only* thing that catches it is the same per-round `scheduler_enabled()` check. Its pins outlive it, which is why startup clears provably-stale ones. |
 | Stale gates from a crashed run | Three layers: `ops.exit_task` deletes on leader exit; `GateBackend::Drop` clears the entries stamped with this run's epoch; and `scx_crfuzz_gated --reset` clears the map wholesale as an explicit operator action, since a recovery tool by definition has no epoch of its own to match. |
 | Another `sched_ext` scheduler attached | Only one can be. The daemon detects this at start and names it. |
 | A `--spawn` fails `sched_setscheduler` | Fail the spawn. An un-enrolled target is invisible to the gate and silently unheld. |
@@ -287,8 +361,14 @@ freezer demonstrably fails this; the gate must pass it. This is gaps.md #7's
 claim turned into an assertion.
 
 **`GateStats`**, mirroring `FreezeStats`: hold latency from notification to
-kick-complete, total and max, so the residual window above is a measured number
-in the README rather than an estimate in this spec.
+kick-complete, total and max.
+
+Mirroring `FreezeStats` in *shape* is not the same as measuring the same
+quantity, and this spec previously conflated the two — see the table under
+"Residual window" above. `max_gate_latency` is an issue cost and
+`max_freeze_latency` is a convergence cost. Any README line putting them side by
+side must say which is which, and any claim about how much sharper the gate's
+boundary is needs an interval that actually covers the hold taking effect.
 
 **Non-regression** — `cargo test -p scx_crfuzz` on macOS still reports exactly
 90 tests, proving the new crate stayed off the host build.

@@ -17,6 +17,7 @@ scx_crfuzz --config <json> [options]
 | `--spawn <cmdline>` | launch and instrument a process (repeatable) |
 | `--cgroup-path <p>` | where to place spawned processes; must sit under the config's `cgroup` |
 | `--freezer` | wrap in `FreezerBackend`; forces per-spawn cgroups |
+| `--gate` | wrap in `GateBackend` (the `sched_ext` gate, `scx_crfuzz_gate`); requires `scx_crfuzz_gated` already attached; mutually exclusive with `--freezer` |
 | `--oci-bundle <dir>` | refuse to run if the bundle's seccomp profile erases a checkpoint |
 | `--exit-with-child` | exit with the spawned process's status, not the engine's verdict |
 | `--project-schedule <p>` | write the canonical log back out as a replay schedule |

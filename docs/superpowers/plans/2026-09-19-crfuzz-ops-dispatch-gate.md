@@ -126,7 +126,13 @@ void BPF_STRUCT_OPS(crfuzz_gate_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(crfuzz_gate_dispatch, s32 cpu, struct task_struct *prev)
 {
-	scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL);
+	/*
+	 * Deliberately empty. The core drains SCX_DSQ_GLOBAL itself once
+	 * ops.dispatch() returns, and SCX_DSQ_GLOBAL is NOT a valid source for
+	 * scx_bpf_dsq_move_to_local -- verified on target: the kernel rejects
+	 * it ("invalid DSQ ID") and disables the scheduler immediately. The op
+	 * stays defined because Task 3 drops the HOLD_DSQ drain in this body.
+	 */
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(crfuzz_gate_init)
@@ -302,15 +308,30 @@ Append to `main.bpf.c`, before `SCX_OPS_DEFINE`:
 SEC("syscall")
 int crfuzz_kick_all(struct kick_arg *input)
 {
-	u32 nr = input->nr_cpus;
+	/*
+	 * The bound comes from the kernel, not from userspace: a bad
+	 * nr_cpus must never be able to produce an out-of-range CPU id.
+	 * input->nr_cpus only caps it further. scx_bpf_nr_cpu_ids() is
+	 * declared in scx/common.bpf.h and used in-tree by scx_mlfq.
+	 */
+	u32 nr = scx_bpf_nr_cpu_ids();
+	u32 kicked = 0;
 	u32 i;
 
-	if (nr > 512)
-		nr = 512;
+	if (input->nr_cpus < nr)
+		nr = input->nr_cpus;
+
 	bpf_for(i, 0, nr) {
 		scx_bpf_kick_cpu(i, SCX_KICK_PREEMPT);
+		kicked++;
 	}
-	return 0;
+
+	/*
+	 * Return the count, not a constant. scx_bpf_kick_cpu is void, so a
+	 * constant return would make the caller's check unfalsifiable -- it
+	 * would pass identically with a broken or short-circuited loop.
+	 */
+	return kicked;
 }
 ```
 
@@ -331,11 +352,21 @@ Insert after the `attach_struct_ops` line:
             context_in: Some(&mut arg),
             ..Default::default()
         };
+        // The `?` here is the check that catches the kfunc being unavailable
+        // for this program type -- that failure surfaces as an Err, not as a
+        // return value.
         let out = skel.progs.crfuzz_kick_all.test_run(input).context("kick prog test_run")?;
-        anyhow::ensure!(out.return_value == 0, "kick prog returned {}", out.return_value);
+        anyhow::ensure!(
+            out.return_value == nr_cpus,
+            "kick prog kicked {} of {nr_cpus} cpus: it did not run its full loop, so holds \
+             would be bounded by the scheduling slice instead of one round",
+            out.return_value
+        );
         println!("kick mechanism verified over {nr_cpus} cpus");
     }
 ```
+
+What this self-test does and does not prove, stated so the comment does not overclaim: it proves the program loads, is callable from userspace while the scheduler is attached, and runs its loop to completion. It does **not** prove a sibling thread is actually preempted — that is unobservable at daemon startup with nothing enrolled in `SCHED_EXT`, and is what Task 3 Step 7 verifies by watching a ticking process stop.
 
 - [ ] **Step 4: Build and run**
 
@@ -362,7 +393,7 @@ void BPF_STRUCT_OPS(crfuzz_gate_tick, struct task_struct *p)
 
 wired as `.tick = (void *)crfuzz_gate_tick`, plus a short `SCX_SLICE_DFL` replacement (start at 100 µs) in `enqueue` so an untick'd task is preempted promptly. `is_gated` arrives in Task 3, so with this branch, merge Task 2 and Task 3.
 
-**Then stop and amend the spec.** The fallback's boundary is up to one tick (1–4 ms), which is *worse* than the freezer's measured ~350 µs, and the spec's "roughly an order of magnitude sharper" claim would be false. The perturbation argument (no `ERESTARTSYS`) survives either way and is the load-bearing one, but the window claim must be rewritten to match what was built.
+**Then stop and amend the spec.** The fallback's boundary is up to one tick (1–4 ms), which is *worse* than the freezer's measured ~350 µs. (The spec's "roughly an order of magnitude sharper" claim is not live to weigh this against — it was withdrawn outright, for an unrelated reason, in the spec's residual-window section.) The perturbation argument (no `ERESTARTSYS`) survives either way and is the load-bearing one, but the window claim must be rewritten to match what was built.
 
 - [ ] **Step 6: Commit**
 
@@ -459,17 +490,51 @@ void BPF_STRUCT_OPS(crfuzz_gate_dispatch, s32 cpu, struct task_struct *prev)
 	 * Anything in HOLD_DSQ whose gate has since been deleted goes back to
 	 * the global queue. This is what makes `release` a map delete plus a
 	 * kick rather than needing userspace to move tasks itself.
+	 *
+	 * scx_bpf_dsq_move() and NOT scx_bpf_dsq_move_to_local(): the latter
+	 * pops the DSQ *head*, which is not necessarily the task the iterator
+	 * just found. With a still-gated task at the head and an ungated one
+	 * behind it, popping the head would dispatch a task that is supposed
+	 * to be held -- silent under-holding, the exact failure this whole
+	 * backend exists to avoid. scx_bpf_dsq_move() moves the iterated task.
+	 *
+	 * The set_slice is load-bearing too: enqueue inserted these with
+	 * SCX_SLICE_INF, so without it an ungated task would run with an
+	 * infinite time slice. See scx_tickless dispatch_cpu() and scx_chaos
+	 * for both patterns.
 	 */
+	bpf_rcu_read_lock();
 	bpf_for_each(scx_dsq, p, HOLD_DSQ, 0) {
-		if (!is_gated(p->tgid)) {
-			scx_bpf_dsq_move_to_local(HOLD_DSQ);
-			break;
+		/*
+		 * Verifier pointer-validation workaround, copied from
+		 * scx_tickless: re-acquire a trusted reference by pid.
+		 */
+		p = bpf_task_from_pid(p->pid);
+		if (!p)
+			continue;
+		if (is_gated(p->tgid)) {
+			bpf_task_release(p);
+			continue;
 		}
+		scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, SCX_SLICE_DFL);
+		scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_GLOBAL, 0);
+		bpf_task_release(p);
 	}
+	bpf_rcu_read_unlock();
 
-	scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL);
+	/*
+	 * NO trailing scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL, 0). Verified
+	 * on target in Task 1: SCX_DSQ_GLOBAL is not a valid *source* for that
+	 * helper -- the kernel rejects it ("invalid DSQ ID") and immediately
+	 * disables the scheduler. The core drains SCX_DSQ_GLOBAL itself right
+	 * after ops.dispatch() returns, which is why moving an ungated task
+	 * there above is all this op has to do. SCX_DSQ_GLOBAL remains a valid
+	 * *destination*, which is what enqueue and the move above rely on.
+	 */
 }
 ```
+
+If the verifier rejects the `bpf_rcu_read_lock()` around the iteration, read `dispatch_cpu()` in `scheds/rust/scx_tickless/src/bpf/main.bpf.c:272` and mirror its structure exactly — it is the in-tree pattern this is derived from and it verifies on this kernel.
 
 - [ ] **Step 5: Reap the gate entry when the leader exits**
 
@@ -672,7 +737,25 @@ and dispatch them in `main` before any skeleton work:
     }
 ```
 
-- [ ] **Step 5: Detect an already-attached scheduler**
+- [ ] **Step 5: Hold a startup lock, then detect an already-attached scheduler**
+
+Order matters and the reason is subtle. `/sys/kernel/sched_ext/state` does not flip to `enabled`
+until `scx_ops_attach!` succeeds, so the already-attached check alone does **not** serialise two
+daemons: a second one starting inside the first's `load -> pin -> attach` window passes it, clears
+the first's fresh pins as "stale", and pins its own maps. Its attach then fails, its `?`
+early-return skips the unpin, and pinned maps survive process death -- leaving the pins pointing at
+orphaned maps while the first daemon is still the attached scheduler reading its own. An engine run
+would write tgids into a gate map nothing reads: silent under-holding.
+
+So take an exclusive, non-blocking `flock` first, on `/run/scx_crfuzz_gated.lock` (falling back to
+`/tmp` if `/run` is not writable, announcing which), and hold the `File` alive through the SIGINT
+loop and the unpin -- dropping it closes the fd and reopens the window. `--reset` and `--status`
+return *before* the lock is taken, so recovery tools still work against a wedged daemon. The
+lockfile surviving a `kill -9` is harmless: flock is advisory and the kernel releases it on process
+death, so a restart re-acquires immediately.
+
+The stale-pin argument is therefore two-part: the attach check **and** the lock. Neither alone is
+sufficient.
 
 `attach_struct_ops` will fail, but the message is opaque. Before opening the skeleton:
 
@@ -699,7 +782,7 @@ limactl shell sched-ext -- bash -lc \
    sudo /workspace/scx/target-linux/debug/scx_crfuzz_gated --reset'
 ```
 
-Expected: `state: enabled`, `ops: crfuzz_gate`, `live gates: 0`, both pins present, `cleared 0 gate(s)`. Then start a second daemon and confirm it refuses with the "already attached" message.
+Expected: `state: enabled`; `ops:` reporting a name **beginning** `crfuzz_gate` — `scx_ops_open!` appends version and target, so the real string is like `crfuzz_gate_0.1.0_aarch64_unknown_linux_gnu_debug`, exactly as every macro-based scheduler in this tree does. Do not assert equality against the bare name, here or in `--status`. Then `live gates: 0`, both pins present, `cleared 0 gate(s)`. Finally start a second daemon and confirm it refuses with the "already attached" message.
 
 - [ ] **Step 7: Commit**
 
@@ -731,6 +814,8 @@ The library face of the crate — what `scx_crfuzz` links against. No `struct_op
 **Files:**
 - Create: `scheds/experimental/scx_crfuzz_gate/src/client.rs`
 - Modify: `scheds/experimental/scx_crfuzz_gate/src/lib.rs`
+- Modify: `scheds/experimental/scx_crfuzz_gate/src/bpf/main.bpf.c` (the `crfuzz_epoch_next` program, below)
+- Modify: `scheds/experimental/scx_crfuzz_gate/src/main.rs` (pin it, and add it to the stale-pin/unpin lists)
 
 **Interfaces:**
 - Produces:
@@ -816,6 +901,38 @@ Expected: compile error, `GateMap` not found.
 
 - [ ] **Step 3: Implement `GateMap`**
 
+First the BPF side, because `open()` below depends on it. Append to `main.bpf.c`, beside `crfuzz_kick_all`:
+
+```c
+/*
+ * Atomically bump the epoch counter and return the new value, so
+ * GateMap::open() can mint an epoch without a userspace lookup-then-update
+ * race: __sync_fetch_and_add is a single atomic RMW on the map's one
+ * element, so two callers opening concurrently are guaranteed distinct
+ * values. Returns 0 only if the map lookup fails; a real epoch is never 0
+ * because the counter starts at 0 and this only ever returns old+1, so
+ * userspace can treat a returned 0 as unambiguous failure.
+ */
+SEC("syscall")
+int crfuzz_epoch_next(void)
+{
+	u32 key = 0;
+	u64 *val;
+
+	val = bpf_map_lookup_elem(&epoch, &key);
+	if (!val)
+		return 0;
+
+	return __sync_fetch_and_add(val, 1) + 1;
+}
+```
+
+and pin it in `main.rs` beside the other three, adding `"epoch_next"` to `remove_pins`'s list so the
+daemon's stale-pin clearing and graceful unpin stay complete — a fourth pin the restart logic does
+not know about would survive a `kill -9` and be reused by the next daemon.
+
+Then the client:
+
 ```rust
 // SPDX-License-Identifier: GPL-2.0
 //
@@ -849,19 +966,31 @@ impl GateMap {
         let gate = MapHandle::from_pinned_path(format!("{PIN_DIR}/gate")).with_context(|| {
             format!("opening {PIN_DIR}/gate -- is scx_crfuzz_gated running?")
         })?;
-        let epoch_map = MapHandle::from_pinned_path(format!("{PIN_DIR}/epoch"))
-            .with_context(|| format!("opening {PIN_DIR}/epoch"))?;
 
-        let key = 0u32.to_ne_bytes();
-        let prev = epoch_map
-            .lookup(&key, MapFlags::ANY)
-            .context("reading the epoch counter")?
-            .map(|v| u64::from_ne_bytes(v[..8].try_into().unwrap()))
-            .unwrap_or(0);
-        let epoch = prev + 1;
-        epoch_map
-            .update(&key, &epoch.to_ne_bytes(), MapFlags::ANY)
-            .context("bumping the epoch counter")?;
+        // The epoch is minted by invoking the pinned crfuzz_epoch_next
+        // program, NOT by a userspace lookup-then-update on the epoch map.
+        // A plain read-modify-write here would race: two GateMap::open()
+        // calls started close together could both read the same old value
+        // and both write old+1, so two concurrent engine runs would
+        // silently share one epoch. Then the first run's Drop-time
+        // clear_epoch() would delete the SECOND run's gates too, leaving it
+        // silently under-holding with nothing reporting an error -- which
+        // defeats the entire reason the epoch exists.
+        // NOTE on the API: libbpf-rs 0.27.0 cannot do this the obvious way.
+        // `from_pinned_path` exists only on `ProgramHandle` (program.rs:1780)
+        // and `test_run` only on `ProgramMut` (program.rs:1639), so a pinned
+        // program cannot be test_run through the safe wrapper at all. Open it
+        // as an `OwnedFd` via `Program::fd_from_pinned_path` and call
+        // `libbpf_sys::bpf_prog_test_run_opts` on the raw fd. In-tree
+        // precedent: `rust/scx_arena/scx_arena/src/lib.rs:113`.
+        let epoch_fd = libbpf_rs::Program::fd_from_pinned_path(format!("{PIN_DIR}/epoch_next"))
+            .with_context(|| format!("opening {PIN_DIR}/epoch_next"))?;
+        let epoch = prog_test_run(epoch_fd.as_fd(), None)
+            .context("minting an epoch via crfuzz_epoch_next")? as u64;
+        anyhow::ensure!(
+            epoch != 0,
+            "crfuzz_epoch_next returned 0: the epoch map lookup failed in BPF"
+        );
 
         Ok(GateMap {
             gate,
@@ -945,22 +1074,27 @@ impl GateMap {
 
 - [ ] **Step 4: Wire the kicker program**
 
-Task 4 pins the kick program at `/sys/fs/bpf/crfuzz/kick`. In `GateMap::open`, replace `kicker: None` with:
+Task 4 pins the kick program at `/sys/fs/bpf/crfuzz/kick`. In `GateMap::open`, replace `kicker: None` with (same raw-fd construction as the epoch minter above, and for the same API reason):
 
 ```rust
-        let kicker = libbpf_rs::Program::from_pinned_path(format!("{PIN_DIR}/kick")).ok();
+        let kicker = libbpf_rs::Program::fd_from_pinned_path(format!("{PIN_DIR}/kick"))
+            .with_context(|| format!(
+                "{PIN_DIR}/kick is missing or unopenable: holds would be bounded by the \
+                 scheduling slice instead of one round; refusing rather than under-holding."
+            ))?;
 ```
 
-If `kicker` is `None`, `kick()` is a no-op and holds fall back to slice-boundary latency. That is a silent degradation, so make it loud — in `open`, after the `let kicker = …` line:
+The field is `kicker: OwnedFd`, **not** `Option<OwnedFd>`, and the failure propagates the real error
+rather than `.ok()`-ing it into a guessed one. An earlier draft of this plan wrote `.ok()` followed
+by an `ensure!(kicker.is_some(), …)`; that was wrong twice over. It discards *why* the open failed —
+so an `EACCES`, a revoked pin or `ENOMEM` is all reported as "the daemon is too old" — and the
+`Option` it leaves behind permits a `GateMap` with no kicker, which forces `kick()` to carry a
+`return Ok(())` no-op branch. A silent no-op fallback in the one crate whose thesis is that failures
+must be legible is a defect even while `open()` happens to guard it, because the next constructor
+resurrects it as exactly the slice-boundary degradation this check exists to prevent.
 
-```rust
-        anyhow::ensure!(
-            kicker.is_some(),
-            "{PIN_DIR}/kick is missing: the daemon is too old, or the kick \
-             program failed to pin. Holds would be bounded by the scheduling \
-             slice instead of one round; refusing rather than under-holding."
-        );
-```
+Open the kicker **before** minting the epoch. Minting first burns a counter value on every run that
+then fails this check.
 
 - [ ] **Step 5: Export it**
 
@@ -973,14 +1107,22 @@ pub use client::GateMap;
 
 - [ ] **Step 6: Run the tests**
 
+The daemon must be **rebuilt and restarted** before the tests: `crfuzz_epoch_next` is new BPF, so a
+daemon from before Step 3 has no such pin and every `open()` fails.
+
 ```bash
 limactl shell sched-ext -- bash -lc \
-  'sudo /workspace/scx/target-linux/debug/scx_crfuzz_gated & sleep 3
+  'cd /workspace/scx && CARGO_TARGET_DIR=/workspace/scx/target-linux cargo build -p scx_crfuzz_gate
+   sudo pkill -INT scx_crfuzz_gated; sleep 1
+   sudo /workspace/scx/target-linux/debug/scx_crfuzz_gated & sleep 3
+   ls -l /sys/fs/bpf/crfuzz/
    cd /workspace/scx && sudo CARGO_TARGET_DIR=/workspace/scx/target-linux \
    cargo test -p scx_crfuzz_gate client 2>&1 | tail -20'
 ```
 
-Expected: both tests pass.
+Expected: four pins (`gate`, `epoch`, `kick`, `epoch_next`), then both tests pass.
+`clear_epoch_removes_only_this_epochs_entries` is the one that proves the atomic mint: it asserts
+two `open()`s get distinct epochs, which is exactly what the racy userspace version could violate.
 
 - [ ] **Step 7: Commit**
 
@@ -1061,11 +1203,41 @@ fn a_spawned_target_and_its_threads_are_in_sched_ext() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
         .join("threaded_victim");
-    let spec = ProcessSpec::parse(fixture.to_str().unwrap()).unwrap();
+    // Both fixture arguments are load-bearing: threaded_victim.c:49 exits via
+    // VERDICT:usage when argc < 3, without ever creating the sibling thread --
+    // which would make the multi-threaded assertion below vacuous.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let progress = tmp.path().join("progress");
+    std::fs::write(&target, "BENIGN\n").unwrap();
+    let spec = ProcessSpec::parse(&format!(
+        "{} {} {}",
+        fixture.display(),
+        target.display(),
+        progress.display()
+    ))
+    .expect("spec");
     let mut backend = SeccompNotifyBackend::new(vec![spec], "/crfuzz/enroll")
         .with_sched_ext(true)
         .with_poll_timeout(Duration::from_millis(50));
-    backend.attach(&default_discovery_checkpoints()).unwrap();
+    // A single narrowed checkpoint, NOT default_discovery_checkpoints(): the
+    // full structural set holds the fixture at its progress-file openat, which
+    // happens before the sibling thread exists, so the thread assertions would
+    // run against a single-threaded process.
+    //
+    // "fstatat" and "newfstatat" both work and resolve to the same syscall
+    // number: backend_seccomp.rs's ARCH_ALIASES maps the former to the latter
+    // and tries both. "fstatat" is the canonical spelling in checkpoint.rs's
+    // STRUCTURAL_SYSCALLS table; thread_group_holding.rs happens to spell it
+    // "newfstatat". Follow whichever file you are writing into.
+    backend
+        .attach(&[CheckpointDecl {
+            id: CheckpointId::new("fstatat"),
+            kind: CheckpointKind::Syscall,
+            target: "fstatat".into(),
+            category: None,
+        }])
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut held = None;
@@ -1258,9 +1430,11 @@ mod tests {
 
     #[test]
     fn the_handle_the_engine_is_given_is_the_handle_it_releases() {
-        // The whole point of the gate. FreezerBackend cannot pass this: freezing
-        // interrupts the held notification, the syscall restarts, and a fresh id
-        // replaces the one the engine was told about.
+        // GateBackend::release passes the engine's handle straight through to
+        // the inner backend, with no substitution. The gate-vs-freeze
+        // distinction at the mechanism level is measured in
+        // tests/handle_stability.rs, not here: this test drives a StubBackend,
+        // so FreezerBackend is not involved in it at all.
         if skip() {
             return;
         }
@@ -1703,13 +1877,27 @@ fn the_gate_holds_the_whole_thread_group() {
         return;
     }
     let fixture = scenarios_dir().join("threaded_victim");
-    let spec = ProcessSpec::parse(fixture.to_str().unwrap()).unwrap();
+    // Both fixture arguments are load-bearing: threaded_victim.c:49 exits via
+    // VERDICT:usage when argc < 3, without ever creating the sibling thread,
+    // which would make the assertion below vacuously true. Same construction
+    // as the freezer row already in this file.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let progress = tmp.path().join("progress");
+    std::fs::write(&target, "BENIGN\n").unwrap();
+    let spec = ProcessSpec::parse(&format!(
+        "{} {} {}",
+        fixture.display(),
+        target.display(),
+        progress.display()
+    ))
+    .expect("spec");
     let seccomp = SeccompNotifyBackend::new(vec![spec], "/crfuzz/gate-tgh")
         .with_sched_ext(true)
         .with_poll_timeout(Duration::from_millis(50));
     let mut backend = GateBackend::new(seccomp).unwrap();
 
-    let (at_hit, after) = sibling_progress_while_held(&mut backend);
+    let (at_hit, after) = sibling_progress_while_held(&mut backend, &progress);
     assert_eq!(
         after, at_hit,
         "the sibling wrote {} bytes during a {:?} hold; the gate must hold the \
@@ -1733,13 +1921,25 @@ fn the_gate_holds_a_go_runtimes_thread_group() {
         return;
     }
     let fixture = scenarios_dir().join("go_victim");
-    let spec = ProcessSpec::parse(fixture.to_str().unwrap()).unwrap();
+    // go_victim.go:71 has the same argc guard as threaded_victim -- see the note
+    // on the row above.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let progress = tmp.path().join("progress");
+    std::fs::write(&target, "BENIGN\n").unwrap();
+    let spec = ProcessSpec::parse(&format!(
+        "{} {} {}",
+        fixture.display(),
+        target.display(),
+        progress.display()
+    ))
+    .expect("spec");
     let seccomp = SeccompNotifyBackend::new(vec![spec], "/crfuzz/gate-go")
         .with_sched_ext(true)
         .with_poll_timeout(Duration::from_millis(50));
     let mut backend = GateBackend::new(seccomp).unwrap();
 
-    let (at_hit, after) = sibling_progress_while_held(&mut backend);
+    let (at_hit, after) = sibling_progress_while_held(&mut backend, &progress);
     assert_eq!(
         after, at_hit,
         "the Go fixture's siblings wrote {} bytes during a {:?} hold; under seccomp \
@@ -1773,12 +1973,13 @@ Expected: PASS, 0 bytes written, matching the freezer's column.
 // The test that distinguishes the gate from the freezer rather than measuring
 // them equal.
 //
-// FreezerBackend cannot pass this. Freezing a cgroup wakes every task in it
-// including one parked in a seccomp notification; that wait is interruptible,
-// so the kernel tears the notification down, restarts the syscall, and a fresh
-// id replaces the one the engine was told about -- measured directly, id
-// ...077 became unanswerable the moment the cgroup froze and ...078 appeared
-// in its place. The freezer keeps a pid -> live-handle map to paper over it.
+// This draft assumed FreezerBackend could not pass this; Task 9 Step 5 found
+// the opposite -- FreezerBackend's poll()/release() machinery is built to
+// swallow exactly this restart at the CheckpointBackend trait boundary (its
+// `reported` set and `live` map), so a test driven through that boundary
+// cannot distinguish the gate from the freezer at all. The shipped
+// `tests/handle_stability.rs` was rebuilt below the trait boundary instead;
+// see that file's own header for the corrected account.
 //
 // The gate never touches the held thread, so there is nothing to paper over.
 // This asserts that, which is docs/arch/gaps.md #7's soundness claim turned
@@ -1792,7 +1993,9 @@ use scx_crfuzz::backend::Poll;
 use scx_crfuzz::backend_gate::GateBackend;
 use scx_crfuzz::backend_seccomp::ProcessSpec;
 use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
-use scx_crfuzz::checkpoint::default_discovery_checkpoints;
+use scx_crfuzz::checkpoint::CheckpointDecl;
+use scx_crfuzz::checkpoint::CheckpointId;
+use scx_crfuzz::checkpoint::CheckpointKind;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -1811,12 +2014,34 @@ fn a_held_notification_id_survives_the_hold() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
         .join("threaded_victim");
-    let spec = ProcessSpec::parse(fixture.to_str().unwrap()).unwrap();
+    // Both arguments required; see Task 9 Step 1's note on the argc guard.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let progress = tmp.path().join("progress");
+    std::fs::write(&target, "BENIGN\n").unwrap();
+    let spec = ProcessSpec::parse(&format!(
+        "{} {} {}",
+        fixture.display(),
+        target.display(),
+        progress.display()
+    ))
+    .expect("spec");
     let seccomp = SeccompNotifyBackend::new(vec![spec], "/crfuzz/handle-stability")
         .with_sched_ext(true)
         .with_poll_timeout(Duration::from_millis(50));
     let mut backend = GateBackend::new(seccomp).unwrap();
-    backend.attach(&default_discovery_checkpoints()).unwrap();
+    // A single narrowed checkpoint, NOT default_discovery_checkpoints(): the
+    // full structural set holds the fixture at its progress-file openat, which
+    // happens before the sibling thread is created. Match the newfstatat
+    // narrowing that thread_group_holding.rs already uses for this fixture.
+    backend
+        .attach(&[CheckpointDecl {
+            id: CheckpointId::new("newfstatat"),
+            kind: CheckpointKind::Syscall,
+            target: "newfstatat".into(),
+            category: None,
+        }])
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut first: Option<NotifyHandle> = None;
@@ -1887,9 +2112,46 @@ limactl shell sched-ext -- bash -lc \
    done'
 ```
 
-`go_run.sh` needs a `--gate` passthrough if it hardcodes `--freezer` — read it first and add the passthrough if so. Expected: no worse than the freezer's result. Section 14-A means this is not guaranteed 100%; record what it actually is.
+`go_run.sh` hardcodes `--freezer` at line 18 (confirmed before dispatch) — add a `--gate`
+passthrough rather than editing the flag in place, so the freezer path keeps working. Expected:
+no worse than the freezer's result. Section 14-A means this is not guaranteed 100%; record what
+it actually is.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Record the two latencies, with their definitions, and quote no ratio**
+
+Added after the plan was written, because the spec changed under it. The spec's
+"roughly an order of magnitude sharper" claim was **withdrawn** while reviewing Task 8
+(commit `d61ad4ff`); see the two-clocks table at
+`docs/superpowers/specs/2026-09-19-crfuzz-ops-dispatch-gate-design.md`. `max_gate_latency`
+clocks the cost to *issue* a hold; `max_freeze_latency` clocks the kernel *converging*. The
+intervals are disjoint, so their quotient means nothing. The spec names Task 9 as the owner
+of the resolution and gives it two options; this step takes the second.
+
+**Do not modify `backend_gate.rs` or `backend_freezer.rs`.** Both are reviewed and
+spec-compliant; the defect was in the spec's comparison, not in either measurement. This step
+only *reports*.
+
+Run the same scenario under each backend and capture both stats lines:
+
+```bash
+limactl shell sched-ext -- bash -lc \
+  'cd /workspace/scx/scheds/experimental/scx_crfuzz/scenarios
+   sudo /workspace/scx/target-linux/debug/scx_crfuzz_gated & sleep 3
+   sudo ../../../../target-linux/debug/scx_crfuzz --gate    race_wins.json 2>&1 | grep -i latency
+   sudo ../../../../target-linux/debug/scx_crfuzz --freezer race_wins.json 2>&1 | grep -i latency'
+```
+
+Write the result into the report file as a table with three columns — backend, measured
+value, and **what the clock actually covers** — reproducing the spec's wording for the
+latter. State explicitly that no ratio is quoted and why. This table is what Task 10 Step 3
+consumes; Task 10 must not reintroduce a comparison.
+
+If the two numbers happen to land close together, say so plainly. A gate that is not
+dramatically faster to *issue* than a cgroup write is an unremarkable result and does not
+threaten the claim this branch actually rests on — no `ERESTARTSYS`, no fresh notification
+id, a stable `NotifyHandle` — which Step 3's soundness test is what proves.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add scheds/experimental/scx_crfuzz
@@ -1950,7 +2212,11 @@ Replace the two rows:
 
 It is now a description, not a TODO. Rewrite it as "Holding a thread group: the gate", keeping the three numbered reasons the freezer had to go (they are the motivation and they are still true), and adding:
 
-- the measured `max gate latency` recorded in Task 8 Step 4, against the freezer's ~350 µs;
+- the two latencies **as Task 9 Step 7 recorded them**: each with a statement of what its
+  clock covers, and **no ratio between them**. The spec's "roughly an order of magnitude
+  sharper" claim was withdrawn in `d61ad4ff` because `max_gate_latency` measures the cost to
+  issue a hold and `max_freeze_latency` measures the kernel converging — disjoint intervals.
+  Do not write "against the freezer's ~350 µs", and do not divide the two numbers;
 - the honest statement that the boundary is sharper, not zero, with the phase-2 in-kernel closure named;
 - the 30 s `ops.timeout_ms` ceiling, which the freezer had no equivalent of;
 - that `scx_crfuzz_gated` must be running first, and `--gate` fails rather than degrading if it is not.
@@ -1963,7 +2229,7 @@ Add the measured `--gate` column beside `--freezer`.
 
 - [ ] **Step 5: Update `docs/arch/backends.md`**
 
-Add a `GateBackend` section after `FreezerBackend`, covering the map, `HOLD_DSQ`, the enqueue/dispatch/exit_task behaviour, `SWITCH_PARTIAL` enrollment, and the four failure modes from the spec's error-handling table. Amend "What `ops.dispatch` would fix" from conditional to past tense, and correct its claim that the boundary is "one scheduling round rather than a convergence wait" to match the measured number — the kick is one round, but the userspace round trip before it is not.
+Add a `GateBackend` section after `FreezerBackend`, covering the map, `HOLD_DSQ`, the enqueue/dispatch/exit_task behaviour, `SWITCH_PARTIAL` enrollment, and the four failure modes from the spec's error-handling table. Amend "What `ops.dispatch` would fix" from conditional to past tense, and correct its claim that the boundary is "one scheduling round rather than a convergence wait": the kick is one round, but the userspace round trip before it is not, and — per `d61ad4ff` — the gate and freezer latency numbers are not comparable quantities, so state what each covers instead of contrasting them.
 
 - [ ] **Step 6: Update `docs/arch/gaps.md`**
 
@@ -1999,10 +2265,11 @@ docs: the gate exists; gaps.md #7 is closed
 The arch docs asserted the ops.dispatch backend did not exist and that results
 against multi-threaded targets were unsound. Both are now false.
 
-Records the measured gate latency against the freezer's ~350us rather than the
-spec's estimate, keeps the honest limits (the boundary is sharper, not zero;
-ops.timeout_ms caps a hold at 30s; section 14-A is untouched), and adds the
-veristat baseline.
+Records both measured latencies with what each clock covers rather than a ratio
+between them -- that comparison was withdrawn in d61ad4ff because the two clocks
+measure disjoint intervals. Keeps the honest limits (the boundary is sharper,
+not zero; ops.timeout_ms caps a hold at 30s; section 14-A is untouched), and
+adds the veristat baseline.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 EOF

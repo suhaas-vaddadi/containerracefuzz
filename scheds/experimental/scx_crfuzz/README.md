@@ -29,8 +29,8 @@ Design: [`docs/sched_replay/design_doc.md`](../../../../docs/sched_replay/design
 | Barrier → Enforcing → Draining state machine | implemented, tested |
 | Canonical log + projection back to `steps[]` | implemented, tested |
 | `SeccompNotifyBackend` — holds real processes | implemented, **Linux only**, validated against a synthetic scenario |
-| `FreezerBackend` — extends a hold to the thread group | **proof of concept**, Linux only — works, but see "TODO" below |
-| `sched_ext` `struct_ops` backend (`ops.dispatch` gating) | **not implemented** — the intended mechanism; see "TODO" below |
+| `FreezerBackend` — extends a hold to the thread group | **proof of concept**, Linux only — kept as the baseline `GateBackend` is measured against |
+| `GateBackend` — `sched_ext` `ops.dispatch` gating | implemented, Linux only, needs `scx_crfuzz_gated` running |
 | Mutator, racer, oracle, harness, Class B PID-reuse module | out of scope — see "Seams" in the crate docs |
 
 `SeccompNotifyBackend` covers every `syscall` checkpoint, which is the whole of
@@ -47,10 +47,10 @@ That gap is now measured rather than asserted.
 `tests/thread_group_holding.rs` holds a multi-threaded fixture at a checkpoint
 and watches the threads that should have been held with it:
 
-| Fixture | OS threads | Bytes written during a 300 ms hold | With `--freezer` |
-|---|---|---|---|
-| `threaded_victim.c` (pthreads) | 2 | 255 | **0** |
-| `go_victim.go` (goroutines) | 11 | 920 | **0** |
+| Fixture | OS threads | Bytes written during a 300 ms hold | With `--freezer` | With `--gate` |
+|---|---|---|---|---|
+| `threaded_victim.c` (pthreads) | 2 | 255 | **0** | **0** |
+| `go_victim.go` (goroutines) | 11 | 920 | **0** | **0** |
 
 The Go row is the one that matters: runc and containerd are Go, and Go's
 `sysmon` responds to a thread blocked in a syscall by handing its work to
@@ -58,7 +58,7 @@ another M — so holding one thread in a notification is itself what provokes th
 runtime into running more. Four of those eleven threads are pinned siblings the
 fixture creates; the rest the runtime raised on its own.
 
-## TODO: replace the freezer with `ops.dispatch`
+## Holding a thread group: the gate
 
 `FreezerBackend` (`src/backend_freezer.rs`) is a **proof of concept**, kept
 because it is a useful baseline to measure against — not because it is the
@@ -67,7 +67,7 @@ answer. It wraps `SeccompNotifyBackend` and writes `1` to the held task's
 syscall) and the freezer supplies the group coverage (nothing else in the
 thread group gets CPU).
 
-Three reasons it has to go, the first of which was found by building it:
+Three reasons it had to go, the first of which was found by building it:
 
 1. **It perturbs the syscall it is holding.** Freezing a cgroup wakes every
    task in it, including one parked in a seccomp notification. That wait is
@@ -87,16 +87,55 @@ Three reasons it has to go, the first of which was found by building it:
 3. **It costs milliseconds per step**, which caps how many interleavings a
    discovery run can explore per second.
 
-`ops.dispatch` has none of these. Gating is a map lookup on the enqueue path,
-so the boundary is one scheduling round rather than a convergence wait; a
-sleeping task is off-CPU already and gets gated on its way back in; and nothing
-touches the syscall path, so there is no restart to correct for. The system-wide
-risk is smaller than it looks — `SCX_OPS_SWITCH_PARTIAL` schedules only tasks
-explicitly moved to `SCHED_EXT`, leaving the rest of the machine on CFS, and
-`ops.timeout_ms` ejects a stuck scheduler.
+`GateBackend` (`src/backend_gate.rs`, talking to the `sched_ext` scheduler in
+the separate `scx_crfuzz_gate` crate) is the intended mechanism, and it now
+exists. Gating is a map lookup on the enqueue path: `ops.enqueue` routes a
+gated thread group's tasks into a DSQ nothing consumes, `ops.dispatch` moves
+them back out the moment they're ungated, and `ops.exit_task` reaps a gated
+leader's entry on exit. Nothing touches the syscall path, so there is no
+restart to correct for — the `NotifyHandle` the engine is given stays valid
+for the whole hold.
 
-**Until `ops.dispatch` lands, results against multi-threaded targets remain
-unsound**, freezer or not.
+**The two latencies are not comparable, and neither is reported as a multiple
+of the other** (the earlier claim that the gate was "roughly an order of
+magnitude sharper" was withdrawn in commit `d61ad4ff`, because the two clocks
+below measure different kinds of event, not the same event at different
+speeds):
+
+| Backend | Measured (max, this scenario, 3 runs) | What the clock actually covers |
+|---|---|---|
+| `GateBackend` (`max_gate_latency`, `backend_gate.rs:141-147`) | ~98-112 µs (111.677, 104.983, 97.238 µs) | Starts **before** `map.gate()`, stops **after** `map.kick()` — the cost to **issue** the hold. |
+| `FreezerBackend` (`max_freeze_latency`, `backend_freezer.rs:176-180`) | ~343-346 µs (346.438, 343.07, 345.428 µs) | Starts **after** the `cgroup.freeze` write, stops when `wait_until_frozen` returns — the kernel **converging**. |
+
+The gate's number excludes the scheduling round in which the hold actually
+takes effect; the freezer's excludes the write that starts it. Dividing one by
+the other compares an issue cost to a convergence cost and answers nothing.
+
+**The boundary is sharper, not zero.** Between the seccomp notification
+arriving and userspace writing the gate entry, siblings still run: one
+userspace round trip, on the order of the issue-cost numbers above. Closing
+that residual window to zero needs the gate written in-kernel, in the
+trapping task's own context — an `fentry`/`kprobe` on the seccomp notification
+path — which is phase 2 of the design and not yet built; the map, the
+scheduler and the backend are unchanged by it.
+
+`ops.timeout_ms` is set to 30000 (the kernel's maximum), which the freezer had
+no equivalent of: a gated task is runnable-but-undispatched, exactly what that
+watchdog watches, and exceeding it ejects the scheduler mid-run — for every
+concurrent run on the machine, not just the one that overstayed. `GateBackend`
+treats an approaching timeout as its own run failure rather than waiting for
+the kernel to eject the scheduler underneath it.
+
+`scx_crfuzz_gated` (see `scheds/experimental/scx_crfuzz_gate/README.md`) must
+already be attached before `--gate` is used. `GateBackend::attach` fails the
+run outright if it is not — it never degrades to seccomp-only, because that
+would look identical to a successful multi-threaded hold and be unsound in
+the same way the old default was.
+
+Results under `--gate` do not suffer the freezer's syscall restart. Section
+14-A is still open, though: the gate stops the other threads in a group, it
+does not order their arrival, so run-to-run reproducibility against a
+multi-threaded target is not guaranteed.
 
 ## Build and test
 
@@ -107,19 +146,24 @@ tests anywhere, macOS included:
 cargo test -p scx_crfuzz          # 90 tests on macOS, no kernel needed
 ```
 
-The seccomp and freezer backends are behind `#[cfg(target_os = "linux")]`, and
-their dependencies behind a target cfg in `Cargo.toml`, so none of it reaches
-the host build. On Linux the same command runs 112 — the extra 22 are the
-freezer's and the OCI preflight's own unit tests plus
-`tests/thread_group_holding.rs`, `tests/exit_observation.rs` and
-`tests/exit_status.rs`, which **skip themselves unless run as root** (they
-install a seccomp listener and write `cgroup.freeze`). To actually exercise
-them, inside the VM (see
+The seccomp, freezer and gate backends are behind `#[cfg(target_os = "linux")]`,
+and their dependencies behind a target cfg in `Cargo.toml`, so none of it
+reaches the host build. On Linux the same command runs 120 — the extra 30 are:
+`src/lib.rs`'s own Linux-only backend unit tests (`backend_freezer`,
+`backend_gate` — 9 tests), `src/main.rs`'s OCI preflight unit tests (11), and
+five Linux-only integration test files —
+`tests/thread_group_holding.rs` (5), `tests/handle_stability.rs` (2),
+`tests/exit_observation.rs` (1), `tests/exit_status.rs` (1) and
+`tests/sched_ext_enrollment.rs` (1) — which **skip themselves unless run as
+root** (they install a seccomp listener, write `cgroup.freeze`, or talk to the
+gate), and, for the gate-specific cases among them, unless `scx_crfuzz_gated`
+is also attached. To actually exercise them, inside the VM (see
 `docs/environment/SCHED_EXT_VM.md`):
 
 ```bash
-CARGO_TARGET_DIR=/workspace/scx/target-linux cargo build -p scx_crfuzz
+CARGO_TARGET_DIR=/workspace/scx/target-linux cargo build -p scx_crfuzz -p scx_crfuzz_gate
 cd scheds/experimental/scx_crfuzz/scenarios && make   # builds threaded_victim
+sudo /workspace/scx/target-linux/debug/scx_crfuzz_gated &   # attach the gate first
 sudo CARGO_TARGET_DIR=/workspace/scx/target-linux cargo test -p scx_crfuzz
 ```
 
