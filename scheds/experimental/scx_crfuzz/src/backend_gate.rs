@@ -51,9 +51,8 @@ use std::time::Instant;
 pub struct GateStats {
     pub gates: usize,
     pub ungates: usize,
-    /// Notification-to-kick-complete, summed. The window in which sibling
-    /// threads were still running.
-    pub total_gate_latency: Duration,
+    /// Worst notification-to-kick-complete seen: the cost to *issue* a hold,
+    /// which excludes the scheduling round in which it takes effect.
     pub max_gate_latency: Duration,
 }
 
@@ -148,7 +147,6 @@ impl<B: CheckpointBackend> CheckpointBackend for GateBackend<B> {
 
             self.owner.insert(*handle, tgid);
             self.stats.gates += 1;
-            self.stats.total_gate_latency += latency;
             self.stats.max_gate_latency = self.stats.max_gate_latency.max(latency);
         }
 

@@ -104,8 +104,8 @@ speeds):
 
 | Backend | Measured (max, this scenario, 3 runs) | What the clock actually covers |
 |---|---|---|
-| `GateBackend` (`max_gate_latency`, `backend_gate.rs:141-147`) | ~98-112 µs (111.677, 104.983, 97.238 µs) | Starts **before** `map.gate()`, stops **after** `map.kick()` — the cost to **issue** the hold. |
-| `FreezerBackend` (`max_freeze_latency`, `backend_freezer.rs:176-180`) | ~343-346 µs (346.438, 343.07, 345.428 µs) | Starts **after** the `cgroup.freeze` write, stops when `wait_until_frozen` returns — the kernel **converging**. |
+| `GateBackend` (`max_gate_latency`, set in `poll`) | ~98-112 µs (111.677, 104.983, 97.238 µs) | Starts **before** `map.gate()`, stops **after** `map.kick()` — the cost to **issue** the hold. |
+| `FreezerBackend` (`max_freeze_latency`, set in `freeze`) | ~343-346 µs (346.438, 343.07, 345.428 µs) | Starts **after** the `cgroup.freeze` write, stops when `wait_until_frozen` returns — the kernel **converging**. |
 
 The gate's number excludes the scheduling round in which the hold actually
 takes effect; the freezer's excludes the write that starts it. Dividing one by

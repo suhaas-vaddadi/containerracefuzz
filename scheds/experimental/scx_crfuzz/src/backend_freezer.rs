@@ -102,9 +102,8 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct FreezeStats {
     pub freezes: usize,
     pub thaws: usize,
-    /// Total time spent waiting for `frozen 1` after requesting a freeze. This
+    /// Worst time spent waiting for `frozen 1` after requesting a freeze. This
     /// is the window during which sibling threads were still running.
-    pub total_freeze_latency: Duration,
     pub max_freeze_latency: Duration,
 }
 
@@ -180,7 +179,6 @@ impl<B: CheckpointBackend> FreezerBackend<B> {
         let latency = started.elapsed();
 
         self.stats.freezes += 1;
-        self.stats.total_freeze_latency += latency;
         self.stats.max_freeze_latency = self.stats.max_freeze_latency.max(latency);
         self.frozen.push(cgroup.clone());
         Ok(())

@@ -230,8 +230,8 @@ tracing both call sites rather than comparing their printed values:
 
 | | clock starts | clock stops | so it measures |
 |---|---|---|---|
-| `max_gate_latency` (`backend_gate.rs:141-147`) | before `map.gate()` | after `map.kick()` | the cost to **issue** the hold |
-| `max_freeze_latency` (`backend_freezer.rs:176-180`) | **after** the `cgroup.freeze` write | when `wait_until_frozen` returns | the kernel **converging** |
+| `max_gate_latency` (`backend_gate.rs`, `GateBackend::poll`) | before `map.gate()` | after `map.kick()` | the cost to **issue** the hold |
+| `max_freeze_latency` (`backend_freezer.rs`, `FreezerBackend::freeze`) | **after** the `cgroup.freeze` write | when `wait_until_frozen` returns | the kernel **converging** |
 
 The intervals are disjoint. The gate's number excludes the scheduling round in
 which the hold actually takes effect; the freezer's excludes the write that

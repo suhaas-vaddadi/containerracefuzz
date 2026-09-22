@@ -1,7 +1,7 @@
 # Backends
 
 How a task is actually stopped. `src/backend.rs` (272), `src/backend_seccomp.rs`
-(712), `src/backend_freezer.rs` (440), `src/backend_gate.rs` (294) — plus the
+(712), `src/backend_freezer.rs` (438), `src/backend_gate.rs` (292) — plus the
 `sched_ext` side of the gate, in a separate crate:
 `scx_crfuzz_gate/src/bpf/main.bpf.c` (217), `scx_crfuzz_gate/src/client.rs`
 (238).
