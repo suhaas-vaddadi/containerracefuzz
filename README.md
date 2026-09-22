@@ -20,12 +20,15 @@ time, so exactly one role runs at any moment. Every release is appended to a
 ## Building
 
 ```bash
-cargo test -p scx_crfuzz              # 90 tests, no kernel needed
-cargo build --release                 # the gate needs Linux + clang + libbpf
+cargo test -p scx_crfuzz     # 90 tests on any host; 120 on Linux, which adds
+                             # the seccomp, freezer and gate backend tests
+cargo build --workspace      # scx_crfuzz_gate needs Linux, clang and libbpf
 ```
 
-The `sched_ext` gate requires a kernel with `sched_ext` enabled. See
-`docs/environment/SCHED_EXT_VM.md` for the development VM.
+The `sched_ext` gate requires a kernel with `sched_ext` enabled. The
+development VM is described in `docs/environment/SCHED_EXT_VM.md`, which lives
+one level *above* this checkout alongside `docs/sched_replay/design_doc.md` --
+both are outside the repository, so those paths dangle for a repo-only reader.
 
 ## Provenance
 
