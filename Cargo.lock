@@ -5958,11 +5958,27 @@ dependencies = [
  "nix 0.29.0",
  "rand 0.8.8",
  "rand_chacha",
+ "scx_crfuzz_gate",
  "serde",
  "serde_json",
  "simplelog",
  "tempfile",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "scx_crfuzz_gate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "libbpf-rs 0.27.0",
+ "libc",
+ "log",
+ "scx_cargo",
+ "scx_utils",
+ "simplelog",
 ]
 
 [[package]]

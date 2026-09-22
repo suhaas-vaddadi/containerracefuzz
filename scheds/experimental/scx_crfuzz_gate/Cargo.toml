@@ -1,0 +1,23 @@
+[package]
+name = "scx_crfuzz_gate"
+version = "0.1.0"
+edition = "2021"
+description = "ContainerRaceFuzz gate: a sched_ext scheduler that declines to dispatch a gated thread group."
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
+ctrlc = { version = "3", features = ["termination"] }
+libbpf-rs = "=0.27.0"
+libc = "0.2"
+log = "0.4"
+scx_utils = { path = "../../../rust/scx_utils", version = "1.1.3" }
+simplelog = "0.12"
+
+[build-dependencies]
+scx_cargo = { path = "../../../rust/scx_cargo", version = "1.1.3" }
+
+[[bin]]
+name = "scx_crfuzz_gated"
+path = "src/main.rs"
