@@ -64,6 +64,14 @@ struct Args {
     #[arg(long)]
     freezer: bool,
 
+    /// Hold thread groups with the `sched_ext` gate instead of the cgroup
+    /// freezer. Requires `scx_crfuzz_gated` to be running.
+    ///
+    /// This is the intended mechanism: unlike `--freezer` it does not restart
+    /// the syscall it holds. Mutually exclusive with `--freezer`.
+    #[arg(long, conflicts_with = "freezer")]
+    gate: bool,
+
     /// An OCI bundle to check before running: if its `linux.seccomp` profile
     /// denies a syscall a checkpoint sits on, refuse to start.
     ///
@@ -286,6 +294,31 @@ fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
 
     let seccomp = SeccompNotifyBackend::new(specs, args.cgroup_path.clone())
         .with_poll_timeout(Duration::from_millis(args.poll_timeout_ms));
+
+    if args.gate {
+        use scx_crfuzz::backend_gate::GateBackend;
+        // No per-spawn cgroups: unlike the freezer, the gate acts on the
+        // thread group the held task belongs to, so roles sharing one cgroup
+        // do not interfere.
+        let backend = GateBackend::new(seccomp.with_sched_ext(true))?;
+        return run_engine(
+            config,
+            backend,
+            |b| {
+                let s = b.stats();
+                format!(
+                    "{}\ngate: {} gate(s), {} ungate(s), max gate latency {:?} \
+                     (the cost to issue the hold: notification to kick-complete, \
+                     not the residual window before it takes effect)",
+                    b.inner().arrival_trace().join(" "),
+                    s.gates,
+                    s.ungates,
+                    s.max_gate_latency
+                )
+            },
+            |b| b.inner().child_exit_code(),
+        );
+    }
 
     if args.freezer {
         use scx_crfuzz::backend_freezer::FreezerBackend;

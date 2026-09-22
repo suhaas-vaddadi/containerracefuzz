@@ -12,10 +12,29 @@ set -eu
 BIN="${CRFUZZ_BIN:-/workspace/scx/target-linux/debug/scx_crfuzz}"
 HERE=$(cd "$(dirname "$0")" && pwd)
 "$HERE/setup.sh" /tmp/crfuzz
+
+# --gate is a passthrough, not a swap of the line below: it strips itself out
+# of the caller's arguments and selects the mechanism flag here instead, so
+# the default stays --freezer and every existing freezer invocation (Step 5's
+# manual experiment included) keeps working unchanged.
+MECHANISM="--freezer"
+n=$#
+i=0
+while [ "$i" -lt "$n" ]; do
+    a="$1"
+    shift
+    if [ "$a" = "--gate" ]; then
+        MECHANISM="--gate"
+    else
+        set -- "$@" "$a"
+    fi
+    i=$((i + 1))
+done
+
 exec sudo "$BIN" \
     --config "$HERE/go_race.json" \
     --cgroup-path /crfuzz/run0 \
-    --freezer \
+    "$MECHANISM" \
     --spawn "$HERE/go_victim /tmp/crfuzz/target /tmp/crfuzz/goprog" \
     --spawn "$HERE/racer /tmp/crfuzz/evil /tmp/crfuzz/target" \
     "$@"

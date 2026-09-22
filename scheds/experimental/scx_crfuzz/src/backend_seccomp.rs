@@ -161,6 +161,11 @@ pub struct SeccompNotifyBackend {
     /// test (`role.rs`, `resolve_role`), so a task in `<cgroup>/spawn0` still
     /// matches a role declaring `<cgroup>`.
     per_spawn_cgroups: bool,
+    /// Place each spawned target in `SCHED_EXT` before `exec`, so the gate's
+    /// scheduler sees it. Off by default: with `SCX_OPS_SWITCH_PARTIAL` an
+    /// un-enrolled task stays on CFS, which is exactly what the non-`--gate`
+    /// paths want.
+    sched_ext: bool,
     /// Every notification, in the order it was received, as
     /// `<spawn index>:<checkpoint>`.
     ///
@@ -192,12 +197,18 @@ impl SeccompNotifyBackend {
             announced: Vec::new(),
             poll_timeout: Duration::from_millis(50),
             per_spawn_cgroups: false,
+            sched_ext: false,
             arrival: Vec::new(),
         }
     }
 
     pub fn with_per_spawn_cgroups(mut self, yes: bool) -> Self {
         self.per_spawn_cgroups = yes;
+        self
+    }
+
+    pub fn with_sched_ext(mut self, yes: bool) -> Self {
+        self.sched_ext = yes;
         self
     }
 
@@ -308,18 +319,19 @@ impl SeccompNotifyBackend {
         match unsafe { nix::unistd::fork() }.context("fork")? {
             ForkResult::Child => {
                 drop(parent_sock);
-                let rc = match child_setup(&cgroup_procs, &watched, &child_sock, spec) {
-                    Ok(never) => match never {},
-                    Err(e) => {
-                        // Deliberately raw: the child must not touch the
-                        // logger's mutex after fork.
-                        let msg = format!("scx_crfuzz child setup failed: {e}\n");
-                        unsafe {
-                            libc::write(2, msg.as_ptr().cast(), msg.len());
+                let rc =
+                    match child_setup(&cgroup_procs, &watched, &child_sock, spec, self.sched_ext) {
+                        Ok(never) => match never {},
+                        Err(e) => {
+                            // Deliberately raw: the child must not touch the
+                            // logger's mutex after fork.
+                            let msg = format!("scx_crfuzz child setup failed: {e}\n");
+                            unsafe {
+                                libc::write(2, msg.as_ptr().cast(), msg.len());
+                            }
+                            127
                         }
-                        127
-                    }
-                };
+                    };
                 unsafe { libc::_exit(rc) }
             }
             ForkResult::Parent { child } => {
@@ -408,6 +420,7 @@ fn child_setup(
     watched: &[i32],
     sock: &OwnedFd,
     spec: &ProcessSpec,
+    sched_ext: bool,
 ) -> Result<Never> {
     std::fs::write(cgroup_procs, format!("{}\n", std::process::id()))
         .with_context(|| format!("joining cgroup via {}", cgroup_procs.display()))?;
@@ -425,6 +438,22 @@ fn child_setup(
     // The target has no use for the listener; the engine holds the only copy
     // that matters.
     unsafe { libc::close(notify_fd) };
+
+    if sched_ext {
+        // Policy is inherited across fork and CLONE_THREAD, so this one call
+        // enrolls the whole tree the target goes on to build -- including
+        // threads a Go runtime raises later -- and nothing else on the
+        // machine. Same construction the seccomp filter uses: act between
+        // fork and exec, then let inheritance do the rest.
+        const SCHED_EXT: libc::c_int = 7;
+        let param: libc::sched_param = unsafe { std::mem::zeroed() };
+        // SAFETY: `param` is a zeroed sched_param, valid for SCHED_EXT, and
+        // pid 0 means the calling thread.
+        if unsafe { libc::sched_setscheduler(0, SCHED_EXT, &param) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("enrolling the target in SCHED_EXT -- is scx_crfuzz_gated running?");
+        }
+    }
 
     let argv: Vec<CString> = spec
         .argv

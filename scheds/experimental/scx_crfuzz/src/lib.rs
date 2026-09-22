@@ -44,8 +44,11 @@
 //! that made the syscall; Background requires holding the whole thread group.
 //! For a single-threaded target those coincide, and this backend is sound. For
 //! a Go binary -- runc, containerd, the actual targets -- they do not, and the
-//! `ops.dispatch` half of the base design is what closes the gap. Until that
-//! exists, treat results against multi-threaded targets as unsound.
+//! `ops.dispatch` half of the base design ([`backend_gate::GateBackend`], over
+//! `scx_crfuzz_gate`) is what closes the gap. Results under `--gate` do not
+//! suffer the freezer's syscall restart; section 14-A is still open, so
+//! run-to-run reproducibility against a multi-threaded target is not
+//! guaranteed.
 //!
 //! [`backend_freezer::FreezerBackend`] is a proof of concept that closes the
 //! *measurable* part of that gap with the cgroup v2 freezer:
@@ -53,19 +56,24 @@
 //! during a 300 ms hold under seccomp alone and zero under the freezer. It is
 //! explicitly not the answer -- freezing interrupts the held task's
 //! notification and restarts its syscall, so the instrument perturbs what it
-//! measures. See that module's header and the crate README's `ops.dispatch`
-//! TODO.
+//! measures. See that module's header and the crate README's "Holding a
+//! thread group: the gate" section.
 //!
 //! ## Seams
 //!
 //! Components the design doc specifies but that are deliberately not in this
 //! crate, with the interface each would attach to:
 //!
-//! - **`sched_ext` `struct_ops` backend** (Background). The remaining half of
-//!   the holding mechanism: `ops.dispatch` declining to place a task on a CPU,
-//!   which is what extends a hold from one thread to a whole thread group and
-//!   what `uprobe`/`kprobe`/`lsm` checkpoints need. Implements the same
-//!   [`backend::CheckpointBackend`]; nothing above it changes when it lands.
+//! - **`sched_ext` `struct_ops` backend** (Background). Implemented, but in a
+//!   separate crate: `scx_crfuzz_gate`, whose BPF program (`crfuzz_gate_ops`)
+//!   and daemon (`scx_crfuzz_gated`) supply the map and the dispatch queue
+//!   that decline to place a gated thread group's tasks on a CPU. It is a
+//!   separate crate because BPF needs a `build.rs`, and a `build.rs` runs on
+//!   every host -- keeping it out of this crate is what preserves this
+//!   crate's "builds and tests anywhere, macOS included" property. This
+//!   crate's own [`backend_gate::GateBackend`] talks to it over the pinned
+//!   maps and implements the same [`backend::CheckpointBackend`]; nothing
+//!   above it changed when it landed.
 //! - **Mutator** (section 6.1). A pipeline stage strictly *upstream*: it emits
 //!   an OCI spec plus the list of paths that spec references, before `runc` is
 //!   invoked and therefore before any process tree exists for roles to be
@@ -160,10 +168,17 @@ pub mod backend;
 /// per-thread hold to a whole thread group.
 ///
 /// Linux-only. Not the intended mechanism: see the module header and the
-/// `ops.dispatch` TODO in the crate README for why its asynchronous boundary
-/// makes it a measuring stick rather than an answer.
+/// crate README's "Holding a thread group: the gate" section for why its
+/// asynchronous boundary makes it a measuring stick rather than an answer.
 #[cfg(target_os = "linux")]
 pub mod backend_freezer;
+/// The `ops.dispatch` gate -- the intended holding mechanism.
+///
+/// Linux-only. Unlike `backend_freezer`, this one does not perturb the syscall
+/// it holds: the held thread stays parked in its seccomp notification for the
+/// whole hold, so the notification id the engine was given stays valid.
+#[cfg(target_os = "linux")]
+pub mod backend_gate;
 /// The seccomp user-notification backend -- the one that holds real processes.
 ///
 /// Linux-only, and deliberately so: keeping it behind a target cfg is what

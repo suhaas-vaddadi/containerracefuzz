@@ -18,6 +18,9 @@ use scx_crfuzz::backend::BackendEvent;
 use scx_crfuzz::backend::CheckpointBackend;
 use scx_crfuzz::backend::NotifyHandle;
 use scx_crfuzz::backend::Poll;
+use scx_crfuzz::backend_gate::GateBackend;
+use scx_crfuzz::backend_seccomp::ProcessSpec;
+use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
 use scx_crfuzz::checkpoint::CheckpointDecl;
 use scx_crfuzz::checkpoint::CheckpointId;
 use scx_crfuzz::checkpoint::CheckpointKind;
@@ -320,5 +323,83 @@ fn holding_a_go_role_holds_every_thread_the_runtime_is_using() {
          held: the sibling goroutines wrote {} bytes",
         "some",
         after - at_hit
+    );
+}
+
+#[test]
+fn the_gate_holds_the_whole_thread_group() {
+    if skip_unless_root("the_gate_holds_the_whole_thread_group") {
+        return;
+    }
+    if !scx_crfuzz_gate::GateMap::scheduler_enabled() {
+        eprintln!("skipping: scx_crfuzz_gated is not running");
+        return;
+    }
+    let fixture = scenarios_dir().join("threaded_victim");
+    // Both fixture arguments are load-bearing: threaded_victim.c:49 exits via
+    // VERDICT:usage when argc < 3, without ever creating the sibling thread,
+    // which would make the assertion below vacuously true. Same construction
+    // as the freezer row already in this file.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let progress = tmp.path().join("progress");
+    std::fs::write(&target, "BENIGN\n").unwrap();
+    let spec = ProcessSpec::parse(&format!(
+        "{} {} {}",
+        fixture.display(),
+        target.display(),
+        progress.display()
+    ))
+    .expect("spec");
+    let seccomp = SeccompNotifyBackend::new(vec![spec], "/crfuzz/gate-tgh")
+        .with_sched_ext(true)
+        .with_poll_timeout(Duration::from_millis(50));
+    let mut backend = GateBackend::new(seccomp).unwrap();
+
+    let (at_hit, after) = sibling_progress_while_held(&mut backend, &progress);
+    assert_eq!(
+        after, at_hit,
+        "the sibling wrote {} bytes during a {:?} hold; the gate must hold the \
+         whole thread group, not just the notifying thread",
+        after - at_hit,
+        OBSERVE
+    );
+}
+
+#[test]
+fn the_gate_holds_a_go_runtimes_thread_group() {
+    if skip_unless_root("the_gate_holds_a_go_runtimes_thread_group") {
+        return;
+    }
+    if !scx_crfuzz_gate::GateMap::scheduler_enabled() {
+        eprintln!("skipping: scx_crfuzz_gated is not running");
+        return;
+    }
+    let fixture = scenarios_dir().join("go_victim");
+    // go_victim.go:71 has the same argc guard as threaded_victim -- see the note
+    // on the row above.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let progress = tmp.path().join("progress");
+    std::fs::write(&target, "BENIGN\n").unwrap();
+    let spec = ProcessSpec::parse(&format!(
+        "{} {} {}",
+        fixture.display(),
+        target.display(),
+        progress.display()
+    ))
+    .expect("spec");
+    let seccomp = SeccompNotifyBackend::new(vec![spec], "/crfuzz/gate-go")
+        .with_sched_ext(true)
+        .with_poll_timeout(Duration::from_millis(50));
+    let mut backend = GateBackend::new(seccomp).unwrap();
+
+    let (at_hit, after) = sibling_progress_while_held(&mut backend, &progress);
+    assert_eq!(
+        after, at_hit,
+        "the Go fixture's siblings wrote {} bytes during a {:?} hold; under seccomp \
+         alone this is ~920 and under the freezer it is 0",
+        after - at_hit,
+        OBSERVE
     );
 }
