@@ -122,8 +122,10 @@ affected; runc's own work happens before the profile is installed.
 - **The gate caps holds at 30 s.** Longer trips the `sched_ext` watchdog, which
   ejects the scheduler and releases every gate on the machine. `GateBackend`
   detects the ejection and fails the run.
-- **On aarch64, 9 of the 21 structural syscalls don't exist**; checkpoints on
-  them never fire. `fstatat` is aliased to `newfstatat`.
+- **On aarch64, 15 of the 44 structural syscalls don't exist** (the legacy
+  x86_64 names); each has an `*at` form in the set that does, and the backend
+  warns about the rest. The set holds only syscalls that can be the *use* in a
+  check-then-use race; see design doc §4.2 for why checks are left out.
 - **Open design questions** are marked where they bite: §14-C (`RoleRef`,
   `Pct`), §14-D (`CanonicalLog`), §14-H (`RunOutcome`), §14-J
   (`CheckpointBackend::attach`).

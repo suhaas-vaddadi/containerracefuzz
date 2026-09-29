@@ -51,7 +51,7 @@ fn scenario() -> StubBackend {
     StubBackend::new()
         .task(task(100, 100, 1, "runc"))
         .task(task(200, 200, 1, "racer"))
-        .hit(100, "stat")
+        .hit(100, "chdir")
         .hit(100, "openat")
         .hit(100, "mount")
         .exit(100)
@@ -131,7 +131,7 @@ fn a_task_belonging_to_no_role_is_released_without_being_recorded() {
         .task(task(100, 100, 1, "runc"))
         .task(task(900, 900, 1, "sshd"))
         .hit(900, "openat")
-        .hit(100, "stat")
+        .hit(100, "chdir")
         .exit(100)
         .exit(900);
     let mut engine = Engine::new(
@@ -145,7 +145,7 @@ fn a_task_belonging_to_no_role_is_released_without_being_recorded() {
     assert_eq!(
         engine.canonical_log().len(),
         2,
-        "only the victim's stat and exit: got\n{log}"
+        "only the victim's chdir and exit: got\n{log}"
     );
 }
 
@@ -264,7 +264,7 @@ fn replay_config(steps: &str, on_divergence: DivergencePolicy) -> ScenarioConfig
                 {{ "id": "racer", "comm": "racer", "cardinality": "pool" }}
             ],
             "checkpoints": [
-                {{ "id": "stat", "kind": "syscall", "target": "stat" }},
+                {{ "id": "chdir", "kind": "syscall", "target": "chdir" }},
                 {{ "id": "openat", "kind": "syscall", "target": "openat" }},
                 {{ "id": "mount", "kind": "syscall", "target": "mount" }},
                 {{ "id": "symlink", "kind": "syscall", "target": "symlink" }},
@@ -282,7 +282,7 @@ fn replay_config(steps: &str, on_divergence: DivergencePolicy) -> ScenarioConfig
 fn abort_on_divergence_ends_the_run_at_the_unsatisfiable_step() {
     let cfg = replay_config(
         r#"[
-            { "role": "victim", "until": "stat" },
+            { "role": "victim", "until": "chdir" },
             { "role": "victim", "until": "never_happens" }
         ]"#,
         DivergencePolicy::Abort,
@@ -304,7 +304,7 @@ fn abort_on_divergence_ends_the_run_at_the_unsatisfiable_step() {
 fn skip_on_divergence_advances_past_the_unsatisfiable_step_and_carries_on() {
     let cfg = replay_config(
         r#"[
-            { "role": "victim", "until": "stat" },
+            { "role": "victim", "until": "chdir" },
             { "role": "victim", "until": "never_happens" },
             { "role": "racer#0", "until": "symlink" }
         ]"#,
@@ -315,7 +315,7 @@ fn skip_on_divergence_advances_past_the_unsatisfiable_step_and_carries_on() {
 
     assert_eq!(outcome, RunOutcome::Completed);
     let log = engine.canonical_log().render();
-    assert!(log.contains("victim\tstat"), "log:\n{log}");
+    assert!(log.contains("victim\tchdir"), "log:\n{log}");
     assert!(log.contains("racer#0\tsymlink"), "log:\n{log}");
     assert!(!log.contains("never_happens"));
 }
@@ -355,7 +355,7 @@ fn a_step_must_name_every_release_not_only_the_interesting_ones() {
     // out the victim's intermediate checkpoints is what lets it reach `mount`.
     let cfg = replay_config(
         r#"[
-            { "role": "victim", "until": "stat" },
+            { "role": "victim", "until": "chdir" },
             { "role": "victim", "until": "openat" },
             { "role": "victim", "until": "mount" }
         ]"#,
@@ -365,7 +365,7 @@ fn a_step_must_name_every_release_not_only_the_interesting_ones() {
     assert_eq!(engine.run().expect("engine run"), RunOutcome::Completed);
     assert_eq!(
         engine.canonical_log().render(),
-        "# scenario toy-victim-racer\n0\tvictim\tstat\n1\tvictim\topenat\n2\tvictim\tmount\n"
+        "# scenario toy-victim-racer\n0\tvictim\tchdir\n1\tvictim\topenat\n2\tvictim\tmount\n"
     );
 }
 
@@ -373,7 +373,7 @@ fn a_step_must_name_every_release_not_only_the_interesting_ones() {
 fn a_schedule_left_unfinished_by_the_scenario_does_not_report_completed() {
     let cfg = replay_config(
         r#"[
-            { "role": "victim", "until": "stat" },
+            { "role": "victim", "until": "chdir" },
             { "role": "victim", "until": "never_happens" }
         ]"#,
         DivergencePolicy::Block,
@@ -399,7 +399,7 @@ fn a_role_keeps_its_identity_across_fork_exec_and_thread_creation() {
         .task(task(100, 100, 1, "runc"))
         .task(task(101, 100, 9999, "runc")) // CLONE_THREAD sibling
         .task(task(150, 150, 100, "runc:[2:INIT]")) // fork + exec
-        .hit(101, "stat")
+        .hit(101, "chdir")
         .hit(150, "mount")
         .exit(150)
         .exit(100);

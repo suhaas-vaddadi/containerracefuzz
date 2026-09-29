@@ -77,10 +77,10 @@ const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 /// Checkpoint targets that libseccomp spells differently, tried as a fallback
 /// when the declared spelling resolves to nothing.
 ///
-/// Design doc section 4.2 names this one `fstatat`; libseccomp (and the aarch64
-/// kernel) call it `newfstatat`. Without this the doc's own default checkpoint
-/// set silently loses its entire path-*resolving* half on aarch64 -- which is
-/// half of what a TOCTOU race is made of.
+/// The design doc names this one `fstatat`; libseccomp (and the aarch64 kernel)
+/// call it `newfstatat`. It is check-shaped, so it is not in the default set
+/// (section 4.2), but a hand-written config may still declare it by the doc's
+/// name, and without this that checkpoint would silently never attach.
 const ARCH_ALIASES: &[(&str, &str)] = &[("fstatat", "newfstatat")];
 
 /// One process the backend launches and instruments.
@@ -125,6 +125,11 @@ struct Listener {
     /// immediately. See `poll` for why that is a correctness bug and not just a
     /// busy-wait.
     hung_up: bool,
+    /// The child has made its first notified syscall. Until then, an `execve`
+    /// from it is the backend's own launch (`child_setup` loads the filter and
+    /// only then execs), not something the target did: the target does not
+    /// exist yet, and the task still carries the engine's `comm`. See `poll`.
+    launched: bool,
 }
 
 /// Holds real processes at real syscalls via `SECCOMP_RET_USER_NOTIF`.
@@ -344,6 +349,7 @@ impl SeccompNotifyBackend {
                     reaped: false,
                     exit_code: None,
                     hung_up: false,
+                    launched: false,
                 })
             }
         }
@@ -649,6 +655,26 @@ impl CheckpointBackend for SeccompNotifyBackend {
                         req.data.syscall.get_name().unwrap_or_else(|_| "?".into()),
                         self.watched.get(&nr).map(|c| c.as_str())
                     );
+                    // The launch exec. `child_setup` makes no watched syscall
+                    // between loading the filter and `execv`, so the child's
+                    // first notification is that exec if `execve` is watched.
+                    // It is the backend's own action, not the target's: let it
+                    // through unreported, so it neither reaches the engine
+                    // under the engine's own `comm` nor shows up in the
+                    // arrival trace section 14-A's experiments compare.
+                    let listener = &mut self.listeners[spawn_idx];
+                    if !listener.launched && pid == listener.child {
+                        listener.launched = true;
+                        if req.data.syscall == ScmpSyscall::from_name("execve")? {
+                            let _ = ScmpNotifResp::new_continue(
+                                req.id,
+                                ScmpNotifRespFlags::CONTINUE,
+                            )
+                            .respond(fd);
+                            continue;
+                        }
+                    }
+
                     let Some(checkpoint) = self.watched.get(&nr).cloned() else {
                         // Not ours to hold; let it through immediately.
                         let _ = ScmpNotifResp::new_continue(req.id, ScmpNotifRespFlags::CONTINUE)
@@ -662,6 +688,19 @@ impl CheckpointBackend for SeccompNotifyBackend {
                             Ok(t) => events.push(BackendEvent::TaskAppeared(t)),
                             Err(e) => log::warn!("could not read /proc for pid {pid}: {e}"),
                         }
+                    }
+                    // After an exec the task is a different program, with a
+                    // different `comm`. A pid is announced once, from what
+                    // /proc says at its first notification -- which, for a
+                    // task that execs into a role binary from something that
+                    // is not a role (a shim forking and exec'ing `runc`), is
+                    // the *old* program, matching no role. Forget it, so its
+                    // next notification announces it again as what it now
+                    // is. A pid that already resolved to a role stays in the
+                    // role table's sticky cache, so this cannot move it.
+                    let name = req.data.syscall.get_name().unwrap_or_default();
+                    if name == "execve" || name == "execveat" {
+                        self.announced.retain(|p| *p != pid);
                     }
                     self.arrival.push(format!("{spawn_idx}:{checkpoint}"));
                     self.pending.insert(req.id, fd);

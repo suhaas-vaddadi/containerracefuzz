@@ -14,9 +14,12 @@ use scx_crfuzz_gen::tracer::StraceTracer;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
-/// scheds/experimental/scx_crfuzz/scenarios/race_wins.json declares exactly
-/// these three checkpoints by hand. This test's ground truth.
-const EXPECTED_CHECKPOINTS: &[&str] = &["newfstatat", "openat", "renameat"];
+/// scheds/experimental/scx_crfuzz/scenarios/race_wins.json declares these
+/// by hand, plus `newfstatat`: it is a replay schedule, and a replay schedule
+/// may name the victim's check as a step. The generator emits only the
+/// use-shaped syscalls a discovery config needs (design doc section 4.2), so
+/// the check is the one expected difference. This test's ground truth.
+const EXPECTED_CHECKPOINTS: &[&str] = &["openat", "renameat"];
 
 #[test]
 fn generated_checkpoints_match_the_hand_written_race_wins_scenario() {

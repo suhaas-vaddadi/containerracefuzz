@@ -10,41 +10,67 @@ use std::process::Command;
 use std::process::Stdio;
 
 /// How many of a syscall's arguments are path-shaped, in the order they
-/// appear -- restricted to the syscalls scx_crfuzz's `STRUCTURAL_SYSCALLS`
-/// set already declares (design doc section 4.2). `mount`'s third string
-/// argument, `filesystemtype`, is deliberately not counted: it names a
-/// filesystem driver, not a path.
+/// appear -- exactly the syscalls in scx_crfuzz's `STRUCTURAL_SYSCALLS`
+/// (design doc section 4.2), the use-shaped ones. Check-shaped syscalls are
+/// not traced: `derive::build_config` would drop them anyway, and a race
+/// always has a use on the contended path, so they add no contention signal.
 ///
-/// `"fstatat"` is deliberately absent: it is not a real syscall name (see
-/// `derive::CATEGORY_LOOKUP_ALIASES`'s comment on the same mismatch) --
-/// only `"newfstatat"` is ever actually emitted by strace/the kernel, and
-/// `strace -e trace=...` rejects `"fstatat"` outright ("invalid system
-/// call") wherever the legacy 32-bit stat family isn't in the syscall
-/// table, e.g. aarch64. Keeping it here would break `StraceTracer` on
-/// exactly the architectures without it, for a name that never appears in
-/// output anyway.
+/// `mount`'s third string argument, `filesystemtype`, is deliberately not
+/// counted: it names a filesystem driver, not a path. `setxattr` and friends
+/// print the attribute name after the path, and `execve` its argv strings,
+/// which the count leaves out.
+/// `move_mount` and `open_tree` often pass `""` with `AT_EMPTY_PATH`; an empty
+/// path matches nothing on another role, so it is harmless.
+///
+/// The legacy x86_64 names (`open`, `mkdir`, `chmod`, ...) have no aarch64
+/// syscall number, but strace still accepts them there, from its 32-bit arm
+/// table (checked: strace 7.2, aarch64), so listing them does not break
+/// `-e trace=`.
 const PATH_ARG_COUNT: &[(&str, usize)] = &[
-    ("stat", 1),
-    ("lstat", 1),
-    ("newfstatat", 1),
-    ("access", 1),
-    ("faccessat", 1),
-    ("faccessat2", 1),
-    ("readlink", 1),
-    ("readlinkat", 1),
     ("openat", 1),
-    ("rename", 2),
+    ("openat2", 1),
+    ("open", 1),
+    ("creat", 1),
+    ("execve", 1),
+    ("execveat", 1),
+    ("mkdirat", 1),
+    ("unlinkat", 1),
     ("renameat", 2),
     ("renameat2", 2),
-    ("symlink", 2),
+    ("linkat", 2),
     ("symlinkat", 2),
-    ("unlink", 1),
-    ("unlinkat", 1),
-    ("mknod", 1),
     ("mknodat", 1),
+    ("mkdir", 1),
+    ("rmdir", 1),
+    ("unlink", 1),
+    ("rename", 2),
+    ("link", 2),
+    ("symlink", 2),
+    ("mknod", 1),
+    ("fchmodat", 1),
+    ("fchmodat2", 1),
+    ("fchownat", 1),
+    ("truncate", 1),
+    ("setxattr", 1),
+    ("lsetxattr", 1),
+    ("removexattr", 1),
+    ("lremovexattr", 1),
+    ("utimensat", 1),
+    ("chmod", 1),
+    ("chown", 1),
+    ("lchown", 1),
+    ("utime", 1),
+    ("utimes", 1),
+    ("futimesat", 1),
     ("mount", 2),
-    ("umount", 1),
     ("umount2", 1),
+    ("pivot_root", 2),
+    ("chroot", 1),
+    ("open_tree", 1),
+    ("move_mount", 2),
+    ("mount_setattr", 1),
+    ("fspick", 1),
+    ("chdir", 1),
 ];
 
 /// Parse one `strace -f` output file's text into path-touching events.
@@ -52,10 +78,11 @@ const PATH_ARG_COUNT: &[(&str, usize)] = &[
 /// Deliberately does not do general syscall-argument parsing: it finds the
 /// syscall name at the start of each line, looks up how many of that
 /// syscall's arguments are paths, and takes that many double-quoted strings
-/// off the line in order. Every syscall in `PATH_ARG_COUNT` has only path
-/// arguments among its quoted strings -- none has a free-text quoted
-/// argument that isn't a path -- so this is exact for the syscall set in
-/// scope, not an approximation of a general parser.
+/// off the line in order. Every syscall in `PATH_ARG_COUNT` prints its path
+/// arguments as its *first* quoted strings -- any other quoted argument (an
+/// xattr name, `mount`'s filesystem type) comes after them -- so this is
+/// exact for the syscall set in scope, not an approximation of a general
+/// parser.
 pub fn parse_strace_output(text: &str) -> Vec<PathEvent> {
     let mut events = Vec::new();
     for line in text.lines() {
@@ -84,9 +111,10 @@ pub fn parse_strace_output(text: &str) -> Vec<PathEvent> {
         let paths = extract_quoted_strings(&line[paren..]);
         for path in paths.into_iter().take(n_paths) {
             // `/proc/self/...` always names the calling process itself:
-            // e.g. glibc's static-PIE startup does
-            // `readlinkat(AT_FDCWD, "/proc/self/exe", ...)` to find its own
-            // load bias, and the identical literal string shows up for
+            // e.g. runtimes open `/proc/self/maps`, `/proc/self/fd/N` or
+            // `/proc/self/exe` about themselves (glibc's static-PIE startup
+            // `readlinkat`s the last, though that call is no longer traced),
+            // and the identical literal string shows up for
             // every traced role without ever naming a real, shared
             // resource -- it's self-referential by construction, not
             // shared. Left in, it would make the contention filter see
@@ -151,9 +179,9 @@ fn extract_quoted_strings(s: &str) -> Vec<String> {
 /// realistic case -- traced role binaries are essentially always
 /// ASCII-named), but could diverge from the kernel's byte count for a
 /// hypothetical multi-byte UTF-8 basename. Derived from the command itself
-/// rather than parsed out of a trace: `execve` isn't in `PATH_ARG_COUNT`,
-/// and the traced command's own `argv[0]` already carries this information
-/// without widening what gets traced.
+/// rather than parsed out of a trace: `execve` is traced, but the traced
+/// command's own `argv[0]` already carries this information, with no need
+/// to pick the role's first exec out of `strace -f` output.
 pub fn derive_comm(cmd: &str) -> Option<String> {
     let program = cmd.split_whitespace().next()?;
     let base = program.rsplit('/').next().unwrap_or(program);
@@ -215,7 +243,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_openat_renameat_and_newfstatat_lines() {
+    fn parses_use_shaped_lines_and_ignores_check_shaped_ones() {
         let text = concat!(
             "newfstatat(AT_FDCWD, \"/tmp/crfuzz/target\", {st_mode=S_IFREG|0644, st_size=7, ...}, AT_SYMLINK_NOFOLLOW) = 0\n",
             "openat(AT_FDCWD, \"/tmp/crfuzz/target\", O_RDONLY) = 3\n",
@@ -225,10 +253,6 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                PathEvent {
-                    syscall: "newfstatat".into(),
-                    path: "/tmp/crfuzz/target".into()
-                },
                 PathEvent {
                     syscall: "openat".into(),
                     path: "/tmp/crfuzz/target".into()
@@ -303,7 +327,7 @@ mod tests {
         // actual shared path in the TOCTOU sense the contention filter
         // looks for.
         let text = concat!(
-            "readlinkat(AT_FDCWD, \"/proc/self/exe\", \"/bin/victim\", 4096) = 11\n",
+            "openat(AT_FDCWD, \"/proc/self/exe\", O_RDONLY) = 3\n",
             "openat(AT_FDCWD, \"/tmp/crfuzz/target\", O_RDONLY) = 3\n",
         );
         let events = parse_strace_output(text);
@@ -313,6 +337,22 @@ mod tests {
                 syscall: "openat".into(),
                 path: "/tmp/crfuzz/target".into()
             }]
+        );
+    }
+
+    #[test]
+    fn only_the_leading_quoted_strings_are_taken_as_paths() {
+        let text = concat!(
+            "setxattr(\"/tmp/crfuzz/target\", \"user.x\", \"v\", 1, 0) = 0\n",
+            "mount(\"/tmp/crfuzz/src\", \"/tmp/crfuzz/dst\", \"tmpfs\", 0, NULL) = 0\n",
+        );
+        let paths: Vec<String> = parse_strace_output(text)
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/tmp/crfuzz/target", "/tmp/crfuzz/src", "/tmp/crfuzz/dst"]
         );
     }
 

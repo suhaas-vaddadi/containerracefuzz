@@ -6,8 +6,9 @@
 
 use scx_crfuzz::checkpoint::CheckpointDecl;
 use scx_crfuzz::checkpoint::CheckpointId;
+use scx_crfuzz::checkpoint::structural_category;
 use scx_crfuzz::checkpoint::CheckpointKind;
-use scx_crfuzz::checkpoint::STRUCTURAL_SYSCALLS;
+use scx_crfuzz::checkpoint::PathCategory;
 use scx_crfuzz::config::DivergencePolicy;
 use scx_crfuzz::config::Mode;
 use scx_crfuzz::config::PolicyDecl;
@@ -36,37 +37,23 @@ pub struct RoleTrace {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DeriveError {
     #[error(
-        "no path was touched by two or more of the traced roles ({0:?}); nothing to checkpoint"
+        "no path was touched by a use-shaped syscall in two or more of the traced roles ({0:?}); nothing to checkpoint"
     )]
     NoSharedPaths(Vec<String>),
 }
 
-/// The design doc's table spells this syscall `fstatat`; this crate only
-/// ever observes real strace/kernel output, which spells it `newfstatat`
-/// (scx_crfuzz::backend_seccomp has a private, non-reusable ARCH_ALIASES
-/// hitting the identical mismatch from the other direction). Category
-/// still comes from nowhere but STRUCTURAL_SYSCALLS -- this only
-/// normalizes the key used to look it up.
-const CATEGORY_LOOKUP_ALIASES: &[(&str, &str)] = &[("newfstatat", "fstatat")];
-
-fn structural_category(name: &str) -> Option<scx_crfuzz::checkpoint::PathCategory> {
-    let canonical = CATEGORY_LOOKUP_ALIASES
-        .iter()
-        .find(|(observed, _)| *observed == name)
-        .map_or(name, |(_, canonical)| *canonical);
-    STRUCTURAL_SYSCALLS
-        .iter()
-        .find(|(n, _)| *n == canonical)
-        .map(|(_, c)| *c)
-}
-
 /// Build a discovery-mode `ScenarioConfig` from a set of role traces.
 ///
-/// Checkpoints come from the contention filter: a path touched by only one
-/// role can't be raced, so it contributes nothing. A path touched by two or
-/// more roles has every syscall seen on it -- from any role -- turned into a
-/// checkpoint, because once a path is a contention candidate, every
-/// path-touching syscall against it is potentially the check or the act.
+/// Only use-shaped events count (`PathCategory::Mutating`, design doc
+/// section 4.2): a check-shaped syscall is never a checkpoint, and a race
+/// always has a use on the contended path, so dropping checks up front loses
+/// no contended path.
+///
+/// Checkpoints then come from the contention filter: a path touched by only
+/// one role can't be raced, so it contributes nothing. A path touched by two
+/// or more roles has every use-shaped syscall seen on it -- from any role --
+/// turned into a checkpoint, since any of them may be the victim's use or the
+/// racer's swap.
 pub fn build_config(
     scenario_id: impl Into<String>,
     cgroup: impl Into<String>,
@@ -81,7 +68,11 @@ pub fn build_config(
     let mut roles_by_path: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut syscalls_by_path: HashMap<&str, HashSet<&str>> = HashMap::new();
     for trace in traces {
-        for event in &trace.events {
+        for event in trace
+            .events
+            .iter()
+            .filter(|e| structural_category(&e.syscall) == Some(PathCategory::Mutating))
+        {
             roles_by_path
                 .entry(&event.path)
                 .or_default()
@@ -117,7 +108,7 @@ pub fn build_config(
             id: CheckpointId::new(name),
             kind: CheckpointKind::Syscall,
             target: name.to_string(),
-            category: structural_category(name),
+            category: Some(PathCategory::Mutating),
         })
         .collect();
 
@@ -156,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn two_roles_sharing_a_path_produce_checkpoints_for_every_syscall_on_that_path() {
+    fn two_roles_sharing_a_path_produce_checkpoints_for_its_use_shaped_syscalls_only() {
         let victim = trace(
             "victim",
             vec![
@@ -178,7 +169,8 @@ mod tests {
             .map(|c| c.id.as_str().to_string())
             .collect();
         ids.sort();
-        assert_eq!(ids, vec!["newfstatat", "openat", "renameat"]);
+        // The victim's `newfstatat` is its check: seen, but never a checkpoint.
+        assert_eq!(ids, vec!["openat", "renameat"]);
     }
 
     #[test]
@@ -204,13 +196,24 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_category_is_looked_up_from_the_engines_structural_table() {
-        let victim = trace("victim", vec![("newfstatat", "/p")]);
-        let racer = trace("racer", vec![("newfstatat", "/p")]);
+    fn every_checkpoint_is_tagged_use_shaped() {
+        let victim = trace("victim", vec![("openat", "/p")]);
+        let racer = trace("racer", vec![("renameat", "/p")]);
         let cfg = build_config("s", "/c", 1, &[victim, racer]).unwrap();
+        assert!(cfg
+            .checkpoints
+            .iter()
+            .all(|c| c.category == Some(PathCategory::Mutating)));
+    }
+
+    #[test]
+    fn a_path_shared_only_through_checks_is_not_contention() {
+        let victim = trace("victim", vec![("newfstatat", "/p")]);
+        let racer = trace("racer", vec![("readlinkat", "/p")]);
+        let err = build_config("s", "/c", 1, &[victim, racer]).unwrap_err();
         assert_eq!(
-            cfg.checkpoints[0].category,
-            Some(scx_crfuzz::checkpoint::PathCategory::Resolving)
+            err,
+            DeriveError::NoSharedPaths(vec!["victim".into(), "racer".into()])
         );
     }
 
