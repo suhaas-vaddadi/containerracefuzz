@@ -60,7 +60,7 @@ struct Args {
     /// roles sharing one cgroup would share a freezer and deadlock each other.
     ///
     /// This is a proof of concept and it perturbs what it measures: freezing
-    /// restarts the held syscall. See the crate README's `ops.dispatch` TODO.
+    /// restarts the held syscall. Prefer `--gate`, which does not.
     #[arg(long)]
     freezer: bool,
 

@@ -1,5 +1,8 @@
 # Synthetic check-then-use scenario
 
+(Other fixtures here — `threaded_victim`, `go_victim`, `runc.json` — are covered
+in the crate README.)
+
 The minimal target the engine was first validated against (design doc §10.1,
 §10.2). Two single-threaded static C programs and a three-file fixture.
 
@@ -23,7 +26,7 @@ it shows up in every canonical log here.
 ## Build and run
 
 ```sh
-make                                     # victim, racer
+make                                     # all fixtures (see Makefile)
 ./run.sh race_wins.json                  # swap lands between check and use
 ./run.sh race_loses.json                 # swap lands after the use
 ./experiment.sh <seed> <runs> <policy>   # distinct logs / arrival orders

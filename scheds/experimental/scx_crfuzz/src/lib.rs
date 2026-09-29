@@ -56,8 +56,8 @@
 //! during a 300 ms hold under seccomp alone and zero under the freezer. It is
 //! explicitly not the answer -- freezing interrupts the held task's
 //! notification and restarts its syscall, so the instrument perturbs what it
-//! measures. See that module's header and the crate README's "Holding a
-//! thread group: the gate" section.
+//! measures (see its module header). It remains as the baseline
+//! [`backend_gate::GateBackend`] is measured against.
 //!
 //! ## Seams
 //!
@@ -167,9 +167,9 @@ pub mod backend;
 /// The cgroup v2 freezer decorator -- a proof of concept that extends a
 /// per-thread hold to a whole thread group.
 ///
-/// Linux-only. Not the intended mechanism: see the module header and the
-/// crate README's "Holding a thread group: the gate" section for why its
-/// asynchronous boundary makes it a measuring stick rather than an answer.
+/// Linux-only. Not the intended mechanism: see the module header for why its
+/// syscall restart and asynchronous boundary make it a measuring stick rather
+/// than an answer.
 #[cfg(target_os = "linux")]
 pub mod backend_freezer;
 /// The `ops.dispatch` gate -- the intended holding mechanism.

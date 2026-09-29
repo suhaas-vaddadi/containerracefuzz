@@ -4,7 +4,7 @@
 # than merely available: go_victim runs on ~11 OS threads, and seccomp alone
 # holds exactly one of them.
 #
-# Discovery, not replay. A hand-written schedule would have to name the six
+# Discovery, not replay. A hand-written schedule would have to name the five
 # openat calls the Go runtime makes before main() ever runs -- which is the
 # same startup noise that will dominate a runc scenario, and the reason the
 # generator's contention filter exists.

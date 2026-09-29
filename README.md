@@ -15,7 +15,7 @@ time, so exactly one role runs at any moment. Every release is appended to a
 |---|---|
 | [`scx_crfuzz`](scheds/experimental/scx_crfuzz) | The engine: roles, checkpoints, decision policies, the canonical log, and the checkpoint backends. Pure Rust; builds and tests on any host, macOS included. |
 | [`scx_crfuzz_gate`](scheds/experimental/scx_crfuzz_gate) | The `sched_ext` scheduler that holds a whole thread group by declining to dispatch it, plus the `scx_crfuzz_gated` daemon. Linux only — it is a separate crate because BPF needs a `build.rs`, and a `build.rs` runs on every host. |
-| [`scx_crfuzz_gen`](scheds/experimental/scx_crfuzz_gen) | Derives a discovery-mode scenario config from real traced behavior via `strace`. |
+| [`scx_crfuzz_gen`](scheds/experimental/scx_crfuzz_gen) | `crfuzz_gen`: derives a discovery-mode scenario config by tracing each role with `strace` and keeping only the paths two or more roles touch. |
 
 ## Building
 
@@ -25,10 +25,10 @@ cargo test -p scx_crfuzz     # 90 tests on any host; 120 on Linux, which adds
 cargo build --workspace      # scx_crfuzz_gate needs Linux, clang and libbpf
 ```
 
-The `sched_ext` gate requires a kernel with `sched_ext` enabled. The
-development VM is described in `docs/environment/SCHED_EXT_VM.md`, which lives
-one level *above* this checkout alongside `docs/sched_replay/design_doc.md` --
-both are outside the repository, so those paths dangle for a repo-only reader.
+The gate needs a `sched_ext`-enabled kernel. The development VM
+(`docs/environment/SCHED_EXT_VM.md`) and the design doc
+(`docs/sched_replay/design_doc.md`) live one level above this checkout, outside
+the repository.
 
 ## Provenance
 

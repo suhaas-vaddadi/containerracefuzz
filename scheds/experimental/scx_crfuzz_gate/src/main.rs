@@ -181,8 +181,9 @@ fn main() -> Result<()> {
     // runs scx_utils::import_enums!, which writes the running kernel's
     // SCX_DSQ_GLOBAL/etc. values into the skeleton's rodata before load.
     // Skipping it leaves SCX_DSQ_GLOBAL at its link-time value of 0, so
-    // dispatch's scx_bpf_dsq_move_to_local() targets DSQ 0, which the kernel
-    // rejects as an invalid DSQ id and the scheduler is disabled on the spot.
+    // enqueue's and dispatch's moves to SCX_DSQ_GLOBAL target DSQ 0, which the
+    // kernel rejects as an invalid DSQ id and the scheduler is disabled on the
+    // spot.
     let mut skel = scx_ops_open!(skel_builder, &mut open_object, crfuzz_gate_ops, None)
         .context("open skel")?;
     skel.struct_ops.crfuzz_gate_ops_mut().flags |= *scx_utils::compat::SCX_OPS_SWITCH_PARTIAL;

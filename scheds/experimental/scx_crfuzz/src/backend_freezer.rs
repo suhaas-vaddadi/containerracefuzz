@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // PROOF OF CONCEPT. Not the intended holding mechanism -- see "Why this is not
-// the answer" below, and the `ops.dispatch` TODO in the crate README.
+// the answer" below. The intended mechanism is `backend_gate::GateBackend`;
+// this stays as the baseline it is measured against.
 //
 // A decorator that extends another backend's hold from one *thread* to a whole
 // *thread group*, using the cgroup v2 freezer.
