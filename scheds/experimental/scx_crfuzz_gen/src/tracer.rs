@@ -188,54 +188,46 @@ pub fn derive_comm(cmd: &str) -> Option<String> {
     Some(base.chars().take(15).collect())
 }
 
-/// Something that can observe a command's path-touching syscalls. One
-/// implementation for now (`StraceTracer`); the seam exists so a future
-/// tracer (ptrace directly, or something else) can be swapped in without
-/// touching `derive::build_config` or the CLI, both of which are written
-/// against `Vec<PathEvent>`, never against strace.
-pub trait ProcessTracer {
-    fn trace(&self, cmd: &str) -> Result<Vec<PathEvent>>;
-}
+/// Observe a command's path-touching syscalls under strace.
+///
+/// `derive::build_config` and the CLI consume `Vec<PathEvent>`, never strace
+/// itself, so a different tracer can replace this function without touching
+/// them.
+pub fn trace(cmd: &str) -> Result<Vec<PathEvent>> {
+    let out = tempfile::NamedTempFile::new().context("creating strace output tempfile")?;
+    let syscalls: Vec<&str> = PATH_ARG_COUNT.iter().map(|(name, _)| *name).collect();
+    let mut words = cmd.split_whitespace();
+    let program = words.next().context("empty role command")?;
+    let args: Vec<&str> = words.collect();
 
-pub struct StraceTracer;
+    let status = Command::new("strace")
+        .arg("-f")
+        .arg("-e")
+        .arg(format!("trace={}", syscalls.join(",")))
+        .arg("-o")
+        .arg(out.path())
+        .arg("--")
+        .arg(program)
+        .args(&args)
+        .stdout(Stdio::null())
+        .status()
+        .context("spawning strace -- is it installed?")?;
 
-impl ProcessTracer for StraceTracer {
-    fn trace(&self, cmd: &str) -> Result<Vec<PathEvent>> {
-        let out = tempfile::NamedTempFile::new().context("creating strace output tempfile")?;
-        let syscalls: Vec<&str> = PATH_ARG_COUNT.iter().map(|(name, _)| *name).collect();
-        let mut words = cmd.split_whitespace();
-        let program = words.next().context("empty role command")?;
-        let args: Vec<&str> = words.collect();
-
-        let status = Command::new("strace")
-            .arg("-f")
-            .arg("-e")
-            .arg(format!("trace={}", syscalls.join(",")))
-            .arg("-o")
-            .arg(out.path())
-            .arg("--")
-            .arg(program)
-            .args(&args)
-            .stdout(Stdio::null())
-            .status()
-            .context("spawning strace -- is it installed?")?;
-
-        // `strace -f -o file -- prog args` exits with the TRACED PROGRAM's
-        // exit status (or 128+signal), not a status specific to strace's
-        // own failure to instrument -- so a role command that legitimately
-        // exits non-zero must not, on its own, discard an otherwise-usable
-        // trace. The real error signal is an empty output file: that only
-        // happens when strace never produced any trace data at all, e.g.
-        // it couldn't exec the program, or ptrace was denied before
-        // anything ran.
-        let text = std::fs::read_to_string(out.path()).context("reading strace output file")?;
-        if text.is_empty() && !status.success() {
-            anyhow::bail!(
+    // `strace -f -o file -- prog args` exits with the TRACED PROGRAM's
+    // exit status (or 128+signal), not a status specific to strace's
+    // own failure to instrument -- so a role command that legitimately
+    // exits non-zero must not, on its own, discard an otherwise-usable
+    // trace. The real error signal is an empty output file: that only
+    // happens when strace never produced any trace data at all, e.g.
+    // it couldn't exec the program, or ptrace was denied before
+    // anything ran.
+    let text = std::fs::read_to_string(out.path()).context("reading strace output file")?;
+    if text.is_empty() && !status.success() {
+        anyhow::bail!(
                 "strace produced no output while tracing `{cmd}` (exited {status}) -- is strace installed and able to trace this program?"
             );
-        }
-        Ok(parse_strace_output(&text))
     }
+    Ok(parse_strace_output(&text))
 }
 
 #[cfg(test)]
@@ -380,9 +372,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn strace_tracer_observes_a_real_openat_call() {
-        let events = StraceTracer
-            .trace("/bin/cat /etc/hostname")
-            .expect("strace must be installed in the VM");
+        let events = trace("/bin/cat /etc/hostname").expect("strace must be installed in the VM");
         assert!(
             events.iter().any(|e| e.path == "/etc/hostname"),
             "expected an openat-family event for /etc/hostname, got {events:?}"

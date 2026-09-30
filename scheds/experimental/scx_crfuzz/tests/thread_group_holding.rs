@@ -21,12 +21,12 @@ use scx_crfuzz::backend_gate::GateBackend;
 use scx_crfuzz::backend_seccomp::ProcessSpec;
 use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
 use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointId;
-use scx_crfuzz::checkpoint::CheckpointKind;
 use std::path::Path;
-use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+
+mod common;
+use common::*;
 
 /// How long to let the held role sit before re-measuring its sibling. The
 /// fixture's sibling writes every 1ms, so a backend that does not hold the
@@ -37,22 +37,10 @@ const OBSERVE: Duration = Duration::from_millis(300);
 const HIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The tests here install a seccomp listener and gate a thread group, which
-/// needs privilege. Skipping rather than failing keeps a plain
-/// `cargo test` green for anyone; the VM runs them under sudo.
+/// needs privilege. Skipping rather than failing keeps a plain `cargo test`
+/// green for anyone; the VM runs them under sudo.
 ///
 /// Returns true if the test should stop.
-fn skip_unless_root(test: &str) -> bool {
-    // SAFETY: getuid is always safe.
-    if unsafe { libc::getuid() } == 0 {
-        return false;
-    }
-    eprintln!("skipping {test}: needs root (seccomp listener)");
-    true
-}
-
-fn scenarios_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scenarios")
-}
 
 fn progress_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
@@ -66,12 +54,7 @@ fn sibling_progress_while_held<B: CheckpointBackend>(
     backend: &mut B,
     progress: &Path,
 ) -> (u64, u64) {
-    let checkpoints = vec![CheckpointDecl {
-        id: CheckpointId::new("newfstatat"),
-        kind: CheckpointKind::Syscall,
-        target: "newfstatat".into(),
-        category: None,
-    }];
+    let checkpoints = vec![CheckpointDecl::syscall("newfstatat")];
     backend.attach(&checkpoints).expect("attach");
 
     let deadline = Instant::now() + HIT_TIMEOUT;
@@ -82,10 +65,9 @@ fn sibling_progress_while_held<B: CheckpointBackend>(
         );
         match backend.poll().expect("poll") {
             Poll::Events(events) => {
-                if events
-                    .iter()
-                    .any(|e| matches!(e, BackendEvent::CheckpointHit { .. }))
-                {
+                if events.iter().any(|e| {
+                    matches!(e, BackendEvent::CheckpointHit { .. })
+                }) {
                     // The main thread is now parked inside the kernel. Whatever
                     // the sibling writes from here on is a thread that the role
                     // contract says should be held.
@@ -131,7 +113,8 @@ fn the_gate_holds_the_whole_thread_group() {
 
     let (at_hit, after) = sibling_progress_while_held(&mut backend, &progress);
     assert_eq!(
-        after, at_hit,
+        after,
+        at_hit,
         "the sibling wrote {} bytes during a {:?} hold; the gate must hold the \
          whole thread group, not just the notifying thread",
         after - at_hit,
@@ -169,7 +152,8 @@ fn the_gate_holds_a_go_runtimes_thread_group() {
 
     let (at_hit, after) = sibling_progress_while_held(&mut backend, &progress);
     assert_eq!(
-        after, at_hit,
+        after,
+        at_hit,
         "the Go fixture's siblings wrote {} bytes during a {:?} hold; under seccomp \
          alone this is ~920 and under the gate it is 0",
         after - at_hit,

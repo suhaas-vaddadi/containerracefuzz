@@ -4,8 +4,8 @@
 // actually hold a task.
 //
 // Everything the design doc requires to be real -- seccomp in user-notification
-// mode, uprobe/kprobe/LSM attachment, `ops.dispatch` declining to place a task
-// on a CPU (Background, "Checkpoint") -- is Linux-only, privileged, and
+// mode, `ops.dispatch` declining to place a task on a CPU (Background,
+// "Checkpoint") -- is Linux-only, privileged, and
 // untestable off-target. It therefore lives behind this trait, so the engine's
 // phase machine, role resolution, policies and log can be exercised on any
 // host against `StubBackend`.
@@ -85,19 +85,10 @@ pub trait CheckpointBackend {
 /// put several roles at their own checkpoints simultaneously -- the situation
 /// section 3.2 introduces and that the base design never had to handle.
 ///
-/// IMPORTANT (design doc section 14-A): because the script fixes the order in
-/// which tasks reach their checkpoints, any determinism this backend
-/// demonstrates is determinism of `decide()` as a pure function of
-/// `(seed, ready-set-sequence)` -- and nothing more.
-///
-/// That distinction is not hypothetical. Measured against real processes with
-/// `backend_seccomp::SeccompNotifyBackend`, the ready-set sequence is *not*
-/// reproducible: about one run in a few hundred has two roles reach their first
-/// checkpoint in the opposite order, which reverses their position in the ready
-/// set and diverges the whole run. So a green determinism test here says
-/// nothing whatsoever about whether the same seed reproduces against real
-/// processes -- it demonstrably does not, every few hundred runs. See the
-/// crate docs, "Section 14-A is no longer open".
+/// IMPORTANT (design doc section 14-A): the script fixes arrival order, so a
+/// green determinism test here says nothing about real processes, where
+/// arrival order is not reproducible. See the crate docs, "Section 14-A is no
+/// longer open".
 #[derive(Debug, Default)]
 pub struct StubBackend {
     /// Task pids in the order they were first scripted; drives emission order.

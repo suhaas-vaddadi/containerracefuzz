@@ -9,8 +9,7 @@
 use scx_crfuzz_gen::derive::build_config;
 use scx_crfuzz_gen::derive::RoleTrace;
 use scx_crfuzz_gen::tracer::derive_comm;
-use scx_crfuzz_gen::tracer::ProcessTracer;
-use scx_crfuzz_gen::tracer::StraceTracer;
+use scx_crfuzz_gen::tracer::trace;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
@@ -48,17 +47,16 @@ fn generated_checkpoints_match_the_hand_written_race_wins_scenario() {
         target.display()
     );
 
-    let tracer = StraceTracer;
     let traces = vec![
         RoleTrace {
             name: "victim".into(),
             comm: derive_comm(&victim_cmd).unwrap(),
-            events: tracer.trace(&victim_cmd).expect("tracing victim"),
+            events: trace(&victim_cmd).expect("tracing victim"),
         },
         RoleTrace {
             name: "racer".into(),
             comm: derive_comm(&racer_cmd).unwrap(),
-            events: tracer.trace(&racer_cmd).expect("tracing racer"),
+            events: trace(&racer_cmd).expect("tracing racer"),
         },
     ];
 

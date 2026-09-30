@@ -85,8 +85,7 @@
 //!   pre-empt either question.
 //! - **Harness** (Background). Owns the disposable VM, the fresh scenario
 //!   cgroup, and the supervisory wall-clock timeout measured from the canonical
-//!   log's last advance. For PCT it also owns the throwaway counting run that
-//!   estimates `k` (section 3.4); [`policy::Pct`] takes `k` as given.
+//!   log's last advance.
 //! - **PID/identity-reuse module, Class B** (section 9). Consumes the role,
 //!   checkpoint and decision-policy machinery here and adds a cursor tracker
 //!   and filler-cycle planner. That planner sits *outside*
@@ -101,8 +100,7 @@
 //! Design doc section 14 raises eleven; five bear directly on types here and
 //! are marked at the relevant declaration: **14-A** (is the *ready set's*
 //! arrival order itself deterministic? -- **answered, see below**), **14-C**
-//! (how a pool hit is identified in the log -- [`role::RoleRef`],
-//! [`policy::Pct`]), **14-D** (nothing links a log to its originating config --
+//! (how a pool hit is identified in the log -- [`role::RoleRef`]), **14-D** (nothing links a log to its originating config --
 //! [`log::CanonicalLog`]), **14-H** (the run-outcome taxonomy --
 //! [`engine::RunOutcome`]), **14-J** (the attachment race for late pool members
 //! -- [`backend::CheckpointBackend::attach`]). Only 14-A is resolved.
@@ -113,10 +111,11 @@
 //! against real processes (`scenarios/flake.sh`): holding the seed fixed and
 //! varying nothing, roughly one run in a few hundred sees the two roles reach
 //! their first checkpoint in the opposite order. The ready set then arrives at
-//! `decide()` with the same two members in the other position, `RandomWalk`
-//! indexes by position, a different member is released, and the entire run
+//! `decide()` with the same two members in the other position; a policy that
+//! indexes by position releases a different member, and the entire run
 //! diverges -- including the security verdict, which flips between "the victim
-//! read the secret" and "the victim refused a symlink".
+//! read the secret" and "the victim refused a symlink". (This was measured
+//! against the since-retired `RandomWalk`, which indexed by position.)
 //!
 //! Section 10.1 says ordering determinism "holds trivially if `decide()` is a
 //! pure function of `(seed, ready-set-sequence)`". That premise is true here --
@@ -143,14 +142,11 @@
 //! the ready set entirely, and `decide()` only ever searches for that target
 //! rather than indexing into arrival order. Real-world timing can then only
 //! change *when* the target shows up, never *which* target was chosen.
-//! [`policy::Pct`]'s tie-break was moved onto the same canonical `RoleRef`
-//! ordering for the same reason. [`policy::RandomWalk`] keeps its original,
-//! arrival-order-dependent behaviour -- it is retained as the literal
-//! baseline the measurement above was taken against, not as a recommended
-//! policy for a campaign that needs the reproducibility guarantee.
+//! The arrival-order-dependent `RandomWalk` that
+//! this flake was measured against has since been retired.
 //!
 //! This is still a scaffold-level judgment call, not something the design
-//! doc itself has decided: §3.4 describes `RandomWalk` as uniform choice
+//! doc itself has decided: §3.4 describes the baseline as uniform choice
 //! "over the ready set," and `OrderedWalk`'s role-first, ready-set-blind
 //! draw is a different reading of that. It is recorded here as the concrete
 //! fix, with the reasoning that motivates it, not as a doc amendment.

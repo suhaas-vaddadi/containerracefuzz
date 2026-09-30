@@ -37,17 +37,16 @@ a 300 ms hold:
 | `threaded_victim.c` | 2 | 255 | 0 |
 | `go_victim.go` | 11 | 920 | 0 |
 
-Policies: `FixedSchedule` (replay), `RandomWalk`, `OrderedWalk`, `Pct`
-(discovery).
+Policies: `FixedSchedule` (replay), `OrderedWalk` (discovery).
 
 ## Build and test
 
 ```bash
-cargo test -p scx_crfuzz      # 90 tests; any host, macOS included
+cargo test -p scx_crfuzz      # 78 tests; any host, macOS included
 ```
 
 The engine is pure Rust with no `build.rs`. The seccomp and gate backends are
-`#[cfg(target_os = "linux")]`. On Linux the same command runs 114; the
+`#[cfg(target_os = "linux")]`. On Linux the same command runs 99; the
 Linux-only integration tests skip unless root, and the gate cases
 unless `scx_crfuzz_gated` is attached. In the VM:
 
@@ -127,8 +126,7 @@ affected; runc's own work happens before the profile is installed.
   x86_64 names); each has an `*at` form in the set that does, and the backend
   warns about the rest. The set holds only syscalls that can be the *use* in a
   check-then-use race; see design doc §4.2 for why checks are left out.
-- **Open design questions** are marked where they bite: §14-C (`RoleRef`,
-  `Pct`), §14-D (`CanonicalLog`), §14-H (`RunOutcome`), §14-J
+- **Open design questions** are marked where they bite: §14-C (`RoleRef`), §14-D (`CanonicalLog`), §14-H (`RunOutcome`), §14-J
   (`CheckpointBackend::attach`).
 
 Not built: mutator, oracle, campaign driver, Class B PID-reuse (see "Seams" in

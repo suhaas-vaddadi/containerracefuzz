@@ -35,11 +35,11 @@ use scx_crfuzz::backend::BackendEvent;
 use scx_crfuzz::backend::CheckpointBackend;
 use scx_crfuzz::backend::Poll;
 use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointId;
-use scx_crfuzz::checkpoint::CheckpointKind;
-use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+
+mod common;
+use common::*;
 
 /// Mirrors `engine::MAX_IDLE_ROUNDS`. Not imported, because the point of the
 /// test is that the engine's constant means what the engine thinks it means.
@@ -53,19 +53,6 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(50);
 /// spin could reach. Loose on purpose: this is asserting that idle polls wait
 /// at all, not that they wait precisely.
 const MIN_BUDGET: Duration = Duration::from_millis(500);
-
-fn skip_unless_root(test: &str) -> bool {
-    // SAFETY: getuid is always safe.
-    if unsafe { libc::getuid() } == 0 {
-        return false;
-    }
-    eprintln!("skipping {test}: needs root (seccomp listener)");
-    true
-}
-
-fn scenarios_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scenarios")
-}
 
 /// Drive a multi-threaded child to completion, releasing every checkpoint
 /// immediately, and report `(longest run of consecutive idle polls, how long
@@ -90,12 +77,7 @@ fn drive_to_exit(tag: &str) -> (usize, Duration, bool) {
         &format!("/crfuzz/{tag}"),
     );
     backend
-        .attach(&[CheckpointDecl {
-            id: CheckpointId::new("newfstatat"),
-            kind: CheckpointKind::Syscall,
-            target: "newfstatat".into(),
-            category: None,
-        }])
+        .attach(&[CheckpointDecl::syscall("newfstatat")])
         .expect("attach");
 
     let mut saw_exit = false;

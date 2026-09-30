@@ -23,8 +23,6 @@ use crate::policy::Decision;
 use crate::policy::DecisionPolicy;
 use crate::policy::FixedSchedule;
 use crate::policy::OrderedWalk;
-use crate::policy::Pct;
-use crate::policy::RandomWalk;
 use crate::policy::ReadyCheckpointHit;
 use crate::role::Pid;
 use crate::role::Provenance;
@@ -93,22 +91,10 @@ pub struct Engine<B: CheckpointBackend> {
     tgids: HashMap<Pid, Pid>,
     canonical: CanonicalLog,
     debug: DebugLog,
-    /// The ready set as it stood at each `decide()` call.
-    ///
-    /// Design doc section 10.1 rests ordering determinism on `decide()` being
-    /// "a pure function of `(seed, ready-set-sequence)`". This is that
-    /// ready-set-sequence, recorded so the premise can actually be checked
-    /// rather than assumed.
-    ///
-    /// It is deliberately finer-grained than the order in which hits arrive.
-    /// Two runs can see the same arrivals in the same order and still diverge,
-    /// because what `decide()` is handed is the set of everything that has
-    /// arrived *and not yet been released* at that instant. Whether a second
-    /// role's hit lands just before or just after a decision changes the set
-    /// that decision was made over -- and so changes which random draw is
-    /// consumed -- without changing the arrival order at all. Section 14-A
-    /// asks about arrival order; this is the quantity the purity claim
-    /// actually depends on.
+    /// The ready set as it stood at each `decide()` call: the
+    /// ready-set-sequence section 10.1's determinism claim depends on,
+    /// recorded so it can be compared across runs. Finer-grained than arrival
+    /// order on purpose; see the crate docs, "Section 14-A is no longer open".
     decisions: Vec<String>,
     started: Instant,
 }
@@ -146,14 +132,6 @@ impl<B: CheckpointBackend> Engine<B> {
     /// The ready set at each decision point. See `decisions`.
     pub fn decision_trace(&self) -> &[String] {
         &self.decisions
-    }
-
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-
-    pub fn policy_name(&self) -> &'static str {
-        self.policy.name()
     }
 
     pub fn backend(&self) -> &B {
@@ -242,7 +220,7 @@ impl<B: CheckpointBackend> Engine<B> {
                 // schedule: release it at once and never record it. That is the
                 // blast-radius guarantee -- a bug in this engine must not be
                 // able to degrade or hang unrelated work on the machine.
-                let Some(role) = self.role_of(pid) else {
+                let Some(role) = self.roles.lookup(pid) else {
                     self.backend.release(handle)?;
                     return Ok(());
                 };
@@ -258,7 +236,7 @@ impl<B: CheckpointBackend> Engine<B> {
             BackendEvent::TaskExited(pid) => {
                 // Resolve before eviction: `until: exit` needs to know whose
                 // exit this was.
-                let role = self.role_of(pid);
+                let role = self.roles.lookup(pid);
                 let is_leader = self.is_thread_group_leader(pid);
                 self.roles.on_task_exit(pid);
                 self.provenance.remove(&pid);
@@ -284,10 +262,6 @@ impl<B: CheckpointBackend> Engine<B> {
         Ok(())
     }
 
-    fn role_of(&self, pid: Pid) -> Option<crate::role::RoleRef> {
-        self.roles.lookup(pid)
-    }
-
     /// A role is a thread group, so a single Go runtime thread going away is
     /// not the role exiting -- only the thread-group leader's exit is. A pid
     /// never announced defaults to being its own leader.
@@ -299,8 +273,6 @@ impl<B: CheckpointBackend> Engine<B> {
         let mut released = 0usize;
 
         if self.phase == Phase::Barrier && self.roles.all_roles_seen() {
-            let one_roles = self.roles.one_roles();
-            self.policy.on_barrier(&one_roles);
             self.phase = Phase::Enforcing;
         }
 
@@ -408,7 +380,6 @@ fn build_policy(config: &ScenarioConfig) -> Box<dyn DecisionPolicy> {
     match &config.mode {
         Mode::Replay { steps } => Box::new(FixedSchedule::new(steps.clone())),
         Mode::Discovery { policy } => match policy.policy_type {
-            PolicyType::RandomWalk => Box::new(RandomWalk::new(policy.seed)),
             // Drawn against every declared role, including pool roles: a
             // pool's existence (if not its membership) is fixed at
             // config-parse time, so this needs nothing the ready set would
@@ -416,14 +387,6 @@ fn build_policy(config: &ScenarioConfig) -> Box<dyn DecisionPolicy> {
             PolicyType::OrderedWalk => {
                 Box::new(OrderedWalk::new(policy.seed, config.roles.len()))
             }
-            // `d` and `k` are guaranteed present for `pct` by config
-            // validation; the fallbacks keep this total rather than panicking
-            // on a config built in code rather than parsed.
-            PolicyType::Pct => Box::new(Pct::new(
-                policy.seed,
-                policy.params.d.unwrap_or(1),
-                policy.params.k.unwrap_or(0),
-            )),
         },
     }
 }

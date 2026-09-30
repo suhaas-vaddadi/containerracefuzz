@@ -19,19 +19,11 @@
 use scx_crfuzz::backend::CheckpointBackend;
 use scx_crfuzz::backend::Poll;
 use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointId;
-use scx_crfuzz::checkpoint::CheckpointKind;
 use std::time::Duration;
 use std::time::Instant;
 
-fn skip_unless_root(test: &str) -> bool {
-    // SAFETY: getuid is always safe.
-    if unsafe { libc::getuid() } == 0 {
-        return false;
-    }
-    eprintln!("skipping {test}: needs root (seccomp listener)");
-    true
-}
+mod common;
+use common::*;
 
 /// `/usr/bin/false` is the smallest thing that exits nonzero for a reason that
 /// has nothing to do with the engine. Its exit code (1) is deliberately not the
@@ -47,12 +39,7 @@ fn a_spawned_childs_exit_code_is_recorded() {
     let mut backend =
         scx_crfuzz::backend_seccomp::SeccompNotifyBackend::new(vec![spec], "/crfuzz/exitstatus");
     backend
-        .attach(&[CheckpointDecl {
-            id: CheckpointId::new("openat"),
-            kind: CheckpointKind::Syscall,
-            target: "openat".into(),
-            category: None,
-        }])
+        .attach(&[CheckpointDecl::syscall("openat")])
         .expect("attach");
 
     assert_eq!(

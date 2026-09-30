@@ -32,7 +32,6 @@ use crate::backend::Poll;
 use crate::backend::EXIT_HANDLE;
 use crate::checkpoint::CheckpointDecl;
 use crate::checkpoint::CheckpointId;
-use crate::checkpoint::CheckpointKind;
 use crate::role::Pid;
 use crate::role::TaskInfo;
 use anyhow::anyhow;
@@ -54,7 +53,9 @@ use nix::sys::socket::ControlMessageOwned;
 use nix::sys::socket::MsgFlags;
 use nix::sys::socket::SockFlag;
 use nix::sys::socket::SockType;
+use nix::sys::wait::waitid;
 use nix::sys::wait::waitpid;
+use nix::sys::wait::Id;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::ForkResult;
@@ -73,15 +74,6 @@ use std::time::Duration;
 
 /// Where the unified cgroup v2 hierarchy is mounted.
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
-
-/// Checkpoint targets that libseccomp spells differently, tried as a fallback
-/// when the declared spelling resolves to nothing.
-///
-/// The design doc names this one `fstatat`; libseccomp (and the aarch64 kernel)
-/// call it `newfstatat`. It is check-shaped, so it is not in the default set
-/// (section 4.2), but a hand-written config may still declare it by the doc's
-/// name, and without this that checkpoint would silently never attach.
-const ARCH_ALIASES: &[(&str, &str)] = &[("fstatat", "newfstatat")];
 
 /// One process the backend launches and instruments.
 #[derive(Debug, Clone)]
@@ -238,23 +230,16 @@ impl SeccompNotifyBackend {
     fn resolve_checkpoints(&mut self, checkpoints: &[CheckpointDecl]) -> Vec<CheckpointId> {
         let mut unresolved = Vec::new();
         for decl in checkpoints {
-            if decl.kind != CheckpointKind::Syscall {
-                unresolved.push(decl.id.clone());
-                continue;
-            }
-            let alias = ARCH_ALIASES
-                .iter()
-                .find(|(from, _)| *from == decl.target)
-                .map(|(_, to)| *to);
-            let nr = [Some(decl.target.as_str()), alias]
-                .into_iter()
-                .flatten()
-                .find_map(|name| match ScmpSyscall::from_name(name) {
+            // A hand-written config may declare `fstatat` by the design doc's
+            // name; without canonicalising, that checkpoint would silently
+            // never attach.
+            let nr =
+                match ScmpSyscall::from_name(crate::checkpoint::canonical_syscall(&decl.target)) {
                     // A negative number is a libseccomp pseudo-syscall: the
                     // call does not exist on this architecture. See above.
                     Ok(sys) if sys.as_raw_syscall() >= 0 => Some(sys.as_raw_syscall()),
                     _ => None,
-                });
+                };
 
             let Some(nr) = nr else {
                 unresolved.push(decl.id.clone());
@@ -329,7 +314,28 @@ impl SeccompNotifyBackend {
     /// Reap any child that has exited, newest state first.
     fn reap(&mut self, events: &mut Vec<BackendEvent>) {
         loop {
-            let status = waitpid(None, Some(WaitPidFlag::WNOHANG));
+            // Peek before reaping. A spawned child that never made a watched
+            // syscall itself -- `runc run`, whose checkpoints are all hit by
+            // the `runc init` it forks -- was never announced, so the engine
+            // has no role for it and would drop its exit. While it is still a
+            // zombie its /proc entry shows the program it last exec'd, so
+            // announce it now, just ahead of its exit. Doing this at exit
+            // rather than at exec leaves the barrier's timing alone.
+            let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+            let pid = match waitid(Id::All, flags) {
+                Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => pid,
+                _ => break,
+            };
+            let raw = pid.as_raw();
+            if self.listeners.iter().any(|l| l.child == raw) && !self.announced.contains(&raw) {
+                self.announced.push(raw);
+                match read_task_info(raw) {
+                    Ok(t) => events.push(BackendEvent::TaskAppeared(t)),
+                    Err(e) => log::warn!("could not read /proc for exiting pid {raw}: {e}"),
+                }
+            }
+
+            let status = waitpid(pid, Some(WaitPidFlag::WNOHANG));
             match status {
                 Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
                     let raw = pid.as_raw();
@@ -475,13 +481,12 @@ fn recv_fd(sock: &OwnedFd) -> Result<OwnedFd> {
 }
 
 fn set_nonblocking(fd: RawFd) -> Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        bail!(
-            "making the notify fd non-blocking: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    use nix::fcntl::fcntl;
+    use nix::fcntl::FcntlArg;
+    use nix::fcntl::OFlag;
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+        .context("making the notify fd non-blocking")?;
     Ok(())
 }
 
@@ -635,11 +640,9 @@ impl CheckpointBackend for SeccompNotifyBackend {
                     if !listener.launched && pid == listener.child {
                         listener.launched = true;
                         if req.data.syscall == ScmpSyscall::from_name("execve")? {
-                            let _ = ScmpNotifResp::new_continue(
-                                req.id,
-                                ScmpNotifRespFlags::CONTINUE,
-                            )
-                            .respond(fd);
+                            let _ =
+                                ScmpNotifResp::new_continue(req.id, ScmpNotifRespFlags::CONTINUE)
+                                    .respond(fd);
                             continue;
                         }
                     }

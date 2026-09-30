@@ -27,6 +27,7 @@
 
 use scx_crfuzz::backend::StubBackend;
 use scx_crfuzz::config::DivergencePolicy;
+use scx_crfuzz::config::Mode;
 use scx_crfuzz::config::ScenarioConfig;
 use scx_crfuzz::engine::RunOutcome;
 use scx_crfuzz::role::TaskInfo;
@@ -60,19 +61,41 @@ fn scenario() -> StubBackend {
         .exit(200)
 }
 
-fn discovery_config(policy: &str) -> ScenarioConfig {
+fn config_with_roles(roles: &str, policy: &str) -> ScenarioConfig {
     ScenarioConfig::from_json(&format!(
         r#"{{
             "scenario_id": "toy-victim-racer",
             "cgroup": "{CGROUP}",
-            "roles": [
-                {{ "id": "victim", "comm": "runc" }},
-                {{ "id": "racer", "comm": "racer", "cardinality": "pool" }}
-            ],
+            "roles": [{roles}],
             "policy": {policy}
         }}"#
     ))
     .expect("discovery config should parse")
+}
+
+fn discovery_config(policy: &str) -> ScenarioConfig {
+    config_with_roles(
+        r#"{ "id": "victim", "comm": "runc" }, { "id": "racer", "comm": "racer", "cardinality": "pool" }"#,
+        policy,
+    )
+}
+
+/// Both roles `one`. `OrderedWalk` retires a `one` role once it exits, but not
+/// a pool (more members may yet arrive), so a pool target whose members are all
+/// gone is waited on forever. Tests that need the run to finish use this.
+fn one_racer_config(seed: u64) -> ScenarioConfig {
+    config_with_roles(
+        r#"{ "id": "victim", "comm": "runc" }, { "id": "racer", "comm": "racer" }"#,
+        &format!(r#"{{ "type": "ordered_walk", "seed": {seed} }}"#),
+    )
+}
+
+/// The victim alone, for tests where no racer ever runs.
+fn victim_only_config() -> ScenarioConfig {
+    config_with_roles(
+        r#"{ "id": "victim", "comm": "runc" }"#,
+        r#"{ "type": "ordered_walk", "seed": 1 }"#,
+    )
 }
 
 fn run(config: ScenarioConfig) -> (RunOutcome, String, Vec<scx_crfuzz::config::Step>) {
@@ -88,7 +111,7 @@ fn run(config: ScenarioConfig) -> (RunOutcome, String, Vec<scx_crfuzz::config::S
 
 #[test]
 fn a_scenario_runs_to_completion_and_every_release_is_recorded() {
-    let (outcome, log, steps) = run(discovery_config(r#"{ "type": "random_walk", "seed": 1 }"#));
+    let (outcome, log, steps) = run(one_racer_config(1));
     assert_eq!(outcome, RunOutcome::Completed);
     // Five checkpoint hits plus two exits.
     assert_eq!(steps.len(), 7, "log:\n{log}");
@@ -102,7 +125,7 @@ fn nothing_is_released_before_the_barrier_completes() {
     let backend = StubBackend::new()
         .task(task(200, 200, 1, "racer"))
         .hit(200, "symlink");
-    let config = discovery_config(r#"{ "type": "random_walk", "seed": 1 }"#);
+    let config = discovery_config(r#"{ "type": "ordered_walk", "seed": 1 }"#);
     let mut engine = Engine::new(config, backend);
     let outcome = engine.run().expect("engine run");
 
@@ -118,7 +141,7 @@ fn a_pool_role_alone_does_not_satisfy_the_barrier_but_does_not_block_it_either()
     // Section 5: `all_roles_seen()` is evaluated over `one` roles only.
     // The full scenario completes even though no fixed number of pool members
     // was ever declared or waited for.
-    let (outcome, _, steps) = run(discovery_config(r#"{ "type": "random_walk", "seed": 3 }"#));
+    let (outcome, _, steps) = run(discovery_config(r#"{ "type": "ordered_walk", "seed": 3 }"#));
     assert_eq!(outcome, RunOutcome::Completed);
     assert!(steps.iter().any(|s| s.role.starts_with("racer#")));
 }
@@ -134,10 +157,7 @@ fn a_task_belonging_to_no_role_is_released_without_being_recorded() {
         .hit(100, "chdir")
         .exit(100)
         .exit(900);
-    let mut engine = Engine::new(
-        discovery_config(r#"{ "type": "random_walk", "seed": 1 }"#),
-        backend,
-    );
+    let mut engine = Engine::new(victim_only_config(), backend);
     engine.run().expect("engine run");
 
     let log = engine.canonical_log().render();
@@ -154,16 +174,8 @@ fn a_task_belonging_to_no_role_is_released_without_being_recorded() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn random_walk_with_the_same_seed_produces_a_byte_identical_canonical_log() {
-    let cfg = r#"{ "type": "random_walk", "seed": 20260914 }"#;
-    let (_, a, _) = run(discovery_config(cfg));
-    let (_, b, _) = run(discovery_config(cfg));
-    assert_eq!(a, b);
-}
-
-#[test]
-fn pct_with_the_same_seed_produces_a_byte_identical_canonical_log() {
-    let cfg = r#"{ "type": "pct", "seed": 77, "params": { "d": 3, "k": 7 } }"#;
+fn discovery_with_the_same_seed_produces_a_byte_identical_canonical_log() {
+    let cfg = r#"{ "type": "ordered_walk", "seed": 20260914 }"#;
     let (_, a, _) = run(discovery_config(cfg));
     let (_, b, _) = run(discovery_config(cfg));
     assert_eq!(a, b);
@@ -173,14 +185,7 @@ fn pct_with_the_same_seed_produces_a_byte_identical_canonical_log() {
 fn different_seeds_explore_different_interleavings() {
     // Not a guarantee for any particular pair of seeds -- but if no seed ever
     // changed the interleaving, discovery mode would not be exploring anything.
-    let logs: Vec<String> = (0..24)
-        .map(|seed| {
-            run(discovery_config(&format!(
-                r#"{{ "type": "random_walk", "seed": {seed} }}"#
-            )))
-            .1
-        })
-        .collect();
+    let logs: Vec<String> = (0..24).map(|seed| run(one_racer_config(seed)).1).collect();
     let distinct: std::collections::HashSet<&String> = logs.iter().collect();
     assert!(
         distinct.len() > 1,
@@ -199,8 +204,7 @@ fn projecting_a_discovery_log_into_steps_and_replaying_it_reproduces_it_exactly(
     // *is* the schedule format. Against a real backend this same shape becomes
     // section 10.3's check (replay the projection, confirm the same oracle
     // violation); here it confirms the projection itself is faithful.
-    let discovery =
-        discovery_config(r#"{ "type": "pct", "seed": 4242, "params": { "d": 3, "k": 7 } }"#);
+    let discovery = discovery_config(r#"{ "type": "ordered_walk", "seed": 4242 }"#);
     let (outcome, discovered, steps) = run(discovery.clone());
     assert_eq!(outcome, RunOutcome::Completed);
     assert!(!steps.is_empty());
@@ -219,7 +223,7 @@ fn projecting_a_discovery_log_into_steps_and_replaying_it_reproduces_it_exactly(
 fn the_projection_survives_a_round_trip_through_the_config_format() {
     // The projected schedule has to be a config someone can save, hand to
     // another machine, and re-parse -- not just an in-memory value.
-    let discovery = discovery_config(r#"{ "type": "random_walk", "seed": 9 }"#);
+    let discovery = discovery_config(r#"{ "type": "ordered_walk", "seed": 9 }"#);
     let (_, discovered, steps) = run(discovery.clone());
 
     let json = discovery
@@ -227,7 +231,7 @@ fn the_projection_survives_a_round_trip_through_the_config_format() {
         .to_json()
         .expect("serialize");
     let reparsed = ScenarioConfig::from_json(&json).expect("the projection must be a valid config");
-    assert!(!reparsed.is_discovery());
+    assert!(matches!(reparsed.mode, Mode::Replay { .. }));
 
     let (_, replayed, _) = run(reparsed);
     assert_eq!(replayed, discovered);
@@ -237,9 +241,9 @@ fn the_projection_survives_a_round_trip_through_the_config_format() {
 fn replaying_a_projection_is_insensitive_to_the_seed_that_produced_it() {
     // Once projected, the schedule is the authority: nothing about the original
     // policy's randomness survives into replay.
-    let a = discovery_config(r#"{ "type": "random_walk", "seed": 11 }"#);
+    let a = discovery_config(r#"{ "type": "ordered_walk", "seed": 11 }"#);
     let (_, log_a, steps_a) = run(a.clone());
-    let b = discovery_config(r#"{ "type": "random_walk", "seed": 12 }"#);
+    let b = discovery_config(r#"{ "type": "ordered_walk", "seed": 12 }"#);
 
     let (_, replayed, _) = run(b.as_replay_with(steps_a));
     assert_eq!(replayed, log_a);
@@ -404,10 +408,7 @@ fn a_role_keeps_its_identity_across_fork_exec_and_thread_creation() {
         .exit(150)
         .exit(100);
 
-    let mut engine = Engine::new(
-        discovery_config(r#"{ "type": "random_walk", "seed": 1 }"#),
-        backend,
-    );
+    let mut engine = Engine::new(victim_only_config(), backend);
     engine.run().expect("engine run");
 
     let log = engine.canonical_log().render();
@@ -431,7 +432,7 @@ fn pool_members_are_logged_with_their_member_index() {
         .exit(100);
 
     let mut engine = Engine::new(
-        discovery_config(r#"{ "type": "random_walk", "seed": 2 }"#),
+        discovery_config(r#"{ "type": "ordered_walk", "seed": 2 }"#),
         backend,
     );
     engine.run().expect("engine run");
@@ -444,7 +445,7 @@ fn pool_members_are_logged_with_their_member_index() {
 #[test]
 fn the_debug_log_carries_pids_that_the_canonical_log_does_not() {
     let mut engine = Engine::new(
-        discovery_config(r#"{ "type": "random_walk", "seed": 1 }"#),
+        discovery_config(r#"{ "type": "ordered_walk", "seed": 1 }"#),
         scenario(),
     );
     engine.run().expect("engine run");

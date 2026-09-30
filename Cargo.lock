@@ -1434,7 +1434,6 @@ dependencies = [
  "clap",
  "scx_crfuzz",
  "tempfile",
- "thiserror 2.0.20",
 ]
 
 [[package]]

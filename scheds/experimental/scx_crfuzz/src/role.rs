@@ -120,25 +120,6 @@ impl RoleTable {
         }
     }
 
-    pub fn decls(&self) -> &[RoleDecl] {
-        &self.decls
-    }
-
-    pub fn decl(&self, role: RoleId) -> &RoleDecl {
-        &self.decls[role.0]
-    }
-
-    /// Every `one`-cardinality role, in declaration order. This is the set a
-    /// policy is told about at barrier time (see `DecisionPolicy::on_barrier`).
-    pub fn one_roles(&self) -> Vec<RoleId> {
-        self.decls
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.cardinality == Cardinality::One)
-            .map(|(i, _)| RoleId(i))
-            .collect()
-    }
-
     /// Render a role reference the way the canonical log and a schedule's
     /// `steps[]` spell it: `victim`, or `racer#2` for a pool member.
     pub fn render(&self, r: RoleRef) -> String {
@@ -259,15 +240,6 @@ impl RoleTable {
             .filter(|(_, d)| d.cardinality == Cardinality::One)
             .all(|(i, _)| self.seen.contains(&RoleId(i)))
     }
-
-    pub fn is_seen(&self, role: RoleId) -> bool {
-        self.seen.contains(&role)
-    }
-
-    /// How many members a pool has admitted so far.
-    pub fn pool_len(&self, role: RoleId) -> u32 {
-        self.pool_next.get(&role).copied().unwrap_or(0)
-    }
 }
 
 #[cfg(test)]
@@ -278,7 +250,10 @@ mod tests {
     fn decls() -> Vec<RoleDecl> {
         vec![
             RoleDecl::one("victim", "runc"),
-            RoleDecl::pool("racer", "racer"),
+            RoleDecl {
+                cardinality: Cardinality::Pool,
+                ..RoleDecl::one("racer", "racer")
+            },
         ]
     }
 
@@ -373,7 +348,7 @@ mod tests {
         let (b, _) = t.resolve_role(&task(301, 301, 1, "racer")).unwrap();
         assert_eq!(a, RoleRef::pool_member(RoleId(1), 0));
         assert_eq!(b, RoleRef::pool_member(RoleId(1), 1));
-        assert_eq!(t.pool_len(RoleId(1)), 2);
+        assert_eq!(t.pool_next[&RoleId(1)], 2);
     }
 
     #[test]
@@ -401,9 +376,9 @@ mod tests {
     #[test]
     fn pool_is_marked_seen_on_first_match() {
         let mut t = table();
-        assert!(!t.is_seen(RoleId(1)));
+        assert!(!t.seen.contains(&RoleId(1)));
         t.resolve_role(&task(300, 300, 1, "racer")).unwrap();
-        assert!(t.is_seen(RoleId(1)));
+        assert!(t.seen.contains(&RoleId(1)));
     }
 
     #[test]
@@ -423,7 +398,10 @@ mod tests {
         assert!(exact.resolve_role(&t).is_none());
 
         let mut sub = RoleTable::new(
-            vec![RoleDecl::one("victim", "runc").with_substring_match()],
+            vec![RoleDecl {
+                comm_match: CommMatch::Substring,
+                ..RoleDecl::one("victim", "runc")
+            }],
             "/c",
         );
         assert!(sub.resolve_role(&t).is_some());

@@ -67,10 +67,6 @@ impl FixedSchedule {
 }
 
 impl DecisionPolicy for FixedSchedule {
-    fn name(&self) -> &'static str {
-        "fixed_schedule"
-    }
-
     fn decide(&mut self, ready: &[ReadyCheckpointHit]) -> Decision {
         let Some(step) = self.steps.get(self.step_idx) else {
             return Decision::Drain;

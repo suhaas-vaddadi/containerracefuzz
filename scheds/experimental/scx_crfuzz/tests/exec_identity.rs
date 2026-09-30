@@ -22,28 +22,11 @@ use scx_crfuzz::backend::BackendEvent;
 use scx_crfuzz::backend::CheckpointBackend;
 use scx_crfuzz::backend::Poll;
 use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointId;
-use scx_crfuzz::checkpoint::CheckpointKind;
 use std::time::Duration;
 use std::time::Instant;
 
-fn skip_unless_root(test: &str) -> bool {
-    // SAFETY: getuid is always safe.
-    if unsafe { libc::getuid() } == 0 {
-        return false;
-    }
-    eprintln!("skipping {test}: needs root (seccomp listener)");
-    true
-}
-
-fn syscall(name: &str) -> CheckpointDecl {
-    CheckpointDecl {
-        id: CheckpointId::new(name),
-        kind: CheckpointKind::Syscall,
-        target: name.into(),
-        category: None,
-    }
-}
+mod common;
+use common::*;
 
 #[test]
 fn a_task_is_announced_as_the_program_it_became_and_never_as_the_engine() {
@@ -53,12 +36,15 @@ fn a_task_is_announced_as_the_program_it_became_and_never_as_the_engine() {
 
     // Both binaries are dynamically linked, so each makes `openat` calls (the
     // loader's) after its exec -- that is what gets the pid announced again.
-    let spec =
-        scx_crfuzz::backend_seccomp::ProcessSpec::parse("/usr/bin/env /usr/bin/true").expect("spec");
+    let spec = scx_crfuzz::backend_seccomp::ProcessSpec::parse("/usr/bin/env /usr/bin/true")
+        .expect("spec");
     let mut backend =
         scx_crfuzz::backend_seccomp::SeccompNotifyBackend::new(vec![spec], "/crfuzz/execidentity");
     backend
-        .attach(&[syscall("execve"), syscall("openat")])
+        .attach(&[
+            CheckpointDecl::syscall("execve"),
+            CheckpointDecl::syscall("openat"),
+        ])
         .expect("attach");
 
     let mut announced: Vec<String> = Vec::new();

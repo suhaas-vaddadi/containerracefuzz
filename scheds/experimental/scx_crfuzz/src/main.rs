@@ -15,11 +15,9 @@
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
-use scx_crfuzz::backend::StubBackend;
 use scx_crfuzz::config::Mode;
 use scx_crfuzz::log::CanonicalLog;
 use scx_crfuzz::log::DebugLog;
-use scx_crfuzz::Engine;
 use scx_crfuzz::RunOutcome;
 use scx_crfuzz::ScenarioConfig;
 use simplelog::ColorChoice;
@@ -40,9 +38,8 @@ struct Args {
     config: PathBuf,
 
     /// A process to launch and instrument, as a whitespace-separated command
-    /// line. Repeat for each. Linux only; without any, the engine runs against
-    /// the scripted stub backend and holds nothing.
-    #[arg(long = "spawn")]
+    /// line. Repeat for each. Linux only.
+    #[arg(long = "spawn", required = true)]
     spawn: Vec<String>,
 
     /// cgroup v2 path to place spawned processes in, spelled as it appears in
@@ -213,28 +210,9 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_stub(config: ScenarioConfig, note: Option<String>) -> Result<RunReport> {
-    let mut engine = Engine::new(config, StubBackend::new());
-    let outcome = engine.run()?;
-    Ok(RunReport {
-        outcome,
-        canonical: engine.canonical_log().clone(),
-        debug: engine.debug_log().clone(),
-        notes: note,
-        child_exit: None,
-    })
-}
-
 #[cfg(not(target_os = "linux"))]
-fn run(config: ScenarioConfig, _args: &Args) -> Result<RunReport> {
-    run_stub(
-        config,
-        Some(
-            "this is not Linux: no process can be held here, so the engine ran against \
-             the scripted stub backend"
-                .to_string(),
-        ),
-    )
+fn run(_config: ScenarioConfig, _args: &Args) -> Result<RunReport> {
+    anyhow::bail!("holding a process needs Linux; the library and its tests run anywhere")
 }
 
 #[cfg(target_os = "linux")]
@@ -242,17 +220,6 @@ fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
     use scx_crfuzz::backend_seccomp::ProcessSpec;
     use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
     use std::time::Duration;
-
-    if args.spawn.is_empty() {
-        return run_stub(
-            config,
-            Some(
-                "no --spawn given, so the engine ran against the scripted stub backend and \
-                 held nothing"
-                    .to_string(),
-            ),
-        );
-    }
 
     if let Some(bundle) = &args.oci_bundle {
         preflight_bundle(bundle, &config)?;
@@ -381,7 +348,7 @@ fn run_engine<B: scx_crfuzz::backend::CheckpointBackend>(
     arrival: impl FnOnce(&B) -> String,
     child_exit: impl FnOnce(&B) -> Option<i32>,
 ) -> Result<RunReport> {
-    let mut engine = Engine::new(config, backend);
+    let mut engine = scx_crfuzz::Engine::new(config, backend);
     let outcome = engine.run()?;
     // Printed rather than only counted: section 14-A is a question about this
     // exact sequence, and the only way to answer it is to compare it across

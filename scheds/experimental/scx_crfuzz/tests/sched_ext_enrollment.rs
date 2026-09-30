@@ -12,8 +12,6 @@ use scx_crfuzz::backend::Poll;
 use scx_crfuzz::backend_seccomp::ProcessSpec;
 use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
 use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointId;
-use scx_crfuzz::checkpoint::CheckpointKind;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -73,12 +71,7 @@ fn a_spawned_target_and_its_threads_are_in_sched_ext() {
     // assertion below vacuous. thread_group_holding.rs uses this same narrow
     // set for the same fixture and the same reason.
     backend
-        .attach(&[CheckpointDecl {
-            id: CheckpointId::new("fstatat"),
-            kind: CheckpointKind::Syscall,
-            target: "fstatat".into(),
-            category: None,
-        }])
+        .attach(&[CheckpointDecl::syscall("fstatat")])
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);

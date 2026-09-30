@@ -11,15 +11,10 @@ BIN="${CRFUZZ_BIN:-/workspace/scx/target-linux/debug/scx_crfuzz}"
 HERE=$(cd "$(dirname "$0")" && pwd)
 SEED="${1:-1}"
 N="${2:-20}"
-POLICY="${3:-random_walk}"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-if [ "$POLICY" = pct ]; then
-    BLOCK='"policy": { "type": "pct", "seed": '"$SEED"', "params": { "d": 3, "k": 6 } }'
-else
-    BLOCK='"policy": { "type": "random_walk", "seed": '"$SEED"' }'
-fi
+BLOCK='"policy": { "type": "ordered_walk", "seed": '"$SEED"' }'
 sed 's|"policy":.*|'"$BLOCK"'|' "$HERE/discovery.json" > "$WORK/cfg.json"
 
 i=0
@@ -37,7 +32,7 @@ done
 
 LOGS=$(md5sum "$WORK"/log.* | awk '{print $1}' | sort -u | wc -l)
 ARR=$(sort -u "$WORK/arrivals" | wc -l)
-echo "policy=$POLICY seed=$SEED runs=$N"
+echo "policy=ordered_walk seed=$SEED runs=$N"
 echo "  distinct canonical logs (10.1):   $LOGS"
 echo "  distinct arrival orders  (14-A):  $ARR"
 echo "  verdicts: $(sort "$WORK/verdicts" | uniq -c | tr -s ' ' | tr '\n' ' ')"

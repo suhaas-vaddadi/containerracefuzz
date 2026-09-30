@@ -4,10 +4,10 @@
 // it to become ready, rather than indexing into whatever the ready set
 // happens to contain when `decide()` is called.
 //
-// This exists to close design doc section 14-A. `RandomWalk` indexes by
-// position in the ready set (`gen_range(0..ready.len())`), and that position
-// is set by real OS scheduling: arrival order, not the seed, decides which
-// physical role a given draw releases. Measured directly against real
+// This exists to close design doc section 14-A. The since-retired `RandomWalk`
+// indexed by position in the ready set (`gen_range(0..ready.len())`), and that
+// position is set by real OS scheduling: arrival order, not the seed, decides
+// which physical role a given draw releases. Measured directly against real
 // processes, that arrival order is not reproducible -- see the crate docs,
 // "Section 14-A is no longer open" -- so the same seed can release a
 // different role on different runs of the same scenario.
@@ -22,8 +22,7 @@
 // the target role happens to be sitting at.
 //
 // Draws are made against the full declared role count -- including pool
-// roles -- rather than only the `one`-cardinality roles handed to
-// `on_barrier`, since a pool's *existence* (if not its membership) is fixed
+// roles -- rather than only the `one`-cardinality roles, since a pool's *existence* (if not its membership) is fixed
 // at config-parse time and so is available before any process has run. A
 // target naming a pool role is satisfied by whichever member is ready; if
 // several are, the canonically-smallest `RoleRef` wins (lowest member index),
@@ -71,8 +70,7 @@ pub struct OrderedWalk {
     current_target: Option<RoleId>,
     /// Decision *points*, not `decide()` calls: repeated calls while still
     /// waiting on the same target (the engine re-polls and re-enters
-    /// `Enforcing` without a new draw) do not count again. This is the same
-    /// quantity `RandomWalk::decision_count` reports for PCT's `k` estimate.
+    /// `Enforcing` without a new draw) do not count again..
     decisions: u64,
     /// `one`-cardinality roles known to have permanently exited. See the
     /// module doc comment.
@@ -125,10 +123,6 @@ impl OrderedWalk {
 }
 
 impl DecisionPolicy for OrderedWalk {
-    fn name(&self) -> &'static str {
-        "ordered_walk"
-    }
-
     fn decide(&mut self, ready: &[ReadyCheckpointHit]) -> Decision {
         debug_assert!(
             !ready.is_empty(),
@@ -142,7 +136,7 @@ impl DecisionPolicy for OrderedWalk {
 
         // The canonically-smallest match wins a multi-member tie (a pool
         // target with more than one ready member), not the first one to
-        // arrive -- the same reasoning `Pct`'s tie-break uses.
+        // arrive, so the choice does not depend on OS arrival order.
         let found = ready
             .iter()
             .enumerate()
@@ -162,9 +156,9 @@ impl DecisionPolicy for OrderedWalk {
                 self.current_target = None;
                 Decision::Release(i)
             }
-            None => Decision::Divergence(format!(
-                "waiting for role {target:?} to reach a checkpoint"
-            )),
+            None => {
+                Decision::Divergence(format!("waiting for role {target:?} to reach a checkpoint"))
+            }
         }
     }
 

@@ -21,26 +21,19 @@ use scx_crfuzz::backend_gate::tgid_of;
 use scx_crfuzz::backend_seccomp::ProcessSpec;
 use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
 use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointId;
-use scx_crfuzz::checkpoint::CheckpointKind;
 use scx_crfuzz::role::Pid;
 use scx_crfuzz_gate::GateMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-/// The test here installs a privileged seccomp listener and needs the
-/// scheduler attached. Skipping rather than failing keeps a plain
+mod common;
+use common::*;
+
+/// Both tests here install a privileged seccomp listener; the gate test also
+/// needs the scheduler attached. Skipping rather than failing keeps a plain
 /// `cargo test` green for anyone; the VM runs these under sudo with
 /// `scx_crfuzz_gated` already running.
-fn skip_unless_root(test: &str) -> bool {
-    // SAFETY: getuid is always safe.
-    if unsafe { libc::getuid() } != 0 {
-        eprintln!("skipping {test}: needs root (seccomp listener)");
-        return true;
-    }
-    false
-}
 
 fn skip_unless_scheduler(test: &str) -> bool {
     if !GateMap::scheduler_enabled() {
@@ -55,12 +48,7 @@ fn skip_unless_scheduler(test: &str) -> bool {
 /// happens before the sibling thread is created. Matches the `newfstatat`
 /// narrowing `thread_group_holding.rs` already uses for this fixture.
 fn newfstatat_checkpoint() -> CheckpointDecl {
-    CheckpointDecl {
-        id: CheckpointId::new("newfstatat"),
-        kind: CheckpointKind::Syscall,
-        target: "newfstatat".into(),
-        category: None,
-    }
+    CheckpointDecl::syscall("newfstatat")
 }
 
 /// Drive a raw backend until one of its tasks hits a checkpoint.

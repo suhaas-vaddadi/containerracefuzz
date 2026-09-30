@@ -10,7 +10,7 @@ BIN="${CRFUZZ_BIN:-/workspace/scx/target-linux/debug/scx_crfuzz}"
 SEED="${1:-1}"
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 
-sed 's|"policy":.*|"policy": { "type": "random_walk", "seed": '"$SEED"' }|' \
+sed 's|"policy":.*|"policy": { "type": "ordered_walk", "seed": '"$SEED"' }|' \
     "$HERE/discovery.json" > "$W/discovery.json"
 
 "$HERE/setup.sh" /tmp/crfuzz

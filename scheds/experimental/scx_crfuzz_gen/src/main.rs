@@ -11,8 +11,7 @@ use scx_crfuzz::config::ScenarioConfig;
 use scx_crfuzz_gen::derive::build_config;
 use scx_crfuzz_gen::derive::RoleTrace;
 use scx_crfuzz_gen::tracer::derive_comm;
-use scx_crfuzz_gen::tracer::ProcessTracer;
-use scx_crfuzz_gen::tracer::StraceTracer;
+use scx_crfuzz_gen::tracer::trace;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -59,15 +58,12 @@ fn main() -> Result<()> {
         bail!("need at least two `--role name:cmd` entries to find contention between them");
     }
 
-    let tracer = StraceTracer;
     let mut traces = Vec::new();
     for r in &args.role {
         let (name, cmd) = parse_role_arg(r)?;
         let comm =
             derive_comm(&cmd).with_context(|| format!("role `{name}` has an empty command"))?;
-        let events = tracer
-            .trace(&cmd)
-            .with_context(|| format!("tracing role `{name}` (`{cmd}`)"))?;
+        let events = trace(&cmd).with_context(|| format!("tracing role `{name}` (`{cmd}`)"))?;
         traces.push(RoleTrace { name, comm, events });
     }
 

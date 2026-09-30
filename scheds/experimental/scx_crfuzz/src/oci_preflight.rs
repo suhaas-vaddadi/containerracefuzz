@@ -51,7 +51,6 @@ use anyhow::Context;
 use anyhow::Result;
 use libseccomp::ScmpSyscall;
 use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointKind;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -160,9 +159,6 @@ pub fn check(config_json: &str, checkpoints: &[CheckpointDecl]) -> Result<Report
     };
 
     for decl in checkpoints {
-        if decl.kind != CheckpointKind::Syscall {
-            continue;
-        }
         let Some(nr) = syscall_number(&decl.target) else {
             report.absent_on_this_arch.push(decl.target.clone());
             continue;
@@ -206,15 +202,9 @@ pub fn check(config_json: &str, checkpoints: &[CheckpointDecl]) -> Result<Report
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scx_crfuzz::checkpoint::CheckpointId;
 
     fn cp(target: &str) -> CheckpointDecl {
-        CheckpointDecl {
-            id: CheckpointId::new(target),
-            kind: CheckpointKind::Syscall,
-            target: target.into(),
-            category: None,
-        }
+        CheckpointDecl::syscall(target)
     }
 
     fn bundle(seccomp: &str) -> String {
@@ -399,21 +389,5 @@ mod tests {
         .unwrap();
         assert!(r.masked.is_empty());
         assert_eq!(r.conditional.len(), 1);
-    }
-
-    #[test]
-    fn a_non_syscall_checkpoint_is_not_the_profiles_business() {
-        let decl = CheckpointDecl {
-            id: CheckpointId::new("some-probe"),
-            kind: CheckpointKind::Uprobe,
-            target: "openat".into(),
-            category: None,
-        };
-        let r = check(
-            &bundle(r#"{ "defaultAction": "SCMP_ACT_ERRNO", "syscalls": [] }"#),
-            &[decl],
-        )
-        .unwrap();
-        assert!(r.masked.is_empty());
     }
 }

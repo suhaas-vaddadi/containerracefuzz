@@ -4,18 +4,18 @@
 // ScenarioConfig. No I/O, no strace -- unit-tested against hand-written
 // fixtures. See docs/superpowers/specs/2026-09-16-crfuzz-config-generator-design.md.
 
-use scx_crfuzz::checkpoint::CheckpointDecl;
-use scx_crfuzz::checkpoint::CheckpointId;
+use anyhow::bail;
+use anyhow::Result;
 use scx_crfuzz::checkpoint::structural_category;
-use scx_crfuzz::checkpoint::CheckpointKind;
+use scx_crfuzz::checkpoint::CheckpointDecl;
 use scx_crfuzz::checkpoint::PathCategory;
 use scx_crfuzz::config::DivergencePolicy;
 use scx_crfuzz::config::Mode;
 use scx_crfuzz::config::PolicyDecl;
-use scx_crfuzz::config::PolicyParams;
 use scx_crfuzz::config::PolicyType;
 use scx_crfuzz::config::RoleDecl;
 use scx_crfuzz::config::ScenarioConfig;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -32,14 +32,6 @@ pub struct RoleTrace {
     pub name: String,
     pub comm: String,
     pub events: Vec<PathEvent>,
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum DeriveError {
-    #[error(
-        "no path was touched by a use-shaped syscall in two or more of the traced roles ({0:?}); nothing to checkpoint"
-    )]
-    NoSharedPaths(Vec<String>),
 }
 
 /// Build a discovery-mode `ScenarioConfig` from a set of role traces.
@@ -59,57 +51,43 @@ pub fn build_config(
     cgroup: impl Into<String>,
     seed: u64,
     traces: &[RoleTrace],
-) -> Result<ScenarioConfig, DeriveError> {
+) -> Result<ScenarioConfig> {
     let roles: Vec<RoleDecl> = traces
         .iter()
         .map(|t| RoleDecl::one(t.name.clone(), t.comm.clone()))
         .collect();
 
-    let mut roles_by_path: HashMap<&str, HashSet<&str>> = HashMap::new();
-    let mut syscalls_by_path: HashMap<&str, HashSet<&str>> = HashMap::new();
+    // path -> (roles touching it, use-shaped syscalls seen on it)
+    let mut by_path: HashMap<&str, (HashSet<&str>, HashSet<&str>)> = HashMap::new();
     for trace in traces {
         for event in trace
             .events
             .iter()
             .filter(|e| structural_category(&e.syscall) == Some(PathCategory::Mutating))
         {
-            roles_by_path
-                .entry(&event.path)
-                .or_default()
-                .insert(&trace.name);
-            syscalls_by_path
-                .entry(&event.path)
-                .or_default()
-                .insert(&event.syscall);
+            let (roles, syscalls) = by_path.entry(&event.path).or_default();
+            roles.insert(&trace.name);
+            syscalls.insert(&event.syscall);
         }
     }
 
-    let mut checkpoint_syscalls: HashSet<&str> = HashSet::new();
-    for (path, roles_touching) in &roles_by_path {
-        if roles_touching.len() >= 2 {
-            if let Some(set) = syscalls_by_path.get(path) {
-                checkpoint_syscalls.extend(set.iter().copied());
-            }
-        }
-    }
+    // A BTreeSet, so the checkpoints come out sorted.
+    let checkpoint_syscalls: BTreeSet<&str> = by_path
+        .values()
+        .filter(|(roles, _)| roles.len() >= 2)
+        .flat_map(|(_, syscalls)| syscalls.iter().copied())
+        .collect();
 
     if checkpoint_syscalls.is_empty() {
-        return Err(DeriveError::NoSharedPaths(
-            traces.iter().map(|t| t.name.clone()).collect(),
-        ));
+        bail!(
+            "no path was touched by a use-shaped syscall in two or more of the traced roles ({:?}); nothing to checkpoint",
+            traces.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
     }
-
-    let mut checkpoint_syscalls: Vec<&str> = checkpoint_syscalls.into_iter().collect();
-    checkpoint_syscalls.sort_unstable();
 
     let checkpoints: Vec<CheckpointDecl> = checkpoint_syscalls
         .into_iter()
-        .map(|name| CheckpointDecl {
-            id: CheckpointId::new(name),
-            kind: CheckpointKind::Syscall,
-            target: name.to_string(),
-            category: Some(PathCategory::Mutating),
-        })
+        .map(CheckpointDecl::syscall)
         .collect();
 
     Ok(ScenarioConfig {
@@ -122,7 +100,6 @@ pub fn build_config(
             policy: PolicyDecl {
                 policy_type: PolicyType::OrderedWalk,
                 seed,
-                params: PolicyParams::default(),
             },
         },
     })
@@ -178,9 +155,9 @@ mod tests {
         let victim = trace("victim", vec![("openat", "/tmp/crfuzz/target")]);
         let racer = trace("racer", vec![("renameat", "/tmp/crfuzz/evil")]);
         let err = build_config("s", "/c", 1, &[victim, racer]).unwrap_err();
-        assert_eq!(
-            err,
-            DeriveError::NoSharedPaths(vec!["victim".into(), "racer".into()])
+        assert!(
+            err.to_string().contains("no path was touched"),
+            "got: {err}"
         );
     }
 
@@ -211,9 +188,9 @@ mod tests {
         let victim = trace("victim", vec![("newfstatat", "/p")]);
         let racer = trace("racer", vec![("readlinkat", "/p")]);
         let err = build_config("s", "/c", 1, &[victim, racer]).unwrap_err();
-        assert_eq!(
-            err,
-            DeriveError::NoSharedPaths(vec!["victim".into(), "racer".into()])
+        assert!(
+            err.to_string().contains("no path was touched"),
+            "got: {err}"
         );
     }
 

@@ -6,5 +6,5 @@
     { "id": "racer", "comm": "racer" }
   ],
   "on_divergence": "block",
-  "policy": { "type": "random_walk", "seed": 1 }
+  "policy": { "type": "ordered_walk", "seed": 1 }
 }

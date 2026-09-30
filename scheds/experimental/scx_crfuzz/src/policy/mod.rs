@@ -16,17 +16,12 @@
 
 mod fixed;
 mod ordered_walk;
-mod pct;
-mod random_walk;
 
 pub use fixed::FixedSchedule;
 pub use ordered_walk::OrderedWalk;
-pub use pct::Pct;
-pub use random_walk::RandomWalk;
 
 use crate::backend::NotifyHandle;
 use crate::checkpoint::CheckpointId;
-use crate::role::RoleId;
 use crate::role::RoleRef;
 
 /// One role/checkpoint pair currently blocked and eligible to be released.
@@ -63,17 +58,6 @@ pub enum Decision {
 ///
 /// The engine calls `decide` only with a non-empty ready set.
 pub trait DecisionPolicy {
-    fn name(&self) -> &'static str;
-
-    /// Called once when the barrier completes, with every `one`-cardinality
-    /// role in declaration order.
-    ///
-    /// Pool members are deliberately absent: a pool's membership is not fixed
-    /// at barrier time (section 5), which is exactly the tension section 14-C
-    /// notes against PCT's "assign each role a random priority at barrier
-    /// time". Policies that care must say what they do about late arrivals.
-    fn on_barrier(&mut self, _roles: &[RoleId]) {}
-
     fn decide(&mut self, ready: &[ReadyCheckpointHit]) -> Decision;
 
     /// Advance past an unsatisfiable step, for `on_divergence: skip`.

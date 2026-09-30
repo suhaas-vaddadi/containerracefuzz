@@ -10,4 +10,3 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 scx_crfuzz = { path = "../scx_crfuzz" }
 tempfile = "3"
-thiserror = "2"

@@ -9,7 +9,7 @@ BIN="${CRFUZZ_BIN:-/workspace/scx/target-linux/debug/scx_crfuzz}"
 HERE=$(cd "$(dirname "$0")" && pwd)
 SEED="${1:-3}"; N="${2:-200}"
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
-sed 's|"policy":.*|"policy": { "type": "random_walk", "seed": '"$SEED"' }|' \
+sed 's|"policy":.*|"policy": { "type": "ordered_walk", "seed": '"$SEED"' }|' \
     "$HERE/discovery.json" > "$W/cfg.json"
 i=0
 while [ $i -lt "$N" ]; do

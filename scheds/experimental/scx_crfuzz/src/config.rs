@@ -67,22 +67,13 @@ impl RoleDecl {
             cgroup: None,
         }
     }
-
-    pub fn pool(id: impl Into<String>, comm: impl Into<String>) -> Self {
-        RoleDecl {
-            cardinality: Cardinality::Pool,
-            ..RoleDecl::one(id, comm)
-        }
-    }
-
-    pub fn with_substring_match(mut self) -> Self {
-        self.comm_match = CommMatch::Substring;
-        self
-    }
 }
 
 /// A step's stopping condition: a checkpoint, or "run until the role exits".
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized as a bare string: `"exit"`, or the checkpoint id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 pub enum StopCondition {
     Checkpoint(CheckpointId),
     Exit,
@@ -113,18 +104,6 @@ impl From<StopCondition> for String {
     }
 }
 
-impl Serialize for StopCondition {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for StopCondition {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        Ok(StopCondition::from(String::deserialize(de)?))
-    }
-}
-
 /// One entry of a replay schedule's `steps[]`.
 ///
 /// `role` is spelled the way `RoleTable::render` spells it -- `victim`, or
@@ -150,28 +129,7 @@ impl Step {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyType {
-    RandomWalk,
     OrderedWalk,
-    Pct,
-}
-
-/// Tunables for `PCT`. Ignored by `RandomWalk`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PolicyParams {
-    /// Bug depth: the number of ordering constraints PCT assumes a bug needs.
-    /// `d - 1` priority-inversion points are placed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub d: Option<u32>,
-    /// Estimated total decision points in the run, used to place the inversion
-    /// points along the logical decision index.
-    ///
-    /// Section 3.4: this is estimated by one throwaway counting run of the same
-    /// scenario under `RandomWalk`. Performing that counting run is harness
-    /// work, not the engine's -- the engine takes `k` as given. Section 14-I
-    /// notes the throughput cost of that extra run is unreconciled against the
-    /// project's iterations/hour target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub k: Option<u64>,
 }
 
 /// The `policy` block that replaces `steps[]` in a discovery-mode config.
@@ -180,8 +138,6 @@ pub struct PolicyDecl {
     #[serde(rename = "type")]
     pub policy_type: PolicyType,
     pub seed: u64,
-    #[serde(default)]
-    pub params: PolicyParams,
 }
 
 /// What happens when a step's condition cannot be satisfied (Background).
@@ -232,10 +188,6 @@ impl ScenarioConfig {
 
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
-    }
-
-    pub fn is_discovery(&self) -> bool {
-        matches!(self.mode, Mode::Discovery { .. })
     }
 
     /// Build a replay config from a projected `steps[]` (section 3.5).
@@ -301,12 +253,6 @@ pub enum ConfigError {
         "step {index} names checkpoint `{checkpoint}`, which is not declared in `checkpoints`"
     )]
     UnknownStepCheckpoint { index: usize, checkpoint: String },
-    #[error(
-        "policy `pct` requires `params.d` (bug depth) and `params.k` (estimated decision points)"
-    )]
-    PctMissingParams,
-    #[error("policy `pct` requires `params.d` >= 1")]
-    PctBadDepth,
 }
 
 impl TryFrom<RawScenarioConfig> for ScenarioConfig {
@@ -317,18 +263,7 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
             (Some(_), Some(_)) => return Err(ConfigError::BothModes),
             (None, None) => return Err(ConfigError::NoMode),
             (Some(steps), None) => Mode::Replay { steps },
-            (None, Some(policy)) => {
-                if policy.policy_type == PolicyType::Pct {
-                    let (d, k) = (policy.params.d, policy.params.k);
-                    if d.is_none() || k.is_none() {
-                        return Err(ConfigError::PctMissingParams);
-                    }
-                    if d == Some(0) {
-                        return Err(ConfigError::PctBadDepth);
-                    }
-                }
-                Mode::Discovery { policy }
-            }
+            (None, Some(policy)) => Mode::Discovery { policy },
         };
 
         if raw.roles.is_empty() {
@@ -467,7 +402,7 @@ mod tests {
             { "id": "victim", "comm": "runc" },
             { "id": "racer", "comm": "racer", "cardinality": "pool" }
         ],
-        "policy": { "type": "random_walk", "seed": 42 }
+        "policy": { "type": "ordered_walk", "seed": 42 }
     }"#;
 
     const REPLAY: &str = r#"{
@@ -475,7 +410,7 @@ mod tests {
         "cgroup": "/sys/fs/cgroup/crfuzz",
         "roles": [{ "id": "victim", "comm": "runc" }],
         "checkpoints": [
-            { "id": "pre_mount", "kind": "uprobe", "target": "runc:mount" }
+            { "id": "pre_mount", "kind": "syscall", "target": "mount" }
         ],
         "steps": [
             { "role": "victim", "until": "pre_mount" },
@@ -486,7 +421,7 @@ mod tests {
     #[test]
     fn discovery_config_parses_and_selects_discovery_mode() {
         let c = ScenarioConfig::from_json(DISCOVERY).unwrap();
-        assert!(c.is_discovery());
+        assert!(matches!(c.mode, Mode::Discovery { .. }));
         assert_eq!(c.on_divergence, DivergencePolicy::Block, "default is block");
     }
 
@@ -524,7 +459,7 @@ mod tests {
     fn a_config_with_both_steps_and_policy_fails_to_deserialize() {
         let both = REPLAY.replace(
             r#""steps""#,
-            r#""policy": { "type": "random_walk", "seed": 1 }, "steps""#,
+            r#""policy": { "type": "ordered_walk", "seed": 1 }, "steps""#,
         );
         let err = ScenarioConfig::from_json(&both).unwrap_err().to_string();
         assert!(err.contains("found both"), "got: {err}");
@@ -578,24 +513,8 @@ mod tests {
     }
 
     #[test]
-    fn pct_requires_both_d_and_k() {
-        let missing = DISCOVERY.replace(
-            r#"{ "type": "random_walk", "seed": 42 }"#,
-            r#"{ "type": "pct", "seed": 42, "params": { "d": 3 } }"#,
-        );
-        assert!(ScenarioConfig::from_json(&missing).is_err());
-
-        let ok = DISCOVERY.replace(
-            r#"{ "type": "random_walk", "seed": 42 }"#,
-            r#"{ "type": "pct", "seed": 42, "params": { "d": 3, "k": 200 } }"#,
-        );
-        assert!(ScenarioConfig::from_json(&ok).is_ok());
-    }
-
-    #[test]
     fn ordered_walk_policy_parses() {
-        let ow = DISCOVERY.replace(r#""random_walk""#, r#""ordered_walk""#);
-        let c = ScenarioConfig::from_json(&ow).unwrap();
+        let c = ScenarioConfig::from_json(DISCOVERY).unwrap();
         let Mode::Discovery { policy } = &c.mode else {
             panic!("expected discovery mode")
         };

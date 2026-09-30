@@ -48,20 +48,14 @@ impl fmt::Display for CheckpointId {
 
 /// How a checkpoint is attached.
 ///
-/// All four give the same synchronous-holding guarantee by different
-/// constructions; see Background, "Checkpoint". The engine never branches on
-/// the kind -- attaching is the backend's job (see `backend::CheckpointBackend`).
+/// Only `syscall` is implemented. The design doc also names `uprobe`,
+/// `kprobe` and `lsm` (Background, "Checkpoint"); add them here with a backend
+/// that attaches them, so a config naming one fails at parse time until then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointKind {
     /// seccomp in user-notification mode (`SECCOMP_RET_USER_NOTIF`).
     Syscall,
-    /// Userspace probe on a function in the target binary.
-    Uprobe,
-    /// Kernel probe.
-    Kprobe,
-    /// LSM hook.
-    Lsm,
 }
 
 /// Structural category of a path-touching syscall (design doc section 4.2).
@@ -100,6 +94,19 @@ pub struct CheckpointDecl {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<PathCategory>,
+}
+
+impl CheckpointDecl {
+    /// A `syscall` checkpoint named after the syscall it sits on, tagged with
+    /// its structural category when it has one.
+    pub fn syscall(name: &str) -> Self {
+        CheckpointDecl {
+            id: CheckpointId::new(name),
+            kind: CheckpointKind::Syscall,
+            target: name.to_string(),
+            category: structural_category(name),
+        }
+    }
 }
 
 /// The structural syscall set from design doc section 4.2: every syscall that
@@ -211,13 +218,22 @@ pub const CHECK_SHAPED_SYSCALLS: &[&str] = &[
     "readlink",
 ];
 
-/// The structural category of a syscall name, if it is a path-touching one
-/// this crate knows about.
+/// The kernel's spelling of a syscall name.
 ///
-/// `fstatat` is the design doc's spelling; kernels and strace say
-/// `newfstatat`. Both get the same answer.
+/// `fstatat` is the design doc's spelling; libseccomp, the kernel and strace
+/// say `newfstatat`, and `fstatat` resolves to nothing on x86_64 or aarch64.
+pub fn canonical_syscall(name: &str) -> &str {
+    if name == "fstatat" {
+        "newfstatat"
+    } else {
+        name
+    }
+}
+
+/// The structural category of a syscall name, if it is a path-touching one
+/// this crate knows about. Accepts either spelling of `fstatat`.
 pub fn structural_category(name: &str) -> Option<PathCategory> {
-    let name = if name == "fstatat" { "newfstatat" } else { name };
+    let name = canonical_syscall(name);
     if STRUCTURAL_SYSCALLS.contains(&name) {
         Some(PathCategory::Mutating)
     } else if CHECK_SHAPED_SYSCALLS.contains(&name) {
@@ -236,12 +252,7 @@ pub fn structural_category(name: &str) -> Option<PathCategory> {
 pub fn default_discovery_checkpoints() -> Vec<CheckpointDecl> {
     STRUCTURAL_SYSCALLS
         .iter()
-        .map(|name| CheckpointDecl {
-            id: CheckpointId::new(*name),
-            kind: CheckpointKind::Syscall,
-            target: (*name).to_string(),
-            category: Some(PathCategory::Mutating),
-        })
+        .map(|name| CheckpointDecl::syscall(name))
         .collect()
 }
 
