@@ -19,6 +19,7 @@ use crate::role::TaskInfo;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 /// An opaque reference to one held task, handed back to `release`.
 ///
@@ -41,6 +42,12 @@ pub enum BackendEvent {
         pid: Pid,
         checkpoint: CheckpointId,
         handle: NotifyHandle,
+        /// The path the held syscall resolved, when the backend could capture
+        /// it (`checkpoint::path_arg_index` names the register, and the backend
+        /// reads it from the target's memory). `None` for syscalls with no
+        /// path argument, backends that do not capture arguments, or a capture
+        /// that failed. The attacker/oracle orchestration acts on this path.
+        path: Option<PathBuf>,
     },
     TaskExited(Pid),
 }
@@ -121,13 +128,20 @@ impl StubBackend {
     }
 
     /// Script `pid` reaching `checkpoint` and being held there.
-    pub fn hit(mut self, pid: Pid, checkpoint: &str) -> Self {
+    pub fn hit(self, pid: Pid, checkpoint: &str) -> Self {
+        self.hit_path(pid, checkpoint, None)
+    }
+
+    /// Script `pid` reaching `checkpoint` with a captured `path`, as a real
+    /// backend would report for a use-shaped syscall.
+    pub fn hit_path(mut self, pid: Pid, checkpoint: &str, path: Option<&str>) -> Self {
         let handle = NotifyHandle(self.next_handle);
         self.next_handle += 1;
         self.queue(pid).push_back(BackendEvent::CheckpointHit {
             pid,
             checkpoint: CheckpointId::new(checkpoint),
             handle,
+            path: path.map(PathBuf::from),
         });
         self
     }

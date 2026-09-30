@@ -68,6 +68,7 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -528,6 +529,81 @@ fn read_task_info(pid: Pid) -> Result<TaskInfo> {
     })
 }
 
+/// Capture the path a held use-shaped syscall resolved, for the attacker/oracle
+/// orchestration (attacker brainstorm, "The window model").
+///
+/// The seccomp notification carries the syscall's raw register arguments; the
+/// path is a userspace pointer in one of them (`checkpoint::path_arg_index`
+/// names which). The pointer is into the *target's* address space, so it is read
+/// from `/proc/<pid>/mem`. The target is parked in its notification, so the
+/// memory is stable while it is held.
+///
+/// After reading, the notification id is revalidated: if the target was killed
+/// between the notification and the read, the address space we read is
+/// meaningless, so the path is dropped. Returns `None` for a syscall with no
+/// path argument, a NULL pointer, or any read/validation failure -- the engine
+/// treats a missing path as "no path", never as an error.
+fn capture_path(
+    pid: Pid,
+    args: &[u64; 6],
+    syscall_name: &str,
+    fd: RawFd,
+    id: u64,
+) -> Option<PathBuf> {
+    let idx = crate::checkpoint::path_arg_index(syscall_name)?;
+    let addr = *args.get(idx)?;
+    if addr == 0 {
+        return None;
+    }
+    let bytes = read_cstr_from_mem(pid, addr)?;
+    // The read above dereferenced the target's memory; only trust it if the
+    // notification is still live (the kernel invalidates the id when the target
+    // dies). This is the mandatory guard for reading a notified task's memory.
+    if libseccomp::notify_id_valid(fd, id).is_err() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+/// Read a NUL-terminated C string from another process's memory, capped at
+/// `PATH_MAX`. Reads are clipped to page boundaries so a string near the end of
+/// a mapping does not fail the whole read by straddling into an unmapped page.
+fn read_cstr_from_mem(pid: Pid, addr: u64) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    const PATH_MAX: usize = 4096;
+    const PAGE: u64 = 4096;
+
+    let f = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut off = addr;
+    let mut buf = [0u8; 256];
+
+    while out.len() < PATH_MAX {
+        let to_page_end = (PAGE - (off % PAGE)) as usize;
+        let want = to_page_end.min(buf.len()).min(PATH_MAX - out.len());
+        let n = match f.read_at(&mut buf[..want], off) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // A partial string already read is better than nothing; a first-read
+            // failure yields None.
+            Err(_) => break,
+        };
+        if let Some(pos) = buf[..n].iter().position(|&b| b == 0) {
+            out.extend_from_slice(&buf[..pos]);
+            return Some(out);
+        }
+        out.extend_from_slice(&buf[..n]);
+        off += n as u64;
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 impl CheckpointBackend for SeccompNotifyBackend {
     fn attach(&mut self, checkpoints: &[CheckpointDecl]) -> Result<()> {
         let unresolved = self.resolve_checkpoints(checkpoints);
@@ -674,12 +750,17 @@ impl CheckpointBackend for SeccompNotifyBackend {
                     if name == "execve" || name == "execveat" {
                         self.announced.retain(|p| *p != pid);
                     }
+                    // Capture the path this use-shaped syscall resolved, so the
+                    // orchestration can point the attacker at it. Best-effort:
+                    // a failure leaves `path` None and the run continues.
+                    let path = capture_path(pid, &req.data.args, &name, fd, req.id);
                     self.arrival.push(format!("{spawn_idx}:{checkpoint}"));
                     self.pending.insert(req.id, fd);
                     events.push(BackendEvent::CheckpointHit {
                         pid,
                         checkpoint,
                         handle: NotifyHandle(req.id),
+                        path,
                     });
                 }
             }

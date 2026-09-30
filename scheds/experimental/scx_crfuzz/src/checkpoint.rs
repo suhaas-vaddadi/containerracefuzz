@@ -243,6 +243,49 @@ pub fn structural_category(name: &str) -> Option<PathCategory> {
     }
 }
 
+/// Which syscall argument holds the primary path a use-shaped syscall resolves.
+///
+/// The attacker/oracle orchestration hands the attacker "the path the syscall
+/// uses" (attacker brainstorm, "The window model"). A `syscall` checkpoint sees
+/// the raw register arguments; the path is a userspace pointer in one of them,
+/// and which register that is depends on the syscall's signature. This table
+/// names the register index (0-based) of the *primary* path for every syscall
+/// in `STRUCTURAL_SYSCALLS`.
+///
+/// "Primary" is a deliberate narrowing: several syscalls carry two paths
+/// (`renameat2` old/new, `linkat` old/new, `mount` source/target,
+/// `move_mount` from/to). This returns the one the victim is acting *on* -- the
+/// object whose identity a check-then-use race turns on -- which is the old /
+/// target / from side. Capturing the secondary path is a documented follow-up;
+/// for the depth-2, single-path window it is not needed.
+///
+/// `None` means the syscall resolves no path we can point the attacker at (it
+/// should not appear for a `STRUCTURAL_SYSCALLS` name, but the mapping is total
+/// so a hand-declared checkpoint on an unlisted syscall degrades to "no path"
+/// rather than a wrong register).
+pub fn path_arg_index(name: &str) -> Option<usize> {
+    let idx = match name {
+        // path is the first argument.
+        "open" | "creat" | "execve" | "mkdir" | "rmdir" | "unlink" | "rename" | "link"
+        | "mknod" | "truncate" | "setxattr" | "lsetxattr" | "removexattr" | "lremovexattr"
+        | "chmod" | "chown" | "lchown" | "utime" | "utimes" | "umount2" | "pivot_root"
+        | "chroot" | "chdir" => 0,
+        // dirfd-relative `*at` forms: path is the second argument.
+        "openat" | "openat2" | "execveat" | "mkdirat" | "unlinkat" | "renameat" | "renameat2"
+        | "linkat" | "mknodat" | "fchmodat" | "fchmodat2" | "fchownat" | "utimensat"
+        | "futimesat" | "open_tree" | "move_mount" | "mount_setattr" | "fspick" => 1,
+        // The created name is the third argument; the first is the (unresolved)
+        // link contents.
+        "symlink" => 1,
+        "symlinkat" => 2,
+        // `mount(source, target, ...)`: the target is the mount point resolved
+        // against the tree the race is on.
+        "mount" => 1,
+        _ => return None,
+    };
+    Some(idx)
+}
+
 /// The default `checkpoints[]` for a discovery-mode scenario (section 8).
 ///
 /// Populated so an operator need not type out the whole structural set by
@@ -315,6 +358,30 @@ mod tests {
         ids.dedup();
         assert_eq!(before, ids.len(), "duplicate checkpoint id in default set");
         assert!(set.iter().all(|c| c.kind == CheckpointKind::Syscall));
+    }
+
+    #[test]
+    fn every_structural_syscall_has_a_primary_path_argument() {
+        for name in STRUCTURAL_SYSCALLS {
+            assert!(
+                path_arg_index(name).is_some(),
+                "`{name}` is use-shaped but has no path-argument index"
+            );
+        }
+    }
+
+    #[test]
+    fn path_argument_index_matches_the_syscall_signature() {
+        assert_eq!(path_arg_index("open"), Some(0));
+        assert_eq!(path_arg_index("openat"), Some(1)); // (dirfd, PATH, ...)
+        assert_eq!(path_arg_index("execve"), Some(0));
+        assert_eq!(path_arg_index("renameat2"), Some(1)); // old path is primary
+        assert_eq!(path_arg_index("mount"), Some(1)); // target, not source
+        assert_eq!(path_arg_index("symlink"), Some(1)); // linkpath, not target
+        assert_eq!(path_arg_index("symlinkat"), Some(2)); // (target, dirfd, LINKPATH)
+        assert_eq!(path_arg_index("chdir"), Some(0));
+        // A syscall we do not resolve a path for degrades to None.
+        assert_eq!(path_arg_index("fchmod"), None);
     }
 
     #[test]

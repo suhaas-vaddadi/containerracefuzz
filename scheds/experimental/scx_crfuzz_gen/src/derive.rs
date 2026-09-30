@@ -96,6 +96,7 @@ pub fn build_config(
         roles,
         checkpoints,
         on_divergence: DivergencePolicy::Block,
+        attack: None,
         mode: Mode::Discovery {
             policy: PolicyDecl {
                 policy_type: PolicyType::OrderedWalk,

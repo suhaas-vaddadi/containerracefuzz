@@ -7,11 +7,14 @@
 // next" is asked through `DecisionPolicy` rather than answered by
 // `schedule[step_idx]` directly.
 
+use crate::attacker;
+use crate::attacker::AttackOutcome;
 use crate::backend::BackendEvent;
 use crate::backend::CheckpointBackend;
 use crate::backend::Poll;
 use crate::backend::EXIT_HANDLE;
 use crate::checkpoint::CheckpointId;
+use crate::config::AttackDecl;
 use crate::config::DivergencePolicy;
 use crate::config::Mode;
 use crate::config::PolicyType;
@@ -19,6 +22,9 @@ use crate::config::ScenarioConfig;
 use crate::log::CanonicalLog;
 use crate::log::DebugEntry;
 use crate::log::DebugLog;
+use crate::oracle::OracleVerdict;
+use crate::oracle::PathIdentity;
+use crate::oracle::WindowContext;
 use crate::policy::Decision;
 use crate::policy::DecisionPolicy;
 use crate::policy::FixedSchedule;
@@ -30,6 +36,30 @@ use crate::role::RoleTable;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::time::Instant;
+
+/// What drives releases in the `Enforcing` phase.
+///
+/// The `DecisionPolicy` seam answers "which held role goes next" for replay and
+/// the ordered-walk discovery policy. The attacker/oracle orchestration
+/// (`PolicyType::AutoAttack`) does not fit that seam -- only the victim is ever
+/// held, so there is no choice of role, and each release is bracketed by an
+/// attacker turn and an oracle observation the `decide` signature cannot
+/// express. It therefore drives the engine directly, as a second kind of
+/// driver rather than a policy.
+enum Driver {
+    Policy(Box<dyn DecisionPolicy>),
+    Attack(AttackDriver),
+}
+
+/// State for the attacker/oracle orchestration.
+struct AttackDriver {
+    /// The external attacker run inside each window.
+    spec: AttackDecl,
+    /// The window whose oracle has not run yet: set when the victim is released
+    /// to a use, observed at the victim's next hold or exit -- the first point
+    /// the use has provably completed and the victim is frozen again.
+    pending: Option<WindowContext>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -77,7 +107,7 @@ pub struct Engine<B: CheckpointBackend> {
     config: ScenarioConfig,
     backend: B,
     roles: RoleTable,
-    policy: Box<dyn DecisionPolicy>,
+    driver: Driver,
     phase: Phase,
     /// Every role/checkpoint pair currently blocked and eligible for release.
     ready: Vec<ReadyCheckpointHit>,
@@ -96,19 +126,24 @@ pub struct Engine<B: CheckpointBackend> {
     /// recorded so it can be compared across runs. Finer-grained than arrival
     /// order on purpose; see the crate docs, "Section 14-A is no longer open".
     decisions: Vec<String>,
+    /// Oracle rulings, one per observed window: `(release step index, verdict)`.
+    /// Kept off the canonical log, which must stay equal to the enforced release
+    /// sequence so its projection replays exactly; a finding is reported
+    /// alongside, not woven into it.
+    oracle_verdicts: Vec<(u64, OracleVerdict)>,
     started: Instant,
 }
 
 impl<B: CheckpointBackend> Engine<B> {
     pub fn new(config: ScenarioConfig, backend: B) -> Self {
-        let policy = build_policy(&config);
+        let driver = build_driver(&config);
         let roles = RoleTable::new(config.roles.clone(), config.cgroup.clone());
         let canonical = CanonicalLog::new(config.scenario_id.clone());
         Engine {
             config,
             backend,
             roles,
-            policy,
+            driver,
             phase: Phase::Barrier,
             ready: Vec::new(),
             provenance: HashMap::new(),
@@ -117,8 +152,15 @@ impl<B: CheckpointBackend> Engine<B> {
             canonical,
             debug: DebugLog::default(),
             decisions: Vec::new(),
+            oracle_verdicts: Vec::new(),
             started: Instant::now(),
         }
+    }
+
+    /// The oracle's ruling on each observed window (empty unless the run used
+    /// `auto_attack`).
+    pub fn oracle_verdicts(&self) -> &[(u64, OracleVerdict)] {
+        &self.oracle_verdicts
     }
 
     pub fn canonical_log(&self) -> &CanonicalLog {
@@ -132,6 +174,17 @@ impl<B: CheckpointBackend> Engine<B> {
     /// The ready set at each decision point. See `decisions`.
     pub fn decision_trace(&self) -> &[String] {
         &self.decisions
+    }
+
+    /// Whether the driver has nothing further it wants to enforce.
+    fn driver_is_finished(&self) -> bool {
+        match &self.driver {
+            Driver::Policy(p) => p.is_finished(),
+            // The orchestration never wants more than the scenario produces:
+            // it acts on whatever windows the victim reaches and is done when
+            // the victim is.
+            Driver::Attack(_) => true,
+        }
     }
 
     pub fn backend(&self) -> &B {
@@ -188,7 +241,7 @@ impl<B: CheckpointBackend> Engine<B> {
 
     /// Called when the scenario has ended and nothing is left held.
     fn final_outcome(&self) -> RunOutcome {
-        if self.phase == Phase::Draining || self.policy.is_finished() {
+        if self.phase == Phase::Draining || self.driver_is_finished() {
             return RunOutcome::Completed;
         }
         // Every role finished, but the policy still wanted something no
@@ -215,6 +268,7 @@ impl<B: CheckpointBackend> Engine<B> {
                 pid,
                 checkpoint,
                 handle,
+                path,
             } => {
                 // A task the role table does not recognise is not ours to
                 // schedule: release it at once and never record it. That is the
@@ -230,6 +284,7 @@ impl<B: CheckpointBackend> Engine<B> {
                     role_name,
                     checkpoint,
                     handle,
+                    path,
                 });
                 self.ready_pids.push(pid);
             }
@@ -254,6 +309,7 @@ impl<B: CheckpointBackend> Engine<B> {
                         role_name,
                         checkpoint: CheckpointId::exit(),
                         handle: EXIT_HANDLE,
+                        path: None,
                     });
                     self.ready_pids.push(pid);
                 }
@@ -276,7 +332,13 @@ impl<B: CheckpointBackend> Engine<B> {
             self.phase = Phase::Enforcing;
         }
 
-        if self.phase == Phase::Enforcing {
+        // The attacker/oracle orchestration drives itself; it does not consult a
+        // `DecisionPolicy`, so it takes a separate path.
+        if self.phase == Phase::Enforcing && matches!(self.driver, Driver::Attack(_)) {
+            released += self.advance_attack()?;
+        }
+
+        if self.phase == Phase::Enforcing && matches!(self.driver, Driver::Policy(_)) {
             let mut last_divergence: Option<String> = None;
             while !self.ready.is_empty() {
                 self.decisions.push(
@@ -286,7 +348,11 @@ impl<B: CheckpointBackend> Engine<B> {
                         .collect::<Vec<_>>()
                         .join(","),
                 );
-                match self.policy.decide(&self.ready) {
+                let decision = match &mut self.driver {
+                    Driver::Policy(p) => p.decide(&self.ready),
+                    Driver::Attack(_) => unreachable!("attack driver takes the branch above"),
+                };
+                match decision {
                     Decision::Release(i) => {
                         self.release_at(i, true)?;
                         released += 1;
@@ -322,7 +388,9 @@ impl<B: CheckpointBackend> Engine<B> {
                                     break;
                                 }
                                 last_divergence = Some(reason);
-                                self.policy.skip();
+                                if let Driver::Policy(p) = &mut self.driver {
+                                    p.skip();
+                                }
                             }
                         }
                     }
@@ -344,6 +412,90 @@ impl<B: CheckpointBackend> Engine<B> {
             released,
             outcome: None,
         })
+    }
+
+    /// One step of the attacker/oracle orchestration (`PolicyType::AutoAttack`).
+    ///
+    /// Handles at most one ready entry per call, then returns so the released
+    /// victim can reach its next hold before the next step -- the same
+    /// one-at-a-time discipline the policy loop keeps. Per the window model
+    /// (attacker brainstorm): observe the previous window (the victim is frozen
+    /// again, so its use has run), run the attacker on the path this use will
+    /// resolve, then release the victim.
+    fn advance_attack(&mut self) -> Result<usize> {
+        if self.ready.is_empty() {
+            return Ok(0);
+        }
+
+        // The victim is held again, so whatever use it last ran has completed:
+        // this is the race-free point to rule on the previous window.
+        self.run_pending_oracle();
+
+        let checkpoint = self.ready[0].checkpoint.clone();
+        let path = self.ready[0].path.clone();
+
+        // The victim's exit carries the reserved `exit` checkpoint. Its window
+        // was observed just above; let it go and there is no attacker to run.
+        if checkpoint.is_exit() {
+            self.release_at(0, true)?;
+            return Ok(1);
+        }
+
+        // Fingerprint the path on either side of the attacker's turn. The
+        // victim is frozen throughout, so any difference between the two is
+        // the window's substitution -- not the victim's own syscall, which has
+        // not run yet. A post-*use* diff would misread every legitimate
+        // `mount`, because a mount changes the object its target resolves to.
+        let before = path.as_deref().and_then(PathIdentity::of);
+
+        // Run the attacker inside the frozen window, on the path this syscall
+        // resolves. A failure to act is a setup problem (attacker brainstorm's
+        // ACTION-FAILED), never a finding: log it and release the victim
+        // anyway, so the run is not derailed by one unusable primitive.
+        let outcome = match &self.driver {
+            Driver::Attack(a) => attacker::run(&a.spec, checkpoint.as_str(), path.as_deref()),
+            Driver::Policy(_) => unreachable!("advance_attack runs only for the attack driver"),
+        };
+        if let AttackOutcome::Failed { error } = &outcome {
+            log::warn!("attacker could not act at {checkpoint}: {error}");
+        }
+
+        let after = path.as_deref().and_then(PathIdentity::of);
+
+        // Release the victim so the use runs; record it so the log projects to a
+        // replayable schedule. The step index is the position this release takes.
+        let step_idx = self.canonical.len() as u64;
+        self.release_at(0, true)?;
+
+        // Remember the window; its oracle runs at the victim's next hold or exit.
+        if let Driver::Attack(a) = &mut self.driver {
+            a.pending = Some(WindowContext {
+                checkpoint,
+                path,
+                before,
+                after,
+                step_idx,
+            });
+        }
+        Ok(1)
+    }
+
+    /// Rule on the pending window, if any, and record the verdict. The victim
+    /// must be frozen when this is called, so the window's use has run.
+    fn run_pending_oracle(&mut self) {
+        let observed = match &mut self.driver {
+            Driver::Attack(a) => a
+                .pending
+                .take()
+                .map(|ctx| (ctx.step_idx, crate::oracle::observe(&ctx))),
+            Driver::Policy(_) => None,
+        };
+        if let Some((step_idx, verdict)) = observed {
+            if let OracleVerdict::Violation(reason) = &verdict {
+                log::warn!("oracle finding at step {step_idx}: {reason}");
+            }
+            self.oracle_verdicts.push((step_idx, verdict));
+        }
     }
 
     fn release_at(&mut self, i: usize, record: bool) -> Result<()> {
@@ -376,16 +528,27 @@ struct Advanced {
     outcome: Option<RunOutcome>,
 }
 
-fn build_policy(config: &ScenarioConfig) -> Box<dyn DecisionPolicy> {
+fn build_driver(config: &ScenarioConfig) -> Driver {
     match &config.mode {
-        Mode::Replay { steps } => Box::new(FixedSchedule::new(steps.clone())),
+        Mode::Replay { steps } => Driver::Policy(Box::new(FixedSchedule::new(steps.clone()))),
         Mode::Discovery { policy } => match policy.policy_type {
+            // The attacker/oracle orchestration. Config validation guarantees
+            // an `attack` section and a single victim role, so the `expect`
+            // cannot fire on a parsed config; it stays explicit rather than
+            // silently substituting an empty attacker.
+            PolicyType::AutoAttack => Driver::Attack(AttackDriver {
+                spec: config
+                    .attack
+                    .clone()
+                    .expect("auto_attack config carries an attack section (validated)"),
+                pending: None,
+            }),
             // Drawn against every declared role, including pool roles: a
             // pool's existence (if not its membership) is fixed at
             // config-parse time, so this needs nothing the ready set would
             // otherwise have to supply. See `policy::OrderedWalk`.
             PolicyType::OrderedWalk => {
-                Box::new(OrderedWalk::new(policy.seed, config.roles.len()))
+                Driver::Policy(Box::new(OrderedWalk::new(policy.seed, config.roles.len())))
             }
         },
     }

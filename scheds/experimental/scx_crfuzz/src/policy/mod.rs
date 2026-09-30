@@ -23,6 +23,7 @@ pub use ordered_walk::OrderedWalk;
 use crate::backend::NotifyHandle;
 use crate::checkpoint::CheckpointId;
 use crate::role::RoleRef;
+use std::path::PathBuf;
 
 /// One role/checkpoint pair currently blocked and eligible to be released.
 ///
@@ -39,6 +40,11 @@ pub struct ReadyCheckpointHit {
     pub role_name: String,
     pub checkpoint: CheckpointId,
     pub handle: NotifyHandle,
+    /// The path the held syscall resolved, when the backend captured it (see
+    /// `BackendEvent::CheckpointHit::path`). The `DecisionPolicy` policies do
+    /// not read it -- release ordering does not depend on the path -- but the
+    /// attacker/oracle orchestration does, so it travels with the hit.
+    pub path: Option<PathBuf>,
 }
 
 /// What a policy decided to do with the current ready set.
@@ -88,6 +94,7 @@ pub(crate) mod testing {
             role_name: name.to_string(),
             checkpoint: CheckpointId::new(checkpoint),
             handle: NotifyHandle(handle),
+            path: None,
         }
     }
 
@@ -104,6 +111,7 @@ pub(crate) mod testing {
             role_name: format!("{name}#{member}"),
             checkpoint: CheckpointId::new(checkpoint),
             handle: NotifyHandle(handle),
+            path: None,
         }
     }
 }

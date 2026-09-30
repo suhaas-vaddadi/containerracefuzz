@@ -143,7 +143,8 @@
 //! rather than indexing into arrival order. Real-world timing can then only
 //! change *when* the target shows up, never *which* target was chosen.
 //! The arrival-order-dependent `RandomWalk` that
-//! this flake was measured against has since been retired.
+//! this flake was measured against has since been retired; its config slot now
+//! selects the `auto_attack` orchestration.
 //!
 //! This is still a scaffold-level judgment call, not something the design
 //! doc itself has decided: §3.4 describes the baseline as uniform choice
@@ -151,6 +152,10 @@
 //! draw is a different reading of that. It is recorded here as the concrete
 //! fix, with the reasoning that motivates it, not as a doc amendment.
 
+/// The attacker runner: how the engine invokes a user-authored attacker inside
+/// each window (`PolicyType::AutoAttack`). Portable -- `std::process` -- so it
+/// tests on any host.
+pub mod attacker;
 pub mod backend;
 /// The `ops.dispatch` gate -- the holding mechanism for whole thread groups.
 ///
@@ -170,6 +175,10 @@ pub mod checkpoint;
 pub mod config;
 pub mod engine;
 pub mod log;
+/// The oracle: the harness-owned detector run after each use. `observe` fires
+/// when a path's object identity changed across the attacker's turn; the full
+/// invariant battery grows here.
+pub mod oracle;
 pub mod policy;
 pub mod role;
 

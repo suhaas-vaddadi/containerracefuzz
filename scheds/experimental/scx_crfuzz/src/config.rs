@@ -129,7 +129,25 @@ impl Step {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyType {
+    /// The depth-2, one-attacker/one-victim orchestration: at every use-shaped
+    /// checkpoint the single victim role hits, run the configured attacker on
+    /// the path the syscall resolved, release the victim, then run the oracle.
+    /// It does not go through the `DecisionPolicy` seam -- only the victim is
+    /// ever held, so there is no "which role next" to decide -- and it requires
+    /// the top-level `attack` section and exactly one role.
+    AutoAttack,
     OrderedWalk,
+}
+
+/// One entry of `attack`: the external attacker the engine runs inside each
+/// window (used only by `PolicyType::AutoAttack`).
+///
+/// `argv[0]` is the program, executed directly. The token `{path}` in any
+/// element is replaced by the path the victim's syscall resolved
+/// (`attacker::PATH_TOKEN`); the path is also exported as `CRFUZZ_TARGET_PATH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttackDecl {
+    pub argv: Vec<String>,
 }
 
 /// The `policy` block that replaces `steps[]` in a discovery-mode config.
@@ -137,6 +155,8 @@ pub enum PolicyType {
 pub struct PolicyDecl {
     #[serde(rename = "type")]
     pub policy_type: PolicyType,
+    /// Unused by `auto_attack`, which makes no random choices.
+    #[serde(default)]
     pub seed: u64,
 }
 
@@ -160,6 +180,21 @@ pub enum Mode {
     Discovery { policy: PolicyDecl },
 }
 
+impl Mode {
+    /// Whether this selects the attacker/oracle orchestration.
+    pub fn is_auto_attack(&self) -> bool {
+        matches!(
+            self,
+            Mode::Discovery {
+                policy: PolicyDecl {
+                    policy_type: PolicyType::AutoAttack,
+                    ..
+                }
+            }
+        )
+    }
+}
+
 /// A parsed, validated scenario config.
 ///
 /// `mode` is an enum rather than two `Option` fields, so a config carrying both
@@ -179,6 +214,10 @@ pub struct ScenarioConfig {
     pub checkpoints: Vec<CheckpointDecl>,
     pub on_divergence: DivergencePolicy,
     pub mode: Mode,
+    /// The attacker to run inside each window. Required by, and only meaningful
+    /// for, `PolicyType::AutoAttack`; `None` for every other mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack: Option<AttackDecl>,
 }
 
 impl ScenarioConfig {
@@ -221,6 +260,8 @@ struct RawScenarioConfig {
     steps: Option<Vec<Step>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy: Option<PolicyDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attack: Option<AttackDecl>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -253,6 +294,16 @@ pub enum ConfigError {
         "step {index} names checkpoint `{checkpoint}`, which is not declared in `checkpoints`"
     )]
     UnknownStepCheckpoint { index: usize, checkpoint: String },
+    #[error(
+        "policy `auto_attack` requires a top-level `attack` section naming the attacker to run"
+    )]
+    AutoAttackMissingAttack,
+    #[error("policy `auto_attack` requires exactly one role (the victim); found {0}")]
+    AutoAttackNeedsSingleRole(usize),
+    #[error("policy `auto_attack`'s `attack.argv` must not be empty")]
+    AutoAttackEmptyArgv,
+    #[error("`attack` is only valid with policy `auto_attack`")]
+    AttackWithoutAutoAttack,
 }
 
 impl TryFrom<RawScenarioConfig> for ScenarioConfig {
@@ -265,6 +316,26 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
             (Some(steps), None) => Mode::Replay { steps },
             (None, Some(policy)) => Mode::Discovery { policy },
         };
+
+        // The attacker/oracle orchestration is selected through the policy slot
+        // but is not a `DecisionPolicy`: it drives releases itself and needs the
+        // `attack` section plus a single victim role. Validate that coupling
+        // here, so a misconfigured run fails at parse time rather than when the
+        // engine reaches for an attacker that was never declared.
+        let is_auto_attack = mode.is_auto_attack();
+        match (&raw.attack, is_auto_attack) {
+            (Some(a), true) => {
+                if a.argv.is_empty() {
+                    return Err(ConfigError::AutoAttackEmptyArgv);
+                }
+            }
+            (None, true) => return Err(ConfigError::AutoAttackMissingAttack),
+            (Some(_), false) => return Err(ConfigError::AttackWithoutAutoAttack),
+            (None, false) => {}
+        }
+        if is_auto_attack && raw.roles.len() != 1 {
+            return Err(ConfigError::AutoAttackNeedsSingleRole(raw.roles.len()));
+        }
 
         if raw.roles.is_empty() {
             return Err(ConfigError::NoRoles);
@@ -309,6 +380,7 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
             checkpoints,
             on_divergence: raw.on_divergence,
             mode,
+            attack: raw.attack,
         })
     }
 }
@@ -387,6 +459,7 @@ impl From<ScenarioConfig> for RawScenarioConfig {
             on_divergence: c.on_divergence,
             steps,
             policy,
+            attack: c.attack,
         }
     }
 }
@@ -403,6 +476,14 @@ mod tests {
             { "id": "racer", "comm": "racer", "cardinality": "pool" }
         ],
         "policy": { "type": "ordered_walk", "seed": 42 }
+    }"#;
+
+    const AUTO_ATTACK: &str = r#"{
+        "scenario_id": "runc-exec-symlink",
+        "cgroup": "/sys/fs/cgroup/crfuzz",
+        "roles": [{ "id": "victim", "comm": "runc" }],
+        "policy": { "type": "auto_attack" },
+        "attack": { "argv": ["/bin/racer", "--target", "{path}"] }
     }"#;
 
     const REPLAY: &str = r#"{
@@ -519,6 +600,59 @@ mod tests {
             panic!("expected discovery mode")
         };
         assert_eq!(policy.policy_type, PolicyType::OrderedWalk);
+    }
+
+    #[test]
+    fn auto_attack_config_parses_with_its_attacker() {
+        let c = ScenarioConfig::from_json(AUTO_ATTACK).unwrap();
+        assert!(c.mode.is_auto_attack());
+        let attack = c.attack.expect("auto_attack keeps its attack section");
+        assert_eq!(attack.argv, vec!["/bin/racer", "--target", "{path}"]);
+        // auto_attack is a discovery config, so it still defaults the full
+        // structural checkpoint set.
+        assert_eq!(c.checkpoints, default_discovery_checkpoints());
+    }
+
+    #[test]
+    fn auto_attack_without_an_attack_section_is_rejected() {
+        let missing = r#"{
+            "scenario_id": "x", "cgroup": "/c",
+            "roles": [{ "id": "victim", "comm": "runc" }],
+            "policy": { "type": "auto_attack", "seed": 0 }
+        }"#;
+        let err = ScenarioConfig::from_json(missing).unwrap_err().to_string();
+        assert!(err.contains("requires a top-level `attack`"), "got: {err}");
+    }
+
+    #[test]
+    fn auto_attack_requires_exactly_one_role() {
+        let two = AUTO_ATTACK.replace(
+            r#"[{ "id": "victim", "comm": "runc" }]"#,
+            r#"[{ "id": "victim", "comm": "runc" }, { "id": "other", "comm": "x" }]"#,
+        );
+        let err = ScenarioConfig::from_json(&two).unwrap_err().to_string();
+        assert!(err.contains("exactly one role"), "got: {err}");
+    }
+
+    #[test]
+    fn an_attack_section_without_auto_attack_is_rejected() {
+        let bad = DISCOVERY.replace(
+            r#""policy": { "type": "ordered_walk", "seed": 42 }"#,
+            r#""policy": { "type": "ordered_walk", "seed": 42 }, "attack": { "argv": ["/bin/racer"] }"#,
+        );
+        let err = ScenarioConfig::from_json(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("only valid with policy `auto_attack`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_attack_config_round_trips_through_json() {
+        let c = ScenarioConfig::from_json(AUTO_ATTACK).unwrap();
+        let back = ScenarioConfig::from_json(&c.to_json().unwrap()).unwrap();
+        assert_eq!(back.attack, c.attack);
+        assert!(back.mode.is_auto_attack());
     }
 
     #[test]

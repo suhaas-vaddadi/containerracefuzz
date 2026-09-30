@@ -18,6 +18,7 @@ use clap::Parser;
 use scx_crfuzz::config::Mode;
 use scx_crfuzz::log::CanonicalLog;
 use scx_crfuzz::log::DebugLog;
+use scx_crfuzz::oracle::OracleVerdict;
 use scx_crfuzz::RunOutcome;
 use scx_crfuzz::ScenarioConfig;
 use simplelog::ColorChoice;
@@ -117,6 +118,8 @@ struct RunReport {
     outcome: RunOutcome,
     canonical: CanonicalLog,
     debug: DebugLog,
+    /// Oracle rulings, one per observed window. Empty unless `auto_attack`.
+    verdicts: Vec<(u64, OracleVerdict)>,
     /// Backend-specific diagnostics, if any.
     notes: Option<String>,
     /// The spawned process's own exit status, for `--exit-with-child`. `None`
@@ -165,6 +168,28 @@ fn main() -> Result<()> {
     );
     if let Some(notes) = &report.notes {
         log::info!("{notes}");
+    }
+
+    // Findings are the point of a discovery run: print each one plainly and
+    // summarise, so a run that found something is obvious in the log rather
+    // than buried in a warn line.
+    let findings: Vec<(u64, &str)> = report
+        .verdicts
+        .iter()
+        .filter_map(|(step, v)| match v {
+            OracleVerdict::Violation(reason) => Some((*step, reason.as_str())),
+            OracleVerdict::Clean => None,
+        })
+        .collect();
+    if !report.verdicts.is_empty() {
+        log::info!(
+            "oracle: {} window(s) observed, {} finding(s)",
+            report.verdicts.len(),
+            findings.len()
+        );
+    }
+    for (step, reason) in &findings {
+        log::error!("FINDING at step {step}: {reason}");
     }
 
     match &args.canonical_log {
@@ -363,6 +388,7 @@ fn run_engine<B: scx_crfuzz::backend::CheckpointBackend>(
         outcome,
         canonical: engine.canonical_log().clone(),
         debug: engine.debug_log().clone(),
+        verdicts: engine.oracle_verdicts().to_vec(),
         notes: Some(notes),
         child_exit,
     })

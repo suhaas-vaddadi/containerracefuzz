@@ -1,0 +1,14 @@
+{
+  "scenario_id": "runc-auto-attack",
+  "cgroup": "/crfuzz",
+  "roles": [
+    { "id": "runc", "comm": "runc", "comm_match": "substring", "cardinality": "pool" }
+  ],
+  "checkpoints": [
+    { "id": "mount",      "kind": "syscall", "target": "mount",      "category": "mutating" },
+    { "id": "symlinkat",  "kind": "syscall", "target": "symlinkat",  "category": "mutating" }
+  ],
+  "on_divergence": "block",
+  "policy": { "type": "auto_attack", "seed": 0 },
+  "attack": { "argv": ["/workspace/scx/scheds/experimental/scx_crfuzz/scenarios/swap_attacker.sh", "{path}"] }
+}

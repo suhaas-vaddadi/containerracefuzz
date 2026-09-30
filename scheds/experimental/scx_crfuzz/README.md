@@ -37,16 +37,21 @@ a 300 ms hold:
 | `threaded_victim.c` | 2 | 255 | 0 |
 | `go_victim.go` | 11 | 920 | 0 |
 
-Policies: `FixedSchedule` (replay), `OrderedWalk` (discovery).
+Policies: `FixedSchedule` (replay), `OrderedWalk` (discovery), plus the
+`auto_attack` orchestration (discovery; runs an attacker on each use's path and
+an oracle after — see `docs/arch/policies.md`). The oracle is `oracle::observe`
+(`src/oracle.rs`): it flags a path whose object identity changed across the
+attacker's turn — type or inode — the signature of a substitution. The full
+invariant battery is future work.
 
 ## Build and test
 
 ```bash
-cargo test -p scx_crfuzz      # 78 tests; any host, macOS included
+cargo test -p scx_crfuzz      # 103 tests; any host, macOS included
 ```
 
 The engine is pure Rust with no `build.rs`. The seccomp and gate backends are
-`#[cfg(target_os = "linux")]`. On Linux the same command runs 99; the
+`#[cfg(target_os = "linux")]`. On Linux the same command runs 124; the
 Linux-only integration tests skip unless root, and the gate cases
 unless `scx_crfuzz_gated` is attached. In the VM:
 
@@ -101,6 +106,18 @@ The wrapper instruments only `runc create`, under `--gate`. It passes
 engine's verdict, and `--oci-bundle` from runc's `--bundle`.
 `--exit-with-child` allows one `--spawn`, so no racer can run alongside yet.
 
+### runc auto-attack
+
+```bash
+./attack_run.sh [bundle] [id]   # swap attacker + oracle, --gate
+```
+
+One command for the whole orchestration: it copies the bundle to a scratch dir,
+scopes the attacker to it (`CRFUZZ_ATTACK_ROOT`), and runs `scx_crfuzz` in
+`auto_attack` mode. The attacker (`scenarios/swap_attacker.sh`) attempts a
+symlink exchange, an unlink-and-recreate, and a bind mount on each held path;
+the oracle reports any path whose object type changed.
+
 ### `--oci-bundle`
 
 Seccomp filters stack and `ERRNO` beats `USER_NOTIF`, so a bundle profile that
@@ -129,5 +146,6 @@ affected; runc's own work happens before the profile is installed.
 - **Open design questions** are marked where they bite: §14-C (`RoleRef`), §14-D (`CanonicalLog`), §14-H (`RunOutcome`), §14-J
   (`CheckpointBackend::attach`).
 
-Not built: mutator, oracle, campaign driver, Class B PID-reuse (see "Seams" in
-`src/lib.rs`).
+Not built: mutator, campaign driver, Class B PID-reuse (see "Seams" in
+`src/lib.rs`). The oracle is the first real one; its full invariant battery is
+still future work.
