@@ -45,19 +45,11 @@
 //! For a single-threaded target those coincide, and this backend is sound. For
 //! a Go binary -- runc, containerd, the actual targets -- they do not, and the
 //! `ops.dispatch` half of the base design ([`backend_gate::GateBackend`], over
-//! `scx_crfuzz_gate`) is what closes the gap. Results under `--gate` do not
-//! suffer the freezer's syscall restart; section 14-A is still open, so
-//! run-to-run reproducibility against a multi-threaded target is not
-//! guaranteed.
-//!
-//! [`backend_freezer::FreezerBackend`] is a proof of concept that closes the
-//! *measurable* part of that gap with the cgroup v2 freezer:
-//! `tests/thread_group_holding.rs` shows a sibling thread writing ~255 bytes
-//! during a 300 ms hold under seccomp alone and zero under the freezer. It is
-//! explicitly not the answer -- freezing interrupts the held task's
-//! notification and restarts its syscall, so the instrument perturbs what it
-//! measures (see its module header). It remains as the baseline
-//! [`backend_gate::GateBackend`] is measured against.
+//! `scx_crfuzz_gate`) is what closes the gap: it declines to dispatch a held
+//! role's whole thread group, so a multi-threaded target is held without
+//! restarting the syscall the way a cgroup freezer would. Section 14-A is
+//! still open, so run-to-run reproducibility against a multi-threaded target
+//! is not guaranteed.
 //!
 //! ## Seams
 //!
@@ -164,19 +156,12 @@
 //! fix, with the reasoning that motivates it, not as a doc amendment.
 
 pub mod backend;
-/// The cgroup v2 freezer decorator -- a proof of concept that extends a
-/// per-thread hold to a whole thread group.
+/// The `ops.dispatch` gate -- the holding mechanism for whole thread groups.
 ///
-/// Linux-only. Not the intended mechanism: see the module header for why its
-/// syscall restart and asynchronous boundary make it a measuring stick rather
-/// than an answer.
-#[cfg(target_os = "linux")]
-pub mod backend_freezer;
-/// The `ops.dispatch` gate -- the intended holding mechanism.
-///
-/// Linux-only. Unlike `backend_freezer`, this one does not perturb the syscall
-/// it holds: the held thread stays parked in its seccomp notification for the
-/// whole hold, so the notification id the engine was given stays valid.
+/// Linux-only. On a checkpoint hit it gates the held task's thread group by
+/// declining to dispatch it, with the held thread left parked in its seccomp
+/// notification for the whole hold, so the notification id the engine was
+/// given stays valid.
 #[cfg(target_os = "linux")]
 pub mod backend_gate;
 /// The seccomp user-notification backend -- the one that holds real processes.

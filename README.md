@@ -20,8 +20,8 @@ time, so exactly one role runs at any moment. Every release is appended to a
 ## Building
 
 ```bash
-cargo test -p scx_crfuzz     # 90 tests on any host; 120 on Linux, which adds
-                             # the seccomp, freezer and gate backend tests
+cargo test -p scx_crfuzz     # 90 tests on any host; 114 on Linux, which adds
+                             # the seccomp and gate backend tests
 cargo build --workspace      # scx_crfuzz_gate needs Linux, clang and libbpf
 ```
 

@@ -26,17 +26,16 @@ silently lets a target run free.
 |---|---|---|
 | `StubBackend` | nothing (scripted) | any host; engine tests |
 | `SeccompNotifyBackend` | the calling **thread** | seccomp user-notification; siblings keep running |
-| `FreezerBackend` (`--freezer`) | the thread group | cgroup freezer; restarts the held syscall; ~350 µs to converge. Baseline only. |
 | `GateBackend` (`--gate`) | the thread group | `sched_ext` scheduler in [`scx_crfuzz_gate`](../scx_crfuzz_gate); no restart; needs `scx_crfuzz_gated` running |
 
 Why the thread group matters: runc and containerd are Go, and parking one Go
 thread prompts the runtime to run more on others. Sibling bytes written during
 a 300 ms hold:
 
-| Fixture | OS threads | seccomp alone | `--freezer` | `--gate` |
-|---|---|---|---|---|
-| `threaded_victim.c` | 2 | 255 | 0 | 0 |
-| `go_victim.go` | 11 | 920 | 0 | 0 |
+| Fixture | OS threads | seccomp alone | `--gate` |
+|---|---|---|---|
+| `threaded_victim.c` | 2 | 255 | 0 |
+| `go_victim.go` | 11 | 920 | 0 |
 
 Policies: `FixedSchedule` (replay), `RandomWalk`, `OrderedWalk`, `Pct`
 (discovery).
@@ -47,9 +46,9 @@ Policies: `FixedSchedule` (replay), `RandomWalk`, `OrderedWalk`, `Pct`
 cargo test -p scx_crfuzz      # 90 tests; any host, macOS included
 ```
 
-The engine is pure Rust with no `build.rs`. The seccomp, freezer and gate
-backends are `#[cfg(target_os = "linux")]`. On Linux the same command runs
-120; the Linux-only integration tests skip unless root, and the gate cases
+The engine is pure Rust with no `build.rs`. The seccomp and gate backends are
+`#[cfg(target_os = "linux")]`. On Linux the same command runs 114; the
+Linux-only integration tests skip unless root, and the gate cases
 unless `scx_crfuzz_gated` is attached. In the VM:
 
 ```bash
@@ -71,17 +70,19 @@ cd scheds/experimental/scx_crfuzz/scenarios && make
 ./run.sh race_wins.json            # swap lands between check and use
 ./run.sh race_loses.json           # swap lands after the use
 ./run.sh race_wins.json --gate     # hold whole thread groups
-./go_run.sh --gate                 # Go victim; defaults to --freezer
+./go_run.sh                        # Go victim; thread-group hold via --gate
 ```
 
 ### runc
 
 ```bash
 sudo scx_crfuzz --config scenarios/runc.json --cgroup-path /crfuzz/runc0 \
-    --freezer --spawn "/usr/bin/runc run -b /tmp/bundle ctr1"
+    --gate --spawn "/usr/bin/runc run -b /tmp/bundle ctr1"
 ```
 
-All runc measurements used `--freezer`; `--gate` is unmeasured against runc.
+The runc scripts use `--gate`. The gate is validated against runc: one
+`runc run` issues 37 holds across its `mount`/`symlinkat` setup, and runc's
+whole thread group sits at each.
 
 Use `comm_match: substring` (`runc init`'s comm is `runc:[2:INIT]`). A full
 `runc run` is 279 structural syscalls across 31 tasks; two tasks notify, and
@@ -96,7 +97,7 @@ sudo ctr run --rm --runc-binary scenarios/runc_wrapper.sh \
     docker.io/library/busybox:latest ctr1 /bin/echo hello
 ```
 
-The wrapper instruments only `runc create`, under `--freezer`. It passes
+The wrapper instruments only `runc create`, under `--gate`. It passes
 `--exit-with-child` so the shim sees runc's exit status rather than the
 engine's verdict, and `--oci-bundle` from runc's `--bundle`.
 `--exit-with-child` allows one `--spawn`, so no racer can run alongside yet.

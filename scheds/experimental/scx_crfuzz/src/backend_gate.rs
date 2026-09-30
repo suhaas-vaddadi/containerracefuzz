@@ -3,24 +3,23 @@
 // The intended holding mechanism: a `sched_ext` scheduler declines to place a
 // gated thread group on a CPU.
 //
-// A decorator over another backend, sitting exactly where `FreezerBackend`
-// sits and for the same reason: seccomp supplies the precision (stop at
+// A decorator over another backend: seccomp supplies the precision (stop at
 // exactly this syscall), the gate supplies the coverage (nothing else in the
 // thread group gets CPU).
 //
 // WHAT THIS FIXES, AND WHAT IT DOES NOT.
 //
-// Fixed: the freezer perturbs the syscall it holds. Freezing wakes every task
-// in the cgroup including one parked in a seccomp notification; that wait is
-// interruptible, so the kernel restarts the syscall and a fresh notification
-// id replaces the one the engine was told about. The gate never touches the
-// held thread -- it stays parked for the whole hold -- so `owner`, `live`,
-// `reported` and `deferred` all disappear from this backend's state. Only
-// `owner` survives, and only to map a handle back to a thread group.
+// Fixed: holding a thread group without perturbing the syscall it holds. A
+// cgroup freeze would wake every task in the cgroup, including one parked in a
+// seccomp notification; that wait is interruptible, so the kernel would
+// restart the syscall and a fresh notification id would replace the one the
+// engine was told about. The gate never touches the held thread -- it stays
+// parked for the whole hold -- so the only state here is `owner`, mapping a
+// handle back to a thread group.
 //
 // Not fixed: the boundary is sharper, not zero. Between the notification
 // arriving and this code writing the gate entry, siblings still run -- one
-// userspace round trip, against the freezer's measured ~350 us convergence.
+// userspace round trip.
 // `GateStats` measures it rather than asserting it away. Closing it needs the
 // gate set in-kernel in the trapping task's own context; see the spec's
 // "Residual window, and phase 2".
@@ -44,9 +43,8 @@ use std::time::Instant;
 
 /// What the gate cost and how fuzzy its boundary was.
 ///
-/// Mirrors `backend_freezer::FreezeStats` deliberately: the freezer's header
-/// argues the case against a mechanism should be evidence rather than theory,
-/// and the case *for* one is held to the same standard.
+/// The case against a mechanism should be evidence rather than theory, and
+/// the case *for* one is held to the same standard.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GateStats {
     pub gates: usize,
@@ -61,8 +59,8 @@ pub struct GateBackend<B: CheckpointBackend> {
     map: GateMap,
     /// Handle as the engine knows it -> the thread group it belongs to.
     ///
-    /// Unlike the freezer there is no second map: the handle the engine was
-    /// given stays valid for the whole hold, because nothing disturbs it.
+    /// There is no second map: the handle the engine was given stays valid
+    /// for the whole hold, because nothing disturbs it.
     owner: HashMap<NotifyHandle, Pid>,
     stats: GateStats,
 }
@@ -163,10 +161,8 @@ impl<B: CheckpointBackend> CheckpointBackend for GateBackend<B> {
         // No `handle == EXIT_HANDLE` special case: `owner` only ever gains an
         // entry from a real `CheckpointHit`, so a synthetic exit -- or any
         // other handle this backend never gated -- simply finds nothing here
-        // and falls through to answering the inner backend directly.
-        // `FreezerBackend::release` has no such special case either, and
-        // relies on the same single not-found fallback; this backend is
-        // meant to read as its sibling.
+        // and falls through to answering the inner backend directly. The
+        // single not-found fallback is the whole story.
         if let Some(tgid) = self.owner.remove(&handle) {
             self.map.ungate(tgid)?;
             self.map.kick()?;
@@ -181,8 +177,8 @@ impl<B: CheckpointBackend> Drop for GateBackend<B> {
     ///
     /// Without it a crashed run leaves its thread groups gated forever, and
     /// the next run's tasks inherit a machine that will not schedule them --
-    /// the gate's analogue of the freezer's "a frozen process keeps its
-    /// inherited stdout open and the shell hangs forever".
+    /// as a leaked hold that keeps inherited descriptors (the shared stdout
+    /// among them) open, hanging whatever launched the run.
     fn drop(&mut self) {
         if let Err(e) = self.map.clear_epoch() {
             log::warn!("clearing this run's gates: {e:#}");
@@ -234,10 +230,8 @@ mod tests {
     #[test]
     fn the_handle_the_engine_is_given_is_the_handle_it_releases() {
         // GateBackend::release passes the engine's handle straight through to
-        // the inner backend, with no substitution. The gate-vs-freeze
-        // distinction at the mechanism level is measured in
-        // tests/handle_stability.rs, not here: this test drives a StubBackend,
-        // so FreezerBackend is not involved in it at all.
+        // the inner backend, with no substitution. This test drives a
+        // StubBackend, so the mechanism it measures is the gate's own.
         if skip() {
             return;
         }

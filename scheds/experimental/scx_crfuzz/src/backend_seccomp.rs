@@ -153,19 +153,6 @@ pub struct SeccompNotifyBackend {
     /// pids already announced via `TaskAppeared`.
     announced: Vec<Pid>,
     poll_timeout: Duration,
-    /// Place each `--spawn` in its own `<cgroup>/spawn<i>` subdirectory rather
-    /// than all of them in `cgroup` directly.
-    ///
-    /// Off by default, so the cgroup layout of an ordinary run is unchanged.
-    /// `backend_freezer::FreezerBackend` needs it on: the freezer acts on
-    /// whatever cgroup the held task is in, so with one shared cgroup the first
-    /// role to reach a checkpoint freezes every other role along with it --
-    /// measured, as a second role that then never reaches a checkpoint at all.
-    ///
-    /// Safe with role resolution because a role's cgroup matcher is a prefix
-    /// test (`role.rs`, `resolve_role`), so a task in `<cgroup>/spawn0` still
-    /// matches a role declaring `<cgroup>`.
-    per_spawn_cgroups: bool,
     /// Place each spawned target in `SCHED_EXT` before `exec`, so the gate's
     /// scheduler sees it. Off by default: with `SCX_OPS_SWITCH_PARTIAL` an
     /// un-enrolled task stays on CFS, which is exactly what the non-`--gate`
@@ -201,30 +188,14 @@ impl SeccompNotifyBackend {
             pending: HashMap::new(),
             announced: Vec::new(),
             poll_timeout: Duration::from_millis(50),
-            per_spawn_cgroups: false,
             sched_ext: false,
             arrival: Vec::new(),
         }
     }
 
-    pub fn with_per_spawn_cgroups(mut self, yes: bool) -> Self {
-        self.per_spawn_cgroups = yes;
-        self
-    }
-
     pub fn with_sched_ext(mut self, yes: bool) -> Self {
         self.sched_ext = yes;
         self
-    }
-
-    /// The cgroup a given `--spawn` index is placed in, as it appears in
-    /// `/proc/<pid>/cgroup`.
-    pub fn spawn_cgroup(&self, idx: usize) -> String {
-        if self.per_spawn_cgroups {
-            format!("{}/spawn{idx}", self.cgroup.trim_end_matches('/'))
-        } else {
-            self.cgroup.clone()
-        }
     }
 
     pub fn with_poll_timeout(mut self, d: Duration) -> Self {
@@ -303,7 +274,7 @@ impl SeccompNotifyBackend {
         unresolved
     }
 
-    fn spawn(&self, spec: &ProcessSpec, idx: usize) -> Result<Listener> {
+    fn spawn(&self, spec: &ProcessSpec) -> Result<Listener> {
         let (parent_sock, child_sock) = socketpair(
             AddressFamily::Unix,
             SockType::Stream,
@@ -314,7 +285,7 @@ impl SeccompNotifyBackend {
 
         let watched: Vec<i32> = self.watched.keys().copied().collect();
         let cgroup_procs = PathBuf::from(CGROUP_MOUNT)
-            .join(self.spawn_cgroup(idx).trim_start_matches('/'))
+            .join(self.cgroup.trim_start_matches('/'))
             .join("cgroup.procs");
 
         // SAFETY: the engine is single-threaded, and the child does a bounded
@@ -578,15 +549,13 @@ impl CheckpointBackend for SeccompNotifyBackend {
             self.cgroup
         );
 
-        for idx in 0..self.specs.len() {
-            let cg = self.spawn_cgroup(idx);
-            std::fs::create_dir_all(PathBuf::from(CGROUP_MOUNT).join(cg.trim_start_matches('/')))
-                .with_context(|| format!("creating cgroup {cg}"))?;
-        }
+        let cg = &self.cgroup;
+        std::fs::create_dir_all(PathBuf::from(CGROUP_MOUNT).join(cg.trim_start_matches('/')))
+            .with_context(|| format!("creating cgroup {cg}"))?;
 
-        for (idx, spec) in self.specs.clone().into_iter().enumerate() {
+        for spec in self.specs.clone().into_iter() {
             let l = self
-                .spawn(&spec, idx)
+                .spawn(&spec)
                 .with_context(|| format!("spawning `{}`", spec.argv.join(" ")))?;
             log::debug!("spawned pid {} for `{}`", l.child, spec.argv.join(" "));
             self.listeners.push(l);

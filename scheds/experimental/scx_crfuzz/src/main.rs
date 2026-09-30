@@ -51,25 +51,13 @@ struct Args {
     #[arg(long, default_value = "/crfuzz/run0")]
     cgroup_path: String,
 
-    /// Wrap the seccomp backend in the cgroup freezer, so holding a role holds
-    /// every OS thread in it rather than only the one that made the syscall.
+    /// Hold thread groups with the `sched_ext` gate. Requires
+    /// `scx_crfuzz_gated` to be running.
     ///
-    /// Required for any multi-threaded target -- a Go binary such as `runc`
-    /// keeps running on its other threads while one sits in a notification.
-    /// Also switches each `--spawn` into its own `<cgroup-path>/spawn<i>`, since
-    /// roles sharing one cgroup would share a freezer and deadlock each other.
-    ///
-    /// This is a proof of concept and it perturbs what it measures: freezing
-    /// restarts the held syscall. Prefer `--gate`, which does not.
+    /// On a checkpoint hit the gate declines to dispatch the held role's whole
+    /// thread group, so a multi-threaded target -- a Go binary such as `runc`
+    /// -- is held without restarting the syscall it sits in.
     #[arg(long)]
-    freezer: bool,
-
-    /// Hold thread groups with the `sched_ext` gate instead of the cgroup
-    /// freezer. Requires `scx_crfuzz_gated` to be running.
-    ///
-    /// This is the intended mechanism: unlike `--freezer` it does not restart
-    /// the syscall it holds. Mutually exclusive with `--freezer`.
-    #[arg(long, conflicts_with = "freezer")]
     gate: bool,
 
     /// An OCI bundle to check before running: if its `linux.seccomp` profile
@@ -297,9 +285,6 @@ fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
 
     if args.gate {
         use scx_crfuzz::backend_gate::GateBackend;
-        // No per-spawn cgroups: unlike the freezer, the gate acts on the
-        // thread group the held task belongs to, so roles sharing one cgroup
-        // do not interfere.
         let backend = GateBackend::new(seccomp.with_sched_ext(true))?;
         return run_engine(
             config,
@@ -320,37 +305,12 @@ fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
         );
     }
 
-    if args.freezer {
-        use scx_crfuzz::backend_freezer::FreezerBackend;
-        // Per-spawn cgroups are not optional here: the freezer acts on whatever
-        // cgroup the held task is in, so with one shared cgroup the first role
-        // to reach a checkpoint freezes every other role and the second never
-        // arrives at all.
-        let backend = FreezerBackend::new(seccomp.with_per_spawn_cgroups(true));
-        run_engine(
-            config,
-            backend,
-            |b| {
-                let s = b.stats();
-                format!(
-                    "{}\nfreezer: {} freeze(s), {} thaw(s), max freeze latency {:?} \
-                 (the window in which siblings were still running)",
-                    b.inner().arrival_trace().join(" "),
-                    s.freezes,
-                    s.thaws,
-                    s.max_freeze_latency
-                )
-            },
-            |b| b.inner().child_exit_code(),
-        )
-    } else {
-        run_engine(
-            config,
-            seccomp,
-            |b| b.arrival_trace().join(" "),
-            |b| b.child_exit_code(),
-        )
-    }
+    run_engine(
+        config,
+        seccomp,
+        |b| b.arrival_trace().join(" "),
+        |b| b.child_exit_code(),
+    )
 }
 
 /// Refuse to run a scenario whose checkpoints the bundle's profile would erase.
@@ -411,7 +371,7 @@ fn preflight_bundle(bundle: &std::path::Path, config: &ScenarioConfig) -> Result
 
 /// Drive an engine to completion and package what it produced.
 ///
-/// Generic over the backend so the freezer-wrapped and bare cases share one
+/// Generic over the backend so the gate-wrapped and bare cases share one
 /// path; `arrival` is the only thing that differs, since reaching the section
 /// 14-A arrival trace means going through the wrapper when there is one.
 #[cfg(target_os = "linux")]

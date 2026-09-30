@@ -25,6 +25,9 @@
 # those would add latency and interleavings with nothing behind them.
 #
 # Everything else is exec'd straight through, so the shim sees ordinary runc.
+#
+# Holds whole thread groups with the sched_ext gate, so scx_crfuzz_gated must
+# be running.
 set -eu
 
 RUNC="${CRFUZZ_RUNC:-/usr/bin/runc}"
@@ -80,7 +83,7 @@ ARGS="$*"
 set -- \
     --config "$CONFIG" \
     --cgroup-path "$CGROUP_ROOT/$id" \
-    --freezer \
+    --gate \
     --exit-with-child \
     --canonical-log "$OUTDIR/$id.log" \
     --debug-log "$OUTDIR/$id.debug" \
