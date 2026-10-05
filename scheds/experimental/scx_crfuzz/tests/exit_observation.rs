@@ -65,7 +65,7 @@ fn drive_to_exit(tag: &str) -> (usize, Duration, bool) {
     std::fs::write(tmp.join("target"), "BENIGN\n").expect("target");
 
     let spec = scx_crfuzz::backend_seccomp::ProcessSpec::parse(&format!(
-        "{}/go_victim {}/target {}/progress",
+        "{}/fixtures/go_victim {}/target {}/progress",
         dir.display(),
         tmp.display(),
         tmp.display()

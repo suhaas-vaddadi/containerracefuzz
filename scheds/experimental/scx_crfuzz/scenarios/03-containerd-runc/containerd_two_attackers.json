@@ -1,0 +1,16 @@
+{
+  "scenario_id": "containerd-two-attackers",
+  "cgroup": "/crfuzz",
+  "roles": [
+    { "id": "runc", "comm": "runc", "comm_match": "substring", "cardinality": "pool" },
+    { "id": "attacker", "comm": "mt_attacker", "cardinality": "pool" }
+  ],
+  "checkpoints": [
+    { "id": "mount",      "kind": "syscall", "target": "mount",      "category": "mutating" },
+    { "id": "symlinkat",  "kind": "syscall", "target": "symlinkat",  "category": "mutating" },
+    { "id": "readlinkat", "kind": "syscall", "target": "readlinkat", "category": "resolving" },
+    { "id": "renameat",   "kind": "syscall", "target": "renameat",   "category": "mutating" }
+  ],
+  "on_divergence": "block",
+  "policy": { "type": "pos", "seed": 1 }
+}

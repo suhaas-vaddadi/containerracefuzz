@@ -99,6 +99,7 @@ fn a_gated_notification_id_survives_the_hold() {
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
+        .join("02-multi-thread")
         .join("threaded_victim");
     // Both arguments required: threaded_victim.c:49 exits via VERDICT:usage
     // when argc < 3, without ever creating the sibling thread, which would

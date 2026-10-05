@@ -39,6 +39,7 @@ fn a_spawned_target_and_its_threads_are_in_sched_ext() {
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scenarios")
+        .join("02-multi-thread")
         .join("threaded_victim");
     assert!(
         fixture.exists(),

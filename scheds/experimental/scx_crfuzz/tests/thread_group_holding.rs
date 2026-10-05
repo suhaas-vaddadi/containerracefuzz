@@ -91,7 +91,7 @@ fn the_gate_holds_the_whole_thread_group() {
         eprintln!("skipping: scx_crfuzz_gated is not running");
         return;
     }
-    let fixture = scenarios_dir().join("threaded_victim");
+    let fixture = scenarios_dir().join("02-multi-thread").join("threaded_victim");
     // Both fixture arguments are load-bearing: threaded_victim.c:49 exits via
     // VERDICT:usage when argc < 3, without ever creating the sibling thread,
     // which would make the assertion below vacuously true.
@@ -131,7 +131,7 @@ fn the_gate_holds_a_go_runtimes_thread_group() {
         eprintln!("skipping: scx_crfuzz_gated is not running");
         return;
     }
-    let fixture = scenarios_dir().join("go_victim");
+    let fixture = scenarios_dir().join("fixtures").join("go_victim");
     // go_victim.go:71 has the same argc guard as threaded_victim -- see the note
     // on the row above.
     let tmp = tempfile::tempdir().expect("tempdir");

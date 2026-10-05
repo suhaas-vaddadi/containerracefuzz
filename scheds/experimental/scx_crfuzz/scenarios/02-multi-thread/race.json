@@ -1,0 +1,15 @@
+{
+  "scenario_id": "toctou-multithread",
+  "cgroup": "/crfuzz",
+  "roles": [
+    { "id": "victim", "comm": "threaded_victim" },
+    { "id": "attacker", "comm": "mt_attacker" }
+  ],
+  "checkpoints": [
+    { "id": "newfstatat", "kind": "syscall", "target": "newfstatat", "category": "resolving" },
+    { "id": "openat",     "kind": "syscall", "target": "openat",     "category": "mutating" },
+    { "id": "renameat",   "kind": "syscall", "target": "renameat",   "category": "mutating" }
+  ],
+  "on_divergence": "block",
+  "policy": { "type": "pos", "seed": 1 }
+}
