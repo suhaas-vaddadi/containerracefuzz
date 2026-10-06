@@ -38,6 +38,8 @@ pub struct GateBackend {
     sensor: Option<RunSensor>,
     /// `SCX_EV_BYPASS_ACTIVATE` when the run started.
     bypass_at_start: u64,
+    /// The last poll saw the scenario close but returned records instead.
+    closed: bool,
 }
 
 impl GateBackend {
@@ -47,6 +49,7 @@ impl GateBackend {
             map: GateMap::open()?,
             sensor: None,
             bypass_at_start: GateMap::bypass_activations()?,
+            closed: false,
         })
     }
 
@@ -154,6 +157,9 @@ impl CheckpointBackend for GateBackend {
     /// `Idle` means `timeout` passed with nothing to report, or a signal: a
     /// wake for a reaped child or a hung-up listener waits on.
     fn poll(&mut self, timeout: Option<Duration>) -> Result<Poll> {
+        if std::mem::take(&mut self.closed) {
+            return Ok(Poll::Closed);
+        }
         let deadline = timeout.map(|t| Instant::now() + t);
         let (polled, records) = loop {
             self.check_still_attached()?;
@@ -190,6 +196,9 @@ impl CheckpointBackend for GateBackend {
         if records.is_empty() {
             return Ok(polled);
         }
+        // The records go out first; the closure is reported by the next poll
+        // without waiting, since only the ringbuf could still wake that wait.
+        self.closed = polled == Poll::Closed;
         let mut events = Vec::new();
         for r in records {
             events.push(thread_state(r));

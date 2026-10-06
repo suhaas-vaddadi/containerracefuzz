@@ -1194,7 +1194,7 @@ impl CheckpointBackend for SeccompNotifyBackend {
     /// container init entering the container's own cgroup, say) is not part
     /// of the run.
     fn in_scope(&self, tid: Pid) -> bool {
-        read_task_cgroup(tid).is_some_and(|c| c.starts_with(&self.cgroup))
+        read_task_cgroup(tid).is_some_and(|c| crate::role::under_cgroup(&c, &self.cgroup))
     }
 
     /// No sensor, so nothing to lose.

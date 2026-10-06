@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // Closes the loop between scx_crfuzz_gen and the hand-written scenario it's
-// meant to replace the boilerplate of: traces the same victim/racer pair
-// scenarios/race_wins.json declares by hand, and checks the generator
-// arrives at the same checkpoints.
+// meant to replace the boilerplate of: traces scenario 01's victim/racer pair
+// (`scenarios/01-single-thread`) and checks the generator arrives at the
+// checkpoints the retired hand-written `race_wins.json` declared.
 #![cfg(target_os = "linux")]
 
 use scx_crfuzz_gen::derive::build_config;
@@ -13,8 +13,8 @@ use scx_crfuzz_gen::tracer::trace;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
-/// scheds/experimental/scx_crfuzz/scenarios/race_wins.json declares these
-/// by hand, plus `newfstatat`: it is a replay schedule, and a replay schedule
+/// The retired `scenarios/race_wins.json` declared these by hand, plus
+/// `newfstatat`: it was a replay schedule, and a replay schedule
 /// may name the victim's check as a step. The generator emits only the
 /// use-shaped syscalls a discovery config needs (design doc section 4.2), so
 /// the check is the one expected difference. This test's ground truth.
@@ -22,12 +22,13 @@ const EXPECTED_CHECKPOINTS: &[&str] = &["openat", "renameat"];
 
 #[test]
 fn generated_checkpoints_match_the_hand_written_race_wins_scenario() {
-    let scenarios_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scx_crfuzz/scenarios");
+    let scenarios_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scx_crfuzz/scenarios/01-single-thread");
     let victim_bin = scenarios_dir.join("victim");
     let racer_bin = scenarios_dir.join("racer");
     assert!(
         victim_bin.exists() && racer_bin.exists(),
-        "build the fixture first: `cd {} && make`",
+        "build the fixture first: `make -C {}/..`",
         scenarios_dir.display()
     );
 

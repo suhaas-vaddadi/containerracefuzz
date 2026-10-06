@@ -163,7 +163,7 @@ impl RoleTable {
         // Scope first: an out-of-cgroup task never resolves, however it was
         // forked. Step 4's own prefix matcher below keeps its existing
         // per-declaration cgroup semantics.
-        if !task.cgroup.starts_with(&self.scenario_cgroup) {
+        if !under_cgroup(&task.cgroup, &self.scenario_cgroup) {
             return None;
         }
 
@@ -259,9 +259,27 @@ impl RoleTable {
     }
 }
 
+/// Whether cgroup path `cgroup` is `root` or inside it: `/crfuzz/1` contains
+/// `/crfuzz/1/a`, not its sibling `/crfuzz/12`.
+pub fn under_cgroup(cgroup: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    cgroup
+        .strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn under_cgroup_stops_at_a_path_boundary() {
+        assert!(under_cgroup("/crfuzz/1", "/crfuzz/1"));
+        assert!(under_cgroup("/crfuzz/1/a", "/crfuzz/1"));
+        assert!(under_cgroup("/crfuzz/1/a", "/crfuzz/1/"));
+        assert!(!under_cgroup("/crfuzz/12", "/crfuzz/1"));
+        assert!(!under_cgroup("/other", "/crfuzz"));
+    }
     use crate::config::RoleDecl;
 
     fn decls() -> Vec<RoleDecl> {
