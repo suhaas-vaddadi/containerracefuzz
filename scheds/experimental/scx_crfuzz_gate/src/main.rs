@@ -2,7 +2,9 @@
 use anyhow::Context;
 use anyhow::Result;
 use libbpf_rs::MapCore;
+use scx_crfuzz_gate::bpf_intf::CRFUZZ_MAX_RUNS;
 use scx_crfuzz_gate::bpf_skel::*;
+use scx_crfuzz_gate::sensor::release_slot;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -22,7 +24,7 @@ const LOCK_PATH_FALLBACK: &str = "/tmp/scx_crfuzz_gated.lock";
 #[derive(clap::Parser)]
 #[command(name = "scx_crfuzz_gated")]
 struct Args {
-    /// Clear every gate in the pinned map and exit.
+    /// Clear every gate and sensor slot in the pinned maps and exit.
     ///
     /// Wholesale rather than by epoch: a recovery tool has no epoch of its own
     /// to match. It operates on the pinned map, so it neither requires nor
@@ -30,37 +32,77 @@ struct Args {
     #[arg(long)]
     reset: bool,
 
-    /// Report whether the gate is attached and how many gates are live.
+    /// Report whether the gate is attached and how many gates and sensor
+    /// slots are live.
     #[arg(long)]
     status: bool,
 }
 
-fn open_pinned_gate() -> Result<libbpf_rs::MapHandle> {
-    libbpf_rs::MapHandle::from_pinned_path(format!("{PIN_DIR}/gate"))
-        .with_context(|| format!("opening {PIN_DIR}/gate -- is scx_crfuzz_gated running?"))
+/// Live entry count across both the group and per-thread gate maps.
+fn live_gate_count() -> Result<usize> {
+    let mut n = 0;
+    for name in ["gate", "gate_tid"] {
+        let map = libbpf_rs::MapHandle::from_pinned_path(format!("{PIN_DIR}/{name}"))
+            .with_context(|| format!("opening {PIN_DIR}/{name}"))?;
+        n += map.keys().count();
+    }
+    Ok(n)
+}
+
+/// Sensor slots claimed by a run (nonzero epoch).
+fn active_slot_count() -> Result<usize> {
+    let slots = libbpf_rs::MapHandle::from_pinned_path(format!("{PIN_DIR}/sensor_slots"))
+        .with_context(|| format!("opening {PIN_DIR}/sensor_slots"))?;
+    let mut n = 0;
+    for i in 0..CRFUZZ_MAX_RUNS {
+        let slot = slots
+            .lookup(&i.to_ne_bytes(), libbpf_rs::MapFlags::ANY)?
+            .context("sensor slot missing")?;
+        if slot[8..16] != [0; 8] {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 fn reset() -> Result<()> {
-    let map = open_pinned_gate()?;
-    let keys: Vec<Vec<u8>> = map.keys().collect();
-    let n = keys.len();
-    for k in keys {
-        map.delete(&k).context("deleting a gate entry")?;
+    let mut n = 0;
+    for name in ["gate", "gate_tid"] {
+        let map = libbpf_rs::MapHandle::from_pinned_path(format!("{PIN_DIR}/{name}"))
+            .with_context(|| format!("opening {PIN_DIR}/{name}"))?;
+        for k in map.keys().collect::<Vec<Vec<u8>>>() {
+            match map.delete(&k) {
+                Ok(()) => n += 1,
+                Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("deleting a gate entry"),
+            }
+        }
     }
     println!("cleared {n} gate(s)");
+
+    let open = |name: &str| {
+        libbpf_rs::MapHandle::from_pinned_path(format!("{PIN_DIR}/{name}"))
+            .with_context(|| format!("opening {PIN_DIR}/{name}"))
+    };
+    let (slots, rings) = (open("sensor_slots")?, open("sensor_rings")?);
+    let n = active_slot_count()?;
+    for i in 0..CRFUZZ_MAX_RUNS {
+        release_slot(&slots, &rings, i)?;
+    }
+    println!("cleared {n} sensor slot(s)");
     Ok(())
 }
 
 fn status() -> Result<()> {
     let state = std::fs::read_to_string("/sys/kernel/sched_ext/state")
         .unwrap_or_else(|_| "unavailable".into());
-    let ops = std::fs::read_to_string("/sys/kernel/sched_ext/root/ops")
-        .unwrap_or_else(|_| "none".into());
+    let ops =
+        std::fs::read_to_string("/sys/kernel/sched_ext/root/ops").unwrap_or_else(|_| "none".into());
     let attached = state.trim() == "enabled";
     println!("sched_ext state: {}", state.trim());
     println!("attached ops:    {}", ops.trim());
-    match open_pinned_gate() {
-        Ok(map) if attached => println!("live gates:      {}", map.keys().count()),
+    match live_gate_count() {
+        Ok(n) if attached => println!("live gates:      {n}"),
         // Pins exist but nothing is attached: since a daemon that is running
         // would show up as "enabled" above, these pins cannot belong to a
         // live scheduler. They are leftovers from a dead or cleanly-stopped
@@ -72,14 +114,28 @@ fn status() -> Result<()> {
         ),
         Err(e) => println!("live gates:      {e:#}"),
     }
+    match active_slot_count() {
+        Ok(n) if attached => println!("sensor slots:    {n} of {CRFUZZ_MAX_RUNS} claimed"),
+        Ok(_) => println!("sensor slots:    stale pins (no scheduler attached)"),
+        Err(e) => println!("sensor slots:    {e:#}"),
+    }
     Ok(())
 }
 
-/// Remove the four pins and their directory. Called both to clear stale
+/// Remove every pin and their directory. Called both to clear stale
 /// leftovers from a dead daemon before pinning fresh ones, and on graceful
 /// shutdown so a clean stop leaves nothing behind either.
 fn remove_pins() -> std::io::Result<()> {
-    for name in ["gate", "epoch", "kick", "epoch_next"] {
+    for name in [
+        "gate",
+        "gate_tid",
+        "epoch",
+        "kick",
+        "epoch_next",
+        "sensor_slots",
+        "sensor_rings",
+        "slot_claim",
+    ] {
         match std::fs::remove_file(format!("{PIN_DIR}/{name}")) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -111,7 +167,11 @@ fn remove_pins() -> std::io::Result<()> {
 /// home for this kind of runtime lockfile and is not wiped mid-boot the way
 /// /tmp can be; /tmp is only a fallback for when /run is not writable.
 fn acquire_startup_lock() -> Result<File> {
-    let (path, file) = match OpenOptions::new().create(true).write(true).open(LOCK_PATH_PRIMARY) {
+    let (path, file) = match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(LOCK_PATH_PRIMARY)
+    {
         Ok(f) => (LOCK_PATH_PRIMARY, f),
         Err(open_err) => {
             println!(
@@ -123,7 +183,9 @@ fn acquire_startup_lock() -> Result<File> {
                 .write(true)
                 .open(LOCK_PATH_FALLBACK)
                 .with_context(|| {
-                    format!("opening lockfile {LOCK_PATH_FALLBACK} (fallback from {LOCK_PATH_PRIMARY})")
+                    format!(
+                        "opening lockfile {LOCK_PATH_FALLBACK} (fallback from {LOCK_PATH_PRIMARY})"
+                    )
                 })?;
             (LOCK_PATH_FALLBACK, f)
         }
@@ -211,8 +273,18 @@ fn main() -> Result<()> {
         remove_pins().with_context(|| format!("clearing stale pins at {PIN_DIR}"))?;
     }
     std::fs::create_dir_all(PIN_DIR).with_context(|| format!("creating {PIN_DIR}"))?;
-    skel.maps.gate.pin(format!("{PIN_DIR}/gate")).context("pinning the gate map")?;
-    skel.maps.epoch.pin(format!("{PIN_DIR}/epoch")).context("pinning the epoch map")?;
+    skel.maps
+        .gate
+        .pin(format!("{PIN_DIR}/gate"))
+        .context("pinning the gate map")?;
+    skel.maps
+        .gate_tid
+        .pin(format!("{PIN_DIR}/gate_tid"))
+        .context("pinning the per-thread gate map")?;
+    skel.maps
+        .epoch
+        .pin(format!("{PIN_DIR}/epoch"))
+        .context("pinning the epoch map")?;
     // The kick program too: a pinned map gives no access to a program, and
     // GateMap::kick needs to invoke this one via test_run.
     skel.progs
@@ -226,6 +298,20 @@ fn main() -> Result<()> {
         .crfuzz_epoch_next
         .pin(format!("{PIN_DIR}/epoch_next"))
         .context("pinning the epoch_next program")?;
+    // The thread-state sensor: RunSensor::register claims a slot through the
+    // program and installs its own ringbuf in `sensor_rings`.
+    skel.maps
+        .sensor_slots
+        .pin(format!("{PIN_DIR}/sensor_slots"))
+        .context("pinning the sensor slot map")?;
+    skel.maps
+        .sensor_rings
+        .pin(format!("{PIN_DIR}/sensor_rings"))
+        .context("pinning the sensor ringbuf map")?;
+    skel.progs
+        .crfuzz_slot_claim
+        .pin(format!("{PIN_DIR}/slot_claim"))
+        .context("pinning the slot_claim program")?;
 
     let _link = scx_ops_attach!(skel, crfuzz_gate_ops).context("attach struct_ops")?;
 
@@ -248,7 +334,11 @@ fn main() -> Result<()> {
             context_in: Some(&mut arg),
             ..Default::default()
         };
-        let out = skel.progs.crfuzz_kick_all.test_run(input).context("kick prog test_run")?;
+        let out = skel
+            .progs
+            .crfuzz_kick_all
+            .test_run(input)
+            .context("kick prog test_run")?;
         anyhow::ensure!(
             out.return_value == nr_cpus,
             "kick prog kicked {} of {} cpus -- it did not run to completion, so holds would be \

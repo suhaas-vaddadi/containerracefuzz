@@ -1,13 +1,14 @@
 {
   "scenario_id": "runc-exec-pathswap",
-  "cgroup": "/sys/fs/cgroup/crfuzz",
+  "cgroup": "/crfuzz",
   "roles": [
     { "id": "victim", "comm": "runc" },
     { "id": "racer", "comm": "racer", "cardinality": "pool" }
   ],
   "on_divergence": "block",
+  "watchdog_cpu_secs": 15,
   "policy": {
-    "type": "ordered_walk",
+    "type": "pos",
     "seed": 20260914
   }
 }

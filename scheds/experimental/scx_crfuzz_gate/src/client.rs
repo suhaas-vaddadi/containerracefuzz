@@ -13,7 +13,7 @@ use libbpf_rs::MapHandle;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::OwnedFd;
 
-const PIN_DIR: &str = "/sys/fs/bpf/crfuzz";
+pub(crate) const PIN_DIR: &str = "/sys/fs/bpf/crfuzz";
 
 /// Invoke a pinned `SEC("syscall")` program via `BPF_PROG_TEST_RUN` and return
 /// its integer return value.
@@ -26,7 +26,7 @@ const PIN_DIR: &str = "/sys/fs/bpf/crfuzz";
 /// this calls the same libbpf function the safe wrapper calls, directly --
 /// the same workaround upstream scx's `rust/scx_arena` used for the identical
 /// reason (that crate is not part of this repository).
-fn test_run(fd: &OwnedFd, ctx_in: Option<&[u8]>) -> Result<u32> {
+pub(crate) fn test_run(fd: &OwnedFd, ctx_in: Option<&[u8]>) -> Result<u32> {
     let mut opts = libbpf_rs::libbpf_sys::bpf_test_run_opts::default();
     opts.sz = std::mem::size_of_val(&opts) as _;
     if let Some(ctx) = ctx_in {
@@ -44,6 +44,7 @@ fn test_run(fd: &OwnedFd, ctx_in: Option<&[u8]>) -> Result<u32> {
 
 pub struct GateMap {
     gate: MapHandle,
+    gate_tid: MapHandle,
     kicker: OwnedFd,
     epoch: u64,
 }
@@ -55,9 +56,16 @@ impl GateMap {
     /// gating": that is indistinguishable from a successful multi-threaded
     /// hold and is exactly the silent under-holding this engine must not do.
     pub fn open() -> Result<GateMap> {
-        let gate = MapHandle::from_pinned_path(format!("{PIN_DIR}/gate")).with_context(|| {
-            format!("opening {PIN_DIR}/gate -- is scx_crfuzz_gated running?")
-        })?;
+        let gate = MapHandle::from_pinned_path(format!("{PIN_DIR}/gate"))
+            .with_context(|| format!("opening {PIN_DIR}/gate -- is scx_crfuzz_gated running?"))?;
+
+        // The per-thread gate map. Opened alongside the group map; a missing
+        // pin means a daemon predating per-thread gates, which must fail rather
+        // than silently degrade to group-only holding.
+        let gate_tid =
+            MapHandle::from_pinned_path(format!("{PIN_DIR}/gate_tid")).with_context(|| {
+                format!("opening {PIN_DIR}/gate_tid -- is scx_crfuzz_gated running?")
+            })?;
 
         // Opened before the epoch mint below so a missing/unopenable kick
         // pin fails before the epoch counter is bumped: minting first and
@@ -91,10 +99,11 @@ impl GateMap {
         // runs coexist). __sync_fetch_and_add inside the BPF program makes
         // the increment a single atomic RMW, so concurrent opens are
         // guaranteed distinct epochs.
-        let epoch_next_fd = libbpf_rs::Program::fd_from_pinned_path(format!("{PIN_DIR}/epoch_next"))
-            .with_context(|| format!("opening {PIN_DIR}/epoch_next"))?;
-        let ret = test_run(&epoch_next_fd, None)
-            .context("minting an epoch via crfuzz_epoch_next")?;
+        let epoch_next_fd =
+            libbpf_rs::Program::fd_from_pinned_path(format!("{PIN_DIR}/epoch_next"))
+                .with_context(|| format!("opening {PIN_DIR}/epoch_next"))?;
+        let ret =
+            test_run(&epoch_next_fd, None).context("minting an epoch via crfuzz_epoch_next")?;
         let epoch = ret as u64;
         anyhow::ensure!(
             epoch != 0,
@@ -103,6 +112,7 @@ impl GateMap {
 
         Ok(GateMap {
             gate,
+            gate_tid,
             kicker,
             epoch,
         })
@@ -134,33 +144,49 @@ impl GateMap {
 
     pub fn is_gated(&self, tgid: i32) -> bool {
         matches!(
-            self.gate.lookup(&(tgid as u32).to_ne_bytes(), MapFlags::ANY),
+            self.gate
+                .lookup(&(tgid as u32).to_ne_bytes(), MapFlags::ANY),
             Ok(Some(_))
         )
     }
 
-    /// Delete every entry stamped with this run's epoch. Returns how many.
-    pub fn clear_epoch(&self) -> Result<usize> {
-        // Collect keys before deleting any of them: MapKeyIter::next feeds
-        // the previously-returned key back to the kernel's
-        // bpf_map_get_next_key to find the next one. Deleting a key on this
-        // hash map before asking for its successor makes the kernel fall
-        // back to scanning from the (now-absent) key's bucket, which can
-        // revisit or skip entries -- a skipped entry is one of this run's
-        // own gates left permanently held. `reset()` in main.rs already
-        // collects first for the same reason; match it here.
-        let keys: Vec<_> = self.gate.keys().collect();
-        let mut n = 0;
-        for key in keys {
-            let Ok(Some(v)) = self.gate.lookup(&key, MapFlags::ANY) else {
-                continue;
-            };
-            if u64::from_ne_bytes(v[..8].try_into().unwrap()) == self.epoch {
-                self.gate.delete(&key).context("clearing a gate entry")?;
-                n += 1;
-            }
+    /// Hold a single thread, independent of the rest of its thread group.
+    pub fn gate_tid(&self, tid: i32) -> Result<()> {
+        self.gate_tid
+            .update(
+                &(tid as u32).to_ne_bytes(),
+                &self.epoch.to_ne_bytes(),
+                MapFlags::ANY,
+            )
+            .with_context(|| format!("gating tid {tid}"))
+    }
+
+    pub fn ungate_tid(&self, tid: i32) -> Result<()> {
+        match self.gate_tid.delete(&(tid as u32).to_ne_bytes()) {
+            Ok(()) => Ok(()),
+            // Already gone: ops.exit_task reaps on thread exit, so a release
+            // that races an exit is normal, not an error.
+            Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("ungating tid {tid}")),
         }
-        Ok(n)
+    }
+
+    pub fn is_tid_gated(&self, tid: i32) -> bool {
+        matches!(
+            self.gate_tid
+                .lookup(&(tid as u32).to_ne_bytes(), MapFlags::ANY),
+            Ok(Some(_))
+        )
+    }
+
+    /// Delete every entry stamped with this run's epoch, from both the group
+    /// and per-thread maps. Returns how many.
+    pub fn clear_epoch(&self) -> Result<usize> {
+        // Run both passes before propagating: a failure on the group map must
+        // not leave the per-thread gates held.
+        let groups = clear_map_epoch(&self.gate, self.epoch);
+        let threads = clear_map_epoch(&self.gate_tid, self.epoch);
+        Ok(groups? + threads?)
     }
 
     /// Is a sched_ext scheduler still attached?
@@ -174,12 +200,54 @@ impl GateMap {
             .unwrap_or(false)
     }
 
+    /// How many times the scheduler has entered bypass mode, in which the
+    /// kernel schedules every task itself and gates stop holding. A run reads
+    /// it at start; any increase means its holds were not real.
+    pub fn bypass_activations() -> Result<u64> {
+        const PATH: &str = "/sys/kernel/sched_ext/root/events";
+        let events = std::fs::read_to_string(PATH).with_context(|| format!("reading {PATH}"))?;
+        let n = events
+            .lines()
+            .find_map(|l| l.strip_prefix("SCX_EV_BYPASS_ACTIVATE "))
+            .with_context(|| format!("no SCX_EV_BYPASS_ACTIVATE in {PATH}"))?;
+        n.trim()
+            .parse()
+            .with_context(|| format!("parsing SCX_EV_BYPASS_ACTIVATE {n:?}"))
+    }
+
     pub fn kick(&self) -> Result<()> {
         let nr_cpus = libbpf_rs::num_possible_cpus().context("num_possible_cpus")? as u32;
         let arg = nr_cpus.to_ne_bytes();
         test_run(&self.kicker, Some(&arg)).context("kicking cpus")?;
         Ok(())
     }
+}
+
+/// Delete every entry in `map` stamped with `epoch`, returning the count.
+///
+/// Keys are collected before any delete: `MapKeyIter::next` feeds the
+/// previously-returned key back to the kernel's `bpf_map_get_next_key`, and
+/// deleting a key mid-iteration makes the kernel fall back to scanning from
+/// the (now-absent) key's bucket, which can revisit or skip entries -- a
+/// skipped entry is one of this run's own gates left permanently held.
+fn clear_map_epoch(map: &MapHandle, epoch: u64) -> Result<usize> {
+    let keys: Vec<_> = map.keys().collect();
+    let mut n = 0;
+    for key in keys {
+        let Ok(Some(v)) = map.lookup(&key, MapFlags::ANY) else {
+            continue;
+        };
+        if u64::from_ne_bytes(v[..8].try_into().unwrap()) == epoch {
+            match map.delete(&key) {
+                Ok(()) => n += 1,
+                // The thread exited between the lookup and here and BPF
+                // `exit_task` removed the key first: already cleared.
+                Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("clearing a gate entry"),
+            }
+        }
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -221,6 +289,34 @@ mod tests {
     }
 
     #[test]
+    fn tid_gate_is_independent_of_the_group_gate() {
+        if skip() {
+            return;
+        }
+        let m = GateMap::open().unwrap();
+        // A high synthetic tid, unique to this test: the tests share one
+        // machine-global map and run concurrently in one binary, so a real
+        // process id (which `gate_then_ungate_round_trips` gates in the group
+        // map) would collide.
+        let tid = 424250;
+        assert!(!m.is_tid_gated(tid));
+        m.gate_tid(tid).unwrap();
+        assert!(m.is_tid_gated(tid));
+        assert!(!m.is_gated(tid), "a tid gate must not gate the group");
+        m.kick().unwrap();
+        m.ungate_tid(tid).unwrap();
+        assert!(!m.is_tid_gated(tid));
+    }
+
+    #[test]
+    fn bypass_activations_reads_the_counter() {
+        if skip() {
+            return;
+        }
+        GateMap::bypass_activations().unwrap();
+    }
+
+    #[test]
     fn clear_epoch_removes_only_this_epochs_entries() {
         if skip() {
             return;
@@ -230,9 +326,11 @@ mod tests {
         assert_ne!(a.epoch(), b.epoch(), "each open mints a fresh epoch");
 
         a.gate(424242).unwrap();
+        a.gate_tid(424244).unwrap();
         b.gate(424243).unwrap();
-        assert_eq!(a.clear_epoch().unwrap(), 1, "only a's entry");
+        assert_eq!(a.clear_epoch().unwrap(), 2, "a's group and tid entries");
         assert!(!a.is_gated(424242));
+        assert!(!a.is_tid_gated(424244));
         assert!(b.is_gated(424243), "b's gate survives a's cleanup");
         b.clear_epoch().unwrap();
     }

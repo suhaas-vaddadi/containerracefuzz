@@ -10,9 +10,8 @@
 #
 # `runc_wrapper_attackers.sh` replaces the leaf `runc` binary containerd's shim
 # execs, so containerd and the shim are untouched. The wrapper spawns three
-# thread groups under the engine: `runc` and two `mt_attacker` pool members, each
-# held and released one thread at a time by the `pos` policy through the
-# sched_ext gate.
+# thread groups under the engine: `runc` and two `mt_attacker` pool members,
+# each parked and released one thread at a time by the `pos` policy.
 #
 # Root is required (seccomp user-notify) and scx_crfuzz_gated must be running.
 set -eu
@@ -38,7 +37,7 @@ echo "--- canonical log ($OUTDIR/$ID/log): roles released ---"
 if [ -f "$OUTDIR/$ID/log" ]; then
     # Skip the `# scenario` header so the line count and per-role tally are exact.
     grep -v '^#' "$OUTDIR/$ID/log" | wc -l
-    grep -v '^#' "$OUTDIR/$ID/log" | cut -f2 | sort | uniq -c
+    grep -v '^#' "$OUTDIR/$ID/log" | cut -f2 | cut -d/ -f1 | sort | uniq -c
 else
     echo "(no log written)"
 fi

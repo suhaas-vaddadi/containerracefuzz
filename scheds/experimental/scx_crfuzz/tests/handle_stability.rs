@@ -9,15 +9,13 @@
 //
 // Driven through a raw `SeccompNotifyBackend` with `GateMap` applied by hand,
 // not through `GateBackend`: this is the one place low enough to see what the
-// mechanism actually does to the notification id underneath the trait that
-// hides it. It needs `scx_crfuzz_gated` running and skips without it.
+// mechanism actually does to the notification id underneath the trait. It needs `scx_crfuzz_gated` running and skips without it.
 #![cfg(target_os = "linux")]
 
 use scx_crfuzz::backend::BackendEvent;
 use scx_crfuzz::backend::CheckpointBackend;
 use scx_crfuzz::backend::NotifyHandle;
 use scx_crfuzz::backend::Poll;
-use scx_crfuzz::backend_gate::tgid_of;
 use scx_crfuzz::backend_seccomp::ProcessSpec;
 use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
 use scx_crfuzz::checkpoint::CheckpointDecl;
@@ -57,7 +55,7 @@ fn newfstatat_checkpoint() -> CheckpointDecl {
 fn first_hit(backend: &mut SeccompNotifyBackend, deadline: Instant) -> (Pid, NotifyHandle) {
     let mut first: Option<(Pid, NotifyHandle)> = None;
     while Instant::now() < deadline && first.is_none() {
-        if let Poll::Events(events) = backend.poll().unwrap() {
+        if let Poll::Events(events) = backend.poll(Some(Duration::from_millis(50))).unwrap() {
             for e in events {
                 if let BackendEvent::CheckpointHit { pid, handle, .. } = e {
                     first = Some((pid, handle));
@@ -117,8 +115,7 @@ fn a_gated_notification_id_survives_the_hold() {
     .expect("spec");
 
     let mut backend = SeccompNotifyBackend::new(vec![spec], "/crfuzz/handle-stability-gate")
-        .with_sched_ext(true)
-        .with_poll_timeout(Duration::from_millis(50));
+        .with_sched_ext(true);
     backend.attach(&[newfstatat_checkpoint()]).unwrap();
 
     let (pid, handle) = first_hit(&mut backend, Instant::now() + Duration::from_secs(10));
@@ -139,7 +136,7 @@ fn a_gated_notification_id_survives_the_hold() {
     while hold_start.elapsed() < Duration::from_millis(300) {
         // Polling during the hold is what would surface a replacement id: a
         // restarted syscall re-enters the filter and notifies again.
-        if let Poll::Events(events) = backend.poll().unwrap() {
+        if let Poll::Events(events) = backend.poll(Some(Duration::from_millis(50))).unwrap() {
             for e in events {
                 if let BackendEvent::CheckpointHit {
                     pid: p, handle: h, ..
@@ -157,9 +154,9 @@ fn a_gated_notification_id_survives_the_hold() {
         }
     }
 
-    // Ungate before answering -- order is load-bearing, matching
-    // `GateBackend::release`'s own comment: a task released into a still-gated
-    // thread group is parked again immediately on its way back to userspace.
+    // Ungate before answering -- order is load-bearing, as in `auto_attack`'s
+    // window: a task released into a still-gated thread group is parked again
+    // immediately on its way back to userspace.
     map.ungate(tgid).expect("ungate");
     map.kick().expect("kick");
 

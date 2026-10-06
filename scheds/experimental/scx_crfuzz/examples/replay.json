@@ -1,6 +1,6 @@
 {
   "scenario_id": "runc-exec-pathswap",
-  "cgroup": "/sys/fs/cgroup/crfuzz",
+  "cgroup": "/crfuzz",
   "roles": [
     { "id": "victim", "comm": "runc" },
     { "id": "racer", "comm": "racer", "cardinality": "pool" }
@@ -14,7 +14,6 @@
   "steps": [
     { "role": "victim", "until": "lstat" },
     { "role": "racer#0", "until": "symlink" },
-    { "role": "victim", "until": "mount" },
-    { "role": "victim", "until": "exit" }
+    { "role": "victim", "until": "mount" }
   ]
 }

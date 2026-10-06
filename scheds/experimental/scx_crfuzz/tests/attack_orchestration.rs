@@ -6,7 +6,7 @@
 //! The depth-2, one-attacker/one-victim shape: at every use-shaped checkpoint
 //! the single victim role hits, the engine runs the configured attacker on the
 //! path the syscall resolved, releases the victim, and rules on the window with
-//! the oracle at the victim's next hold or exit. `StubBackend` holds nothing
+//! the oracle at the victim's next hold or its leader's exit. `StubBackend` holds nothing
 //! real, so these cover the *orchestration* -- ordering, per-window invocation,
 //! path propagation, failure handling -- not the seccomp capture that produces
 //! the path on a real target.
@@ -18,7 +18,7 @@ use scx_crfuzz::role::TaskInfo;
 use scx_crfuzz::Engine;
 use std::io::Write;
 
-const CGROUP: &str = "/sys/fs/cgroup/crfuzz";
+const CGROUP: &str = "/crfuzz";
 
 fn task(pid: i32, comm: &str) -> TaskInfo {
     TaskInfo {
@@ -146,10 +146,7 @@ fn the_run_projects_to_a_replayable_schedule() {
         .iter()
         .map(|s| format!("{}@{}", s.role, s.until))
         .collect();
-    assert_eq!(
-        rendered,
-        vec!["victim@openat", "victim@mount", "victim@exit"]
-    );
+    assert_eq!(rendered, vec!["victim@openat", "victim@mount"]);
 }
 
 #[test]
@@ -262,4 +259,57 @@ fn the_oracle_fires_on_a_same_type_directory_exchange() {
         "a directory exchange must be a finding, got {:?}",
         verdicts[0].1
     );
+}
+
+#[test]
+fn each_window_runs_gate_fingerprint_attacker_fingerprint_ungate_release_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"BENIGN").unwrap();
+    // Swaps the file for a symlink: a violation proves the two fingerprints
+    // straddle the attacker.
+    let attacker = dir.path().join("swap.sh");
+    std::fs::write(
+        &attacker,
+        "#!/bin/sh\nrm -f \"$CRFUZZ_TARGET_PATH\"\nln -s /nowhere \"$CRFUZZ_TARGET_PATH\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&attacker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // The hit comes from a non-leader thread: the gate is keyed on its group.
+    let backend = StubBackend::new()
+        .task(task(100, "runc"))
+        .task(TaskInfo {
+            tgid: 100,
+            ..task(101, "runc")
+        })
+        .hit_path(101, "openat", Some(target.to_str().unwrap()))
+        // Nothing there before the attacker: a clean window.
+        .hit_path(101, "mount", Some(dir.path().join("new").to_str().unwrap()))
+        .exit(101)
+        .exit(100);
+
+    let mut engine = Engine::new(auto_attack_config(&attacker), backend);
+    assert_eq!(engine.run().expect("engine run"), RunOutcome::Completed);
+    // The group is ungated before the release: a hit released into a gated
+    // group would be held again on its way back to userspace.
+    assert_eq!(
+        engine.backend().gate_calls,
+        [
+            ("gate_group", 100),
+            ("ungate_group", 100),
+            ("release", 101),
+            ("gate_group", 100),
+            ("ungate_group", 100),
+            ("release", 101)
+        ]
+    );
+    let verdicts = engine.oracle_verdicts();
+    assert_eq!(verdicts.len(), 2);
+    assert!(verdicts[0].1.is_violation(), "{:?}", verdicts[0].1);
+    assert!(!verdicts[1].1.is_violation(), "{:?}", verdicts[1].1);
 }

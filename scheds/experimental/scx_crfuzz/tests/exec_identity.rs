@@ -51,7 +51,7 @@ fn a_task_is_announced_as_the_program_it_became_and_never_as_the_engine() {
     let mut execs = 0;
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        match backend.poll().expect("poll") {
+        match backend.poll(Some(Duration::from_millis(50))).expect("poll") {
             Poll::Closed => break,
             Poll::Idle => {}
             Poll::Events(events) => {

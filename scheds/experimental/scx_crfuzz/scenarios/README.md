@@ -10,9 +10,9 @@ is scheduling.
 | `02-multi-thread/` | a multithreaded victim + a multithreaded attacker, one actor per thread | `make run-02` |
 | `03-containerd-runc/` | `runc create` under containerd + two multithreaded attackers | `make run-03` |
 
-`fixtures/` holds two binaries the Rust integration tests exec (`go_victim`,
-`mt_hold`). They belong to no scenario but are built by `make` so `cargo test`
-has them.
+`fixtures/` holds binaries the Rust integration tests exec (`go_victim`,
+`mt_hold`, `spin_park`, `pinned_wake`). They belong to no scenario but are
+built by `make` so `cargo test` has them.
 
 ## Build and run
 
@@ -25,8 +25,8 @@ make clean
 ```
 
 Each `run.sh` uses `sudo` (seccomp user-notify needs root), and every run
-needs the `sched_ext` gate daemon (`scx_crfuzz_gated`) attached: all holds go
-through it. The engine binary is `$CRFUZZ_BIN`, defaulting to
+needs the `sched_ext` gate daemon (`scx_crfuzz_gated`) attached: its sensor
+reports every thread's state, which each decision waits on. The engine binary is `$CRFUZZ_BIN`, defaulting to
 `/workspace/scx/target-linux/debug/scx_crfuzz`.
 
 **Build the guest side with a separate target dir.** Host and guest share this
@@ -59,17 +59,21 @@ early — the check did its job).
 
 `threaded_victim` (a checking main thread plus a sibling worker) against
 `mt_attacker` (several worker threads each hammering `renameat`). Under POS
-every thread that reaches a checkpoint is its own actor, and a hit holds only
-that thread — siblings keep running and reach their own checkpoints, which
-whole-thread-group holding cannot express. The decision trace in the debug log
-names threads as `role/t<n>`.
+every thread that reaches a checkpoint is its own actor, and a hit parks only
+that thread. The engine decides only when every thread is at rest, so each
+ready set holds every parked thread. The decision trace in the debug log names
+threads by clone path (`role/t0.1`). The victim's sibling sleeps on a 1 ms
+timer, so most decisions count in `timed_sleep_decisions` and two runs with one
+seed can differ. `threaded_victim ... still` and `mt_attacker ... <renames>`
+remove every timer; `tests/full_readout.rs` runs them that way and gets
+identical decision traces from one seed.
 
 ## 3 — containerd + runc (full startup, two attackers)
 
 A real `ctr run` of busybox. `runc_wrapper_attackers.sh` replaces the leaf
 `runc` binary containerd's shim execs, and spawns the instrumented `runc create`
 alongside two `mt_attacker` thread groups. POS, with thread actors, schedules all
-three one thread at a time through the gate. See `03-containerd-runc/run.sh`.
+three one thread at a time. See `03-containerd-runc/run.sh`.
 
 ## Why `-static`
 

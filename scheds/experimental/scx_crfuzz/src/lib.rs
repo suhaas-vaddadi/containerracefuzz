@@ -25,7 +25,7 @@
 //! | [`role`] | Background (role resolution), section 5 (pools) |
 //! | [`checkpoint`] | section 4 (placement, the structural syscall set) |
 //! | [`policy`] | section 3 (the decision-policy abstraction) |
-//! | [`engine`] | Background (three-phase state machine) |
+//! | [`engine`] | Background; the full-readout thread table and decision loop |
 //! | [`log`] | Background (canonical log), section 3.5 (projection) |
 //! | [`backend`] | Background (checkpoint mechanisms) |
 //!
@@ -37,19 +37,14 @@
 //!
 //! On Linux, [`backend_seccomp::SeccompNotifyBackend`] holds real processes at
 //! real syscalls via `SECCOMP_RET_USER_NOTIF`. It covers every `syscall`
-//! checkpoint, which is the whole of the section 4.2 default set, and needs
-//! neither eBPF nor a `sched_ext` attach.
+//! checkpoint, which is the whole of the section 4.2 default set. A parked hit
+//! holds only its own thread.
 //!
-//! It is not the whole story. seccomp user-notification holds the *thread*
-//! that made the syscall; Background requires holding the whole thread group.
-//! For a single-threaded target those coincide, and this backend is sound. For
-//! a Go binary -- runc, containerd, the actual targets -- they do not, and the
-//! `ops.dispatch` half of the base design ([`backend_gate::GateBackend`], over
-//! `scx_crfuzz_gate`) is what closes the gap: it declines to dispatch a held
-//! role's whole thread group, so a multi-threaded target is held without
-//! restarting the syscall the way a cgroup freezer would. Section 14-A is
-//! still open, so run-to-run reproducibility against a multi-threaded target
-//! is not guaranteed.
+//! The binary always wraps it in [`backend_gate::GateBackend`] (over
+//! `scx_crfuzz_gate`, so `scx_crfuzz_gated` must be attached), which adds the
+//! thread-state sensor the full readout is built on, and holds a thread or a
+//! thread group off the CPU when the engine asks: the watchdog's freeze and
+//! `auto_attack`'s attacker window.
 //!
 //! ## Seams
 //!
@@ -58,14 +53,13 @@
 //!
 //! - **`sched_ext` `struct_ops` backend** (Background). Implemented, but in a
 //!   separate crate: `scx_crfuzz_gate`, whose BPF program (`crfuzz_gate_ops`)
-//!   and daemon (`scx_crfuzz_gated`) supply the map and the dispatch queue
-//!   that decline to place a gated thread group's tasks on a CPU. It is a
-//!   separate crate because BPF needs a `build.rs`, and a `build.rs` runs on
-//!   every host -- keeping it out of this crate is what preserves this
-//!   crate's "builds and tests anywhere, macOS included" property. This
-//!   crate's own [`backend_gate::GateBackend`] talks to it over the pinned
-//!   maps and implements the same [`backend::CheckpointBackend`]; nothing
-//!   above it changed when it landed.
+//!   and daemon (`scx_crfuzz_gated`) supply the gate maps, the dispatch queue
+//!   that keeps a gated thread or thread group off the CPU, and the
+//!   thread-state sensor. It is a separate crate because BPF needs a
+//!   `build.rs`, and a `build.rs` runs on every host -- keeping it out of this
+//!   crate is what preserves this crate's "builds and tests anywhere, macOS
+//!   included" property. This crate's own [`backend_gate::GateBackend`] talks
+//!   to it over the pinned maps.
 //! - **Mutator** (section 6.1). A pipeline stage strictly *upstream*: it emits
 //!   an OCI spec plus the list of paths that spec references, before `runc` is
 //!   invoked and therefore before any process tree exists for roles to be
@@ -105,64 +99,36 @@
 //! [`engine::RunOutcome`]), **14-J** (the attachment race for late pool members
 //! -- [`backend::CheckpointBackend::attach`]). Only 14-A is resolved.
 //!
-//! ## Section 14-A is no longer open, and the answer is no
+//! ## Section 14-A: answered by the full readout
 //!
-//! The ready-set arrival order is **not** reproducible. Measured directly
-//! against real processes (`scenarios/flake.sh`): holding the seed fixed and
-//! varying nothing, roughly one run in a few hundred sees the two roles reach
-//! their first checkpoint in the opposite order. The ready set then arrives at
-//! `decide()` with the same two members in the other position; a policy that
-//! indexes by position releases a different member, and the entire run
-//! diverges -- including the security verdict, which flips between "the victim
-//! read the secret" and "the victim refused a symlink". (This was measured
-//! against the since-retired `RandomWalk`, which indexed by position.)
+//! Measured against real processes, the ready set's *arrival order* is not
+//! reproducible, and neither is its *membership* at any instant chosen by
+//! timing: decision 1 could see two of four threads parked while the other two
+//! were still running toward their checkpoint. `decide()` being a pure
+//! function of `(seed, ready-set-sequence)` (section 10.1) is necessary, not
+//! sufficient.
 //!
-//! Section 10.1 says ordering determinism "holds trivially if `decide()` is a
-//! pure function of `(seed, ready-set-sequence)`". That premise is true here --
-//! `decide()` is pure, and the unit tests prove it -- and the conclusion is
-//! still false, because nothing makes the ready-set-sequence itself
-//! reproducible. The condition is necessary, not sufficient.
-//!
-//! The exposure is concentrated where more than one role is runnable at once.
-//! Once `Enforcing` is holding everyone but the single role it released, only
-//! one process can be approaching a checkpoint, so arrival order is forced. The
-//! window is the startup gap before the first hold, and any moment a released
-//! role does not immediately reach its next checkpoint.
-//!
-//! Two fixes are available here. A narrow one -- canonicalise the ready set's
-//! order before handing it to `decide()` (sort by role declaration index and
-//! checkpoint id) -- would still leave a policy exposed to a subtler case:
-//! two runs that see the same arrivals in the same order can still diverge,
-//! because what `decide()` is handed is whichever ready-set snapshot existed
-//! at that exact instant, and that snapshot's *membership* is itself
-//! timing-dependent, not just its order.
-//!
-//! [`policy::OrderedWalk`] takes the stronger fix instead: it draws a target
-//! *role* from the seed alone, before anything has run and independent of
-//! the ready set entirely, and `decide()` only ever searches for that target
-//! rather than indexing into arrival order. Real-world timing can then only
-//! change *when* the target shows up, never *which* target was chosen.
-//! The arrival-order-dependent `RandomWalk` that
-//! this flake was measured against has since been retired; its config slot now
-//! selects the `auto_attack` orchestration.
-//!
-//! This is still a scaffold-level judgment call, not something the design
-//! doc itself has decided: §3.4 describes the baseline as uniform choice
-//! "over the ready set," and `OrderedWalk`'s role-first, ready-set-blind
-//! draw is a different reading of that. It is recorded here as the concrete
-//! fix, with the reasoning that motivates it, not as a doc amendment.
+//! The engine therefore decides only at a full readout: every thread of the
+//! run's cgroup at rest, the ready set exactly the threads parked at a
+//! checkpoint, canonicalised, with each thread named by its clone path. POS
+//! keys priorities from the seed and event identity alone. That makes
+//! ready-set membership deterministic except for two counted cases --
+//! decisions taken while a thread is frozen (`frozen_decisions`) or while a
+//! Blocked thread is in a timed sleep (`timed_sleep_decisions`) -- and for
+//! memory races between checkpoints that change which syscall a thread
+//! reaches next, which are out of scope.
 
 /// The attacker runner: how the engine invokes a user-authored attacker inside
 /// each window (`PolicyType::AutoAttack`). Portable -- `std::process` -- so it
 /// tests on any host.
 pub mod attacker;
 pub mod backend;
-/// The `ops.dispatch` gate -- the holding mechanism for whole thread groups.
+/// The `ops.dispatch` gate and the thread-state sensor.
 ///
-/// Linux-only. On a checkpoint hit it gates the held task's thread group by
-/// declining to dispatch it, with the held thread left parked in its seccomp
-/// notification for the whole hold, so the notification id the engine was
-/// given stays valid.
+/// Linux-only. It freezes a thread or a whole thread group when the engine
+/// asks, by declining to dispatch it; a thread parked in its seccomp
+/// notification stays parked, so the notification id the engine was given
+/// stays valid. It also reports every thread's state in the run's cgroup.
 #[cfg(target_os = "linux")]
 pub mod backend_gate;
 /// The seccomp user-notification backend -- the one that holds real processes.
@@ -174,6 +140,9 @@ pub mod backend_seccomp;
 pub mod checkpoint;
 pub mod config;
 pub mod engine;
+/// POS event identity and conflict keys (plan Phase 1). Pure Rust, tests on any
+/// host; the kernel-side key capture lives in `backend_seccomp`.
+pub mod event;
 pub mod log;
 /// The oracle: the harness-owned detector run after each use. `observe` fires
 /// when a path's object identity changed across the attacker's turn; the full

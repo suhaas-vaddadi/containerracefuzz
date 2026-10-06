@@ -63,8 +63,7 @@ fn a_spawned_target_and_its_threads_are_in_sched_ext() {
     ))
     .unwrap();
     let mut backend = SeccompNotifyBackend::new(vec![spec], "/crfuzz/enroll")
-        .with_sched_ext(true)
-        .with_poll_timeout(Duration::from_millis(50));
+        .with_sched_ext(true);
     // Only fstatat: the fixture's own progress-file open() is also a
     // structural syscall (openat), and it runs before the sibling thread is
     // created. Attaching the full discovery set would hold the target there
@@ -78,7 +77,7 @@ fn a_spawned_target_and_its_threads_are_in_sched_ext() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut held = None;
     while Instant::now() < deadline && held.is_none() {
-        if let Poll::Events(events) = backend.poll().unwrap() {
+        if let Poll::Events(events) = backend.poll(Some(Duration::from_millis(50))).unwrap() {
             for e in events {
                 if let BackendEvent::CheckpointHit { pid, .. } = e {
                     held = Some(pid);

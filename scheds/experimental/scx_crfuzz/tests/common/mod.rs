@@ -22,3 +22,23 @@ pub fn skip_unless_root(test: &str) -> bool {
 pub fn scenarios_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scenarios")
 }
+
+/// A live task's thread group, from `/proc/<pid>/status`.
+pub fn tgid_of(pid: i32) -> i32 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .expect("the task is live")
+        .lines()
+        .find_map(|l| l.strip_prefix("Tgid:"))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("a Tgid line")
+}
+
+/// Abort the test binary if it is still running after `d`: a poll that
+/// waits forever would otherwise hang the suite.
+pub fn abort_after(d: std::time::Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(d);
+        eprintln!("still running after {d:?}: a blocking poll never woke");
+        std::process::abort();
+    });
+}

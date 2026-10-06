@@ -43,21 +43,6 @@ struct Args {
     #[arg(long = "spawn", required = true)]
     spawn: Vec<String>,
 
-    /// cgroup v2 path to place spawned processes in, spelled as it appears in
-    /// `/proc/<pid>/cgroup` -- e.g. `/crfuzz/run0`, not
-    /// `/sys/fs/cgroup/crfuzz/run0`. Must sit under the config's `cgroup`.
-    #[arg(long, default_value = "/crfuzz/run0")]
-    cgroup_path: String,
-
-    /// Hold thread groups with the `sched_ext` gate. Requires
-    /// `scx_crfuzz_gated` to be running.
-    ///
-    /// On a checkpoint hit the gate declines to dispatch the held role's whole
-    /// thread group, so a multi-threaded target -- a Go binary such as `runc`
-    /// -- is held without restarting the syscall it sits in.
-    #[arg(long)]
-    gate: bool,
-
     /// An OCI bundle to check before running: if its `linux.seccomp` profile
     /// denies a syscall a checkpoint sits on, refuse to start.
     ///
@@ -71,35 +56,27 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     oci_bundle: Option<PathBuf>,
 
-    /// Exit with the spawned process's status instead of the engine's verdict.
+    /// Exit with the status of the `--spawn` at INDEX (0 if given bare)
+    /// instead of the engine's verdict.
     ///
     /// For standing in for the binary being instrumented. `ctr run
     /// --runc-binary <wrapper>` makes containerd's shim exec the wrapper where
     /// it would have exec'd `runc`, and the shim reads the exit status to
     /// decide whether the container was created -- so reporting "the scheduling
     /// run completed" there would tell it a container exists when it does not.
-    ///
-    /// Requires exactly one `--spawn`: with several there is no single status
-    /// to report. The engine's own outcome still goes to the log, and to
-    /// `--canonical-log` / `--project-schedule` if asked for.
-    #[arg(long)]
-    exit_with_child: bool,
+    /// The index is what lets a wrapper carry the instrumented binary *and*
+    /// other processes (racers, attackers). The engine's own outcome still
+    /// goes to the log, and to `--out` if given. Requires `--out`: the shim
+    /// never drains stdout.
+    #[arg(long, value_name = "INDEX", num_args = 0..=1, default_missing_value = "0", requires = "out")]
+    exit_with_spawn: Option<usize>,
 
-    /// How long each backend poll waits for a notification.
-    #[arg(long, default_value_t = 50)]
-    poll_timeout_ms: u64,
-
-    /// Write the canonical log here instead of stdout.
-    #[arg(long)]
-    canonical_log: Option<PathBuf>,
-
-    /// Write the projected replay schedule (design doc section 3.5) here.
-    #[arg(long)]
-    project_schedule: Option<PathBuf>,
-
-    /// Write the debug log (pids, timings) here. Never byte-compared.
-    #[arg(long)]
-    debug_log: Option<PathBuf>,
+    /// Write the canonical log (`log`), projected replay schedule
+    /// (`schedule.json`, design doc section 3.5) and debug log (`debug`, pids
+    /// and timings, never byte-compared) into this directory. Without it the
+    /// canonical log goes to stdout and nothing else is written.
+    #[arg(long, value_name = "DIR")]
+    out: Option<PathBuf>,
 
     #[arg(short, long)]
     verbose: bool,
@@ -108,8 +85,8 @@ struct Args {
 /// Whether the container's own seccomp profile would erase our checkpoints.
 ///
 /// Binary-only, deliberately: the crate docs put OCI strictly upstream of the
-/// engine, so this sits with `--spawn` and `--cgroup-path` as harness work
-/// rather than inside the library.
+/// engine, so this sits with `--spawn` as harness work rather than inside the
+/// library.
 #[cfg(target_os = "linux")]
 mod oci_preflight;
 
@@ -120,9 +97,15 @@ struct RunReport {
     debug: DebugLog,
     /// Oracle rulings, one per observed window. Empty unless `auto_attack`.
     verdicts: Vec<(u64, OracleVerdict)>,
-    /// Backend-specific diagnostics, if any.
+    /// Bounded backend diagnostics (counts): safe to write to any
+    /// stream, including one that may never be drained.
     notes: Option<String>,
-    /// The spawned process's own exit status, for `--exit-with-child`. `None`
+    /// Unbounded per-event traces (`ready-sets:`): written to the
+    /// debug-log file, never to a stream. As one line these can exceed a pipe
+    /// buffer and block the process forever when the reader is a containerd
+    /// shim holding container stdio, so they must not go to stderr.
+    traces: Option<String>,
+    /// The spawned process's own exit status, for `--exit-with-spawn`. `None`
     /// when there was no real process, or it was never reaped.
     child_exit: Option<i32>,
 }
@@ -192,24 +175,22 @@ fn main() -> Result<()> {
         log::error!("FINDING at step {step}: {reason}");
     }
 
-    match &args.canonical_log {
-        Some(p) => std::fs::write(p, report.canonical.render())?,
-        None => print!("{}", report.canonical.render()),
-    }
-    if let Some(p) = &args.project_schedule {
-        std::fs::write(
-            p,
-            serde_json::to_string_pretty(&report.canonical.project_to_steps())?,
-        )?;
-    }
-    if let Some(p) = &args.debug_log {
-        std::fs::write(p, report.debug.render())?;
+    if let Some(dir) = &args.out {
+        if let Err(e) = write_out(dir, &report) {
+            if args.exit_with_spawn.is_none() {
+                return Err(e);
+            }
+            // Standing in for the child: its status matters more than ours.
+            log::error!("writing --out: {e:#}");
+        }
+    } else {
+        print!("{}", report.canonical.render());
     }
 
     // A run that did not complete is a failed run, and the exit status should
     // say so: these are driven from shell loops that need to tell the cases
     // apart without parsing the log.
-    if args.exit_with_child {
+    if args.exit_with_spawn.is_some() {
         // Deliberately unconditional on the outcome: the caller asked to stand
         // in for the child, and a wrapper that substitutes its own verdict on a
         // timeout is exactly the failure this flag exists to avoid. The outcome
@@ -218,7 +199,7 @@ fn main() -> Result<()> {
             Some(code) => std::process::exit(code),
             None => {
                 log::error!(
-                    "--exit-with-child, but the spawned process was never reaped; \
+                    "--exit-with-spawn, but the spawned process was never reaped; \
                      reporting 2 rather than inventing a status for it"
                 );
                 std::process::exit(2);
@@ -235,36 +216,123 @@ fn main() -> Result<()> {
     }
 }
 
+fn write_out(dir: &std::path::Path, report: &RunReport) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(dir.join("log"), report.canonical.render())?;
+    std::fs::write(
+        dir.join("schedule.json"),
+        serde_json::to_string_pretty(&report.canonical.project_to_steps())?,
+    )?;
+
+    // The debug log is the one non-compared output file, so the unbounded
+    // ready-set traces belong here and not on stderr.
+    let mut rendered = report.debug.render();
+    if let Some(traces) = &report.traces {
+        rendered
+            .push_str("\n# ready-set traces (section 14-A; never byte-compared)\n");
+        rendered.push_str(traces);
+        rendered.push('\n');
+    }
+    std::fs::write(dir.join("debug"), rendered)?;
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn run(_config: ScenarioConfig, _args: &Args) -> Result<RunReport> {
     anyhow::bail!("holding a process needs Linux; the library and its tests run anywhere")
 }
 
+/// Set by SIGINT/SIGTERM; the engine checks it once per round.
+#[cfg(target_os = "linux")]
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Removes this run's cgroup on the way out, on every path. When the run did
+/// not complete, whatever is still inside is killed first: an abandoned victim
+/// would otherwise keep the directory busy forever.
+#[cfg(target_os = "linux")]
+struct CgroupGuard {
+    dir: PathBuf,
+    kill: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        if self.kill {
+            // cgroup.kill (Linux 5.14) SIGKILLs every task in the cgroup.
+            if let Err(e) = std::fs::write(self.dir.join("cgroup.kill"), "1") {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("killing {}: {e}", self.dir.display());
+                }
+            }
+        }
+        // Killed tasks leave asynchronously; give them a moment.
+        for _ in 0..50 {
+            match std::fs::remove_dir(&self.dir) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => {
+                    log::warn!("removing cgroup {}: {e}", self.dir.display());
+                    return;
+                }
+            }
+        }
+        log::warn!("cgroup {} still has tasks; leaving it", self.dir.display());
+    }
+}
+
+/// Spawn the scenario under the `sched_ext` gate and drive the engine.
+///
+/// The gate is always used: it carries the thread-state sensor, and holds the
+/// victim's thread group during an `auto_attack` window. Without
+/// `scx_crfuzz_gated` attached, `GateBackend` refuses to start.
 #[cfg(target_os = "linux")]
 fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
+    use scx_crfuzz::backend_gate::GateBackend;
     use scx_crfuzz::backend_seccomp::ProcessSpec;
     use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
-    use std::time::Duration;
 
     if let Some(bundle) = &args.oci_bundle {
         preflight_bundle(bundle, &config)?;
     }
 
-    if args.exit_with_child && args.spawn.len() != 1 {
-        anyhow::bail!(
-            "--exit-with-child needs exactly one --spawn to answer for, got {}",
-            args.spawn.len()
-        );
+    if let Some(i) = args.exit_with_spawn {
+        if i >= args.spawn.len() {
+            anyhow::bail!(
+                "--exit-with-spawn {i} is out of range: only {} --spawn(s) were given",
+                args.spawn.len()
+            );
+        }
     }
 
-    if !args.cgroup_path.starts_with(&config.cgroup) {
-        anyhow::bail!(
-            "--cgroup-path `{}` is not inside the config's cgroup `{}`, so no spawned \
-             process could ever match a role",
-            args.cgroup_path,
-            config.cgroup
-        );
+    // One cgroup per invocation, so concurrent runs -- one runc wrapper per
+    // container under containerd -- never share one.
+    let cgroup = format!(
+        "{}/{}",
+        config.cgroup.trim_end_matches('/'),
+        std::process::id()
+    );
+
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    let action = SigAction::new(SigHandler::Handler(on_stop_signal), SaFlags::empty(), SigSet::empty());
+    for sig in [Signal::SIGINT, Signal::SIGTERM] {
+        // SAFETY: the handler only stores to an atomic. Handlers reset to the
+        // default across exec, so spawned processes are unaffected.
+        unsafe { sigaction(sig, &action) }.context("installing a stop handler")?;
     }
+
+    let mut cgroup_guard = CgroupGuard { // `mut`: `kill` is set after the run
+        dir: std::path::Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+        kill: true,
+    };
 
     let specs = args
         .spawn
@@ -272,37 +340,41 @@ fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
         .map(|s| ProcessSpec::parse(s))
         .collect::<Result<Vec<_>>>()?;
 
-    let seccomp = SeccompNotifyBackend::new(specs, args.cgroup_path.clone())
-        .with_poll_timeout(Duration::from_millis(args.poll_timeout_ms));
+    let seccomp = SeccompNotifyBackend::new(specs, cgroup.clone()).with_sched_ext(true);
+    let backend = GateBackend::new(seccomp)?;
+    let mut engine = scx_crfuzz::Engine::new(config, backend).with_stop(&STOP);
+    let outcome = engine.run();
 
-    if args.gate {
-        use scx_crfuzz::backend_gate::GateBackend;
-        let backend = GateBackend::new(seccomp.with_sched_ext(true))?;
-        return run_engine(
-            config,
-            backend,
-            |b| {
-                let s = b.stats();
-                format!(
-                    "{}\ngate: {} gate(s), {} ungate(s), max gate latency {:?} \
-                     (the cost to issue the hold: notification to kick-complete, \
-                     not the residual window before it takes effect)",
-                    b.inner().arrival_trace().join(" "),
-                    s.gates,
-                    s.ungates,
-                    s.max_gate_latency
-                )
-            },
-            |b| b.inner().child_exit_code(),
-        );
-    }
+    // A completed `runc create` may leave the container's tasks in flight
+    // to their own cgroup; never kill on success.
+    cgroup_guard.kill = !matches!(outcome, Ok(RunOutcome::Completed));
+    let outcome = outcome?;
 
-    run_engine(
-        config,
-        seccomp,
-        |b| b.arrival_trace().join(" "),
-        |b| b.child_exit_code(),
-    )
+    // Bounded: this is what reaches stderr, and it is safe on a stream that is
+    // never drained.
+    let notes = format!(
+        "ready-sets: {} decision(s); {} during a timed sleep, {} while a thread was frozen \
+         (non-zero: not seed-reproducible)",
+        engine.decision_trace().len(),
+        engine.timed_sleep_decisions(),
+        engine.frozen_decisions()
+    );
+    // Unbounded: section 14-A is a question about this exact sequence, and the
+    // only way to answer it is to compare it across runs -- so it is kept in
+    // full, but in a file, where its size cannot block the run.
+    let traces = format!("ready-sets: {}", engine.decision_trace().join(" | "));
+
+    Ok(RunReport {
+        outcome,
+        canonical: engine.canonical_log().clone(),
+        debug: engine.debug_log().clone(),
+        verdicts: engine.oracle_verdicts().to_vec(),
+        notes: Some(notes),
+        traces: Some(traces),
+        child_exit: args
+            .exit_with_spawn
+            .and_then(|i| engine.backend().inner().child_exit_code_at(i)),
+    })
 }
 
 /// Refuse to run a scenario whose checkpoints the bundle's profile would erase.
@@ -361,35 +433,17 @@ fn preflight_bundle(bundle: &std::path::Path, config: &ScenarioConfig) -> Result
     Ok(())
 }
 
-/// Drive an engine to completion and package what it produced.
-///
-/// Generic over the backend so the gate-wrapped and bare cases share one
-/// path; `arrival` is the only thing that differs, since reaching the section
-/// 14-A arrival trace means going through the wrapper when there is one.
-#[cfg(target_os = "linux")]
-fn run_engine<B: scx_crfuzz::backend::CheckpointBackend>(
-    config: ScenarioConfig,
-    backend: B,
-    arrival: impl FnOnce(&B) -> String,
-    child_exit: impl FnOnce(&B) -> Option<i32>,
-) -> Result<RunReport> {
-    let mut engine = scx_crfuzz::Engine::new(config, backend);
-    let outcome = engine.run()?;
-    // Printed rather than only counted: section 14-A is a question about this
-    // exact sequence, and the only way to answer it is to compare it across
-    // runs.
-    let notes = format!("arrival: {}", arrival(engine.backend()));
-    let notes = format!(
-        "{notes}\nready-sets: {}",
-        engine.decision_trace().join(" | ")
-    );
-    let child_exit = child_exit(engine.backend());
-    Ok(RunReport {
-        outcome,
-        canonical: engine.canonical_log().clone(),
-        debug: engine.debug_log().clone(),
-        verdicts: engine.oracle_verdicts().to_vec(),
-        notes: Some(notes),
-        child_exit,
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_with_spawn_requires_out() {
+        let r = Args::try_parse_from(["scx_crfuzz", "-c", "x.json", "--spawn", "true", "--exit-with-spawn"]);
+        assert!(r.is_err(), "a shim-facing run must not print the log to an undrained stdout");
+        let ok = Args::try_parse_from([
+            "scx_crfuzz", "-c", "x.json", "--spawn", "true", "--exit-with-spawn", "--out", "/tmp/o",
+        ]);
+        assert!(ok.is_ok());
+    }
 }

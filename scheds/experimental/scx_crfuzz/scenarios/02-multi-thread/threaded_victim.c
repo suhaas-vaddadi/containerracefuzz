@@ -8,12 +8,15 @@
 // the same structural checkpoints. The sibling thread does nothing but record
 // that it is still running: it appends one byte to a progress file, forever.
 //
-// That progress file is the whole point. The design doc's Background says a
-// role denotes a thread group and "holding a role back means holding every
-// thread of that thread group". So while the engine holds this role at a
-// checkpoint, the progress file MUST NOT grow. seccomp user-notification holds
-// only the thread that made the syscall, so under that backend alone it does
-// grow -- which is the gap tests/thread_group_holding.rs exists to measure.
+// The progress file shows whether the sibling ran. seccomp user-notification
+// holds only the thread that made the syscall, so while the main thread is
+// parked the file grows; under `gate_group` (auto_attack's attacker window)
+// it must not. tests/thread_group_holding.rs measures both.
+//
+// The sibling sleeps on a 1 ms timer, so under POS nearly every decision
+// counts in `timed_sleep_decisions` (not seed-reproducible). A third argument,
+// `still`, removes every timer: no warmup, and the sibling only waits for a
+// signal (tests/full_readout.rs's reproducible run).
 //
 // Built -static for the same reason victim.c is: a dynamic loader makes dozens
 // of path-touching syscalls before main(), every one of them a checkpoint.
@@ -29,6 +32,7 @@
 static void say(const char *s) { (void)!write(1, s, strlen(s)); }
 
 static const char *progress_path;
+static int still;
 
 // Deliberately NOT a path-touching syscall per iteration: the file is opened
 // once, up front, so the sibling's loop makes only write(2) calls. A write to
@@ -37,6 +41,8 @@ static const char *progress_path;
 // unambiguously "a thread that should have been held was running".
 static void *sibling(void *arg) {
     int fd = *(int *)arg;
+    while (still)
+        pause();
     struct timespec nap = {.tv_sec = 0, .tv_nsec = 1000000}; // 1ms
     for (;;) {
         (void)!write(fd, ".", 1);
@@ -52,6 +58,7 @@ int main(int argc, char **argv) {
     }
     const char *path = argv[1];
     progress_path = argv[2];
+    still = argc > 3;
 
     int pfd = open(progress_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (pfd < 0) {
@@ -69,7 +76,8 @@ int main(int argc, char **argv) {
     // progress file at the main thread's first checkpoint is measuring a
     // genuinely running thread rather than one that has not started yet.
     struct timespec warmup = {.tv_sec = 0, .tv_nsec = 50000000}; // 50ms
-    nanosleep(&warmup, NULL);
+    if (!still)
+        nanosleep(&warmup, NULL);
 
     // CHECK -- the main thread's first structural checkpoint.
     struct stat st;

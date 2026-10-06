@@ -10,5 +10,9 @@
 pub mod bpf_intf;
 pub mod bpf_skel;
 pub mod client;
+pub mod sensor;
 
 pub use client::GateMap;
+pub use sensor::RecordKind;
+pub use sensor::RunSensor;
+pub use sensor::ThreadRecord;

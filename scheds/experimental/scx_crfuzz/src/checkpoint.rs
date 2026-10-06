@@ -20,21 +20,6 @@ impl CheckpointId {
         CheckpointId(s.into())
     }
 
-    /// The reserved id for the `exit` stop condition.
-    ///
-    /// A step may name `exit` instead of a checkpoint ("run until the role
-    /// naturally exits or blocks" -- Background, "Schedule and the three-phase
-    /// state machine"). The engine turns a role's task-exit into a synthetic
-    /// ready-set entry carrying this id, so a policy sees one uniform kind of
-    /// thing to decide over and does not need a second code path for exits.
-    pub fn exit() -> Self {
-        CheckpointId::new("exit")
-    }
-
-    pub fn is_exit(&self) -> bool {
-        self.0 == "exit"
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -142,8 +127,9 @@ impl CheckpointDecl {
 /// - `fsconfig`: it can carry a path (`FSCONFIG_SET_PATH`), but only as the
 ///   value for a filesystem that `fsmount` + `move_mount` then attaches, and
 ///   `move_mount` is here.
-/// - `setxattrat`/`removexattrat` (Linux 6.13): too new for the libseccomp
-///   this is built against. Section 12's maintenance note covers adding them.
+/// - `setxattrat`/`removexattrat`, and the check-shaped `getxattrat`/
+///   `listxattrat` (Linux 6.13): too new for the libseccomp this is built
+///   against. Section 12's maintenance note covers adding them.
 pub const STRUCTURAL_SYSCALLS: &[&str] = &[
     // Open.
     "openat",
@@ -216,6 +202,11 @@ pub const CHECK_SHAPED_SYSCALLS: &[&str] = &[
     "lstat",
     "access",
     "readlink",
+    "getxattr",
+    "lgetxattr",
+    "listxattr",
+    "llistxattr",
+    "statfs",
 ];
 
 /// The kernel's spelling of a syscall name.
@@ -286,6 +277,92 @@ pub fn path_arg_index(name: &str) -> Option<usize> {
     Some(idx)
 }
 
+/// Which syscall arguments hold *every* path a syscall resolves, not just the
+/// primary one (plan Phase 1).
+///
+/// The single-path `path_arg_index` exists for the depth-2 `auto_attack` window,
+/// which points one attacker at the one object the victim acts on. POS needs
+/// all of them: a `renameat2` that moves `old` onto `new` conflicts on both
+/// paths, and `mount` source and target are each separately swappable. The
+/// result is a slice so the common one-path case stays allocation-free.
+///
+/// Accepts either spelling of `fstatat`. `&[]` means the syscall resolves no
+/// path this crate knows how to name.
+pub fn path_arg_indices(name: &str) -> &'static [usize] {
+    let name = canonical_syscall(name);
+    match name {
+        // path is the first argument.
+        "open" | "creat" | "execve" | "mkdir" | "rmdir" | "unlink" | "mknod" | "truncate"
+        | "setxattr" | "lsetxattr" | "removexattr" | "lremovexattr" | "chmod" | "chown"
+        | "lchown" | "utime" | "utimes" | "umount2" | "chroot" | "chdir" => &[0],
+        // Legacy two-path forms: (old, new).
+        "rename" | "link" => &[0, 1],
+        // `symlink(target, linkpath)`: `target` is the link's *contents*, not
+        // a path the call resolves.
+        "symlink" => &[1],
+        // `pivot_root(new_root, put_old)`.
+        "pivot_root" => &[0, 1],
+        // dirfd-relative `*at` forms: path is the second argument.
+        "openat" | "openat2" | "execveat" | "mkdirat" | "unlinkat" | "mknodat" | "fchmodat"
+        | "fchmodat2" | "fchownat" | "utimensat" | "futimesat" | "open_tree" | "mount_setattr"
+        | "fspick" => &[1],
+        // Two-dirfd `*at` forms: (olddirfd, oldpath, newdirfd, newpath).
+        "renameat" | "renameat2" | "linkat" => &[1, 3],
+        // `symlinkat(target, newdirfd, linkpath)`: as `symlink`.
+        "symlinkat" => &[2],
+        // `mount(source, target, ...)`: both sides resolve against the tree.
+        "mount" => &[0, 1],
+        // `move_mount(from_dfd, from_pathname, to_dfd, to_pathname, flags)`.
+        "move_mount" => &[1, 3],
+        // Check-shaped path-resolving calls (plan Phase 4 attaches these only
+        // for `pos`).
+        "newfstatat" | "statx" | "faccessat" | "faccessat2" | "readlinkat" => &[1],
+        "stat" | "lstat" | "access" | "readlink" | "getxattr" | "lgetxattr" | "listxattr"
+        | "llistxattr" | "statfs" => &[0],
+        _ => &[],
+    }
+}
+
+/// `O_CREAT` and `O_TRUNC` (asm-generic; the same on x86_64 and aarch64).
+/// Spelled out because this module builds without `libc`.
+pub const O_CREAT: u64 = 0o100;
+pub const O_TRUNC: u64 = 0o1000;
+
+/// Whether the call *rebinds* the path at `path_arg_indices(name)[slot]`, as
+/// opposed to only resolving it. `open_flags` is the open-family flags word
+/// (ignored for every other call).
+///
+/// POS's read-only relaxation depends on this being per argument: a
+/// read-only `openat` that is keyed as a rebind conflicts with every other
+/// open of the same file and orders events that commute.
+pub fn arg_rebinds(name: &str, slot: usize, open_flags: u64) -> bool {
+    match canonical_syscall(name) {
+        "open" | "openat" | "openat2" => open_flags & (O_CREAT | O_TRUNC) != 0,
+        // Running, or entering a directory, resolves a path and binds nothing.
+        "execve" | "execveat" | "chdir" | "chroot" => false,
+        // The existing name is only resolved; the new one is bound.
+        "link" | "linkat" => slot == 1,
+        // The source is a device, an fs type or a bind source: resolved only.
+        "mount" => slot == 1,
+        other => structural_category(other) == Some(PathCategory::Mutating),
+    }
+}
+
+/// The default `checkpoints[]` for a POS discovery run (plan Phase 4).
+///
+/// The union of the use-shaped structural set and the check-shaped resolving
+/// set. Check-shaped calls were excluded from the depth-2 default because a
+/// hold at their entry lies *before* the check, outside every check-to-use
+/// window -- but POS does not need check/use labels: it orders a check against
+/// a later rebind by conflict key, which is exactly the read-only relaxation.
+pub fn default_pos_checkpoints() -> Vec<CheckpointDecl> {
+    STRUCTURAL_SYSCALLS
+        .iter()
+        .chain(CHECK_SHAPED_SYSCALLS.iter())
+        .map(|name| CheckpointDecl::syscall(name))
+        .collect()
+}
+
 /// The default `checkpoints[]` for a discovery-mode scenario (section 8).
 ///
 /// Populated so an operator need not type out the whole structural set by
@@ -297,6 +374,22 @@ pub fn default_discovery_checkpoints() -> Vec<CheckpointDecl> {
         .iter()
         .map(|name| CheckpointDecl::syscall(name))
         .collect()
+}
+
+/// Whether `name` follows a symlink in the *last* component of its path.
+///
+/// Calls that name the entry itself (remove, rename, create, `l*`) do not.
+// ponytail: flag-controlled cases (`AT_SYMLINK_NOFOLLOW`, `O_NOFOLLOW`,
+// `AT_SYMLINK_FOLLOW` on linkat) use the default; following when the kernel
+// would not only adds objects, i.e. more conflicts, never fewer.
+pub fn follows_final_symlink(name: &str) -> bool {
+    !matches!(
+        canonical_syscall(name),
+        "unlink" | "unlinkat" | "rmdir" | "rename" | "renameat" | "renameat2"
+            | "link" | "linkat" | "symlink" | "symlinkat" | "mkdir" | "mkdirat"
+            | "mknod" | "mknodat" | "lstat" | "readlink" | "readlinkat" | "lchown"
+            | "lsetxattr" | "lremovexattr" | "lgetxattr" | "llistxattr"
+    )
 }
 
 #[cfg(test)]
@@ -325,6 +418,22 @@ mod tests {
     }
 
     #[test]
+    fn pos_holds_every_path_based_check() {
+        let pos: Vec<String> = default_pos_checkpoints()
+            .into_iter()
+            .map(|c| c.target)
+            .collect();
+        for name in ["getxattr", "lgetxattr", "listxattr", "llistxattr", "statfs"] {
+            assert!(pos.iter().any(|t| t == name), "`{name}` is not held under pos");
+            assert_eq!(path_arg_indices(name), &[0], "`{name}` keys its path");
+            assert!(!arg_rebinds(name, 0, 0), "`{name}` is a check, not a rebind");
+        }
+        assert!(!default_discovery_checkpoints()
+            .iter()
+            .any(|c| c.target == "getxattr"));
+    }
+
+    #[test]
     fn category_lookup_knows_both_lists_and_the_doc_spelling() {
         assert_eq!(structural_category("openat"), Some(PathCategory::Mutating));
         assert_eq!(structural_category("chdir"), Some(PathCategory::Mutating));
@@ -347,6 +456,7 @@ mod tests {
     fn umount_is_not_listed() {
         assert!(!STRUCTURAL_SYSCALLS.contains(&"umount"));
         assert!(STRUCTURAL_SYSCALLS.contains(&"umount2"));
+        assert!(follows_final_symlink("umount2"));
     }
 
     #[test]
@@ -385,10 +495,66 @@ mod tests {
     }
 
     #[test]
-    fn exit_id_is_reserved_and_recognised() {
-        assert!(CheckpointId::exit().is_exit());
-        assert!(!CheckpointId::new("openat").is_exit());
-        // The reserved id must not collide with a real checkpoint.
-        assert!(!STRUCTURAL_SYSCALLS.contains(&"exit"));
+    fn every_known_path_syscall_has_a_nonempty_index_set() {
+        for name in STRUCTURAL_SYSCALLS
+            .iter()
+            .chain(CHECK_SHAPED_SYSCALLS.iter())
+        {
+            assert!(
+                !path_arg_indices(name).is_empty(),
+                "`{name}` has no path-argument index in either set"
+            );
+        }
+        assert!(
+            !path_arg_indices("fstatat").is_empty(),
+            "the doc spelling works"
+        );
+        assert!(
+            path_arg_indices("fchmod").is_empty(),
+            "unknown degrades to no path"
+        );
+    }
+
+    #[test]
+    fn two_path_syscalls_name_both_sides() {
+        assert_eq!(path_arg_indices("renameat2").to_vec(), vec![1, 3]);
+        assert_eq!(path_arg_indices("linkat").to_vec(), vec![1, 3]);
+        assert_eq!(path_arg_indices("mount").to_vec(), vec![0, 1]);
+        assert_eq!(path_arg_indices("move_mount").to_vec(), vec![1, 3]);
+    }
+
+    #[test]
+    fn only_the_arguments_a_call_rebinds_are_rebinds() {
+        assert!(!arg_rebinds("openat", 0, 0), "a plain open only resolves");
+        assert!(arg_rebinds("openat", 0, O_CREAT));
+        assert!(arg_rebinds("openat", 0, O_TRUNC));
+        assert!(arg_rebinds("creat", 0, 0));
+        assert!(!arg_rebinds("execve", 0, 0));
+        assert!(!arg_rebinds("chdir", 0, 0));
+        assert!(!arg_rebinds("linkat", 0, 0), "the existing name is only resolved");
+        assert!(arg_rebinds("linkat", 1, 0), "the new name is bound");
+        assert!(!arg_rebinds("mount", 0, 0), "the source is only resolved");
+        assert!(arg_rebinds("mount", 1, 0));
+        assert!(arg_rebinds("renameat2", 0, 0) && arg_rebinds("renameat2", 1, 0));
+        assert!(!arg_rebinds("newfstatat", 0, 0));
+    }
+
+    #[test]
+    fn symlink_contents_are_not_a_path_argument() {
+        assert_eq!(path_arg_indices("symlinkat").to_vec(), vec![2]);
+        assert_eq!(path_arg_indices("symlink").to_vec(), vec![1]);
+    }
+
+    #[test]
+    fn pos_default_set_is_the_structural_union_check_shaped() {
+        let set = default_pos_checkpoints();
+        assert_eq!(
+            set.len(),
+            STRUCTURAL_SYSCALLS.len() + CHECK_SHAPED_SYSCALLS.len()
+        );
+        assert!(set.iter().any(|c| c.id.as_str() == "openat"));
+        assert!(set
+            .iter()
+            .any(|c| c.id.as_str() == "newfstatat" && c.category == Some(PathCategory::Resolving)));
     }
 }

@@ -15,13 +15,15 @@
 // exists to close.
 
 mod fixed;
-mod ordered_walk;
+mod pos;
 
 pub use fixed::FixedSchedule;
-pub use ordered_walk::OrderedWalk;
+pub use pos::PosPolicy;
 
 use crate::backend::NotifyHandle;
 use crate::checkpoint::CheckpointId;
+use crate::event::ConflictKey;
+use crate::event::EventId;
 use crate::role::RoleRef;
 use std::path::PathBuf;
 
@@ -45,6 +47,12 @@ pub struct ReadyCheckpointHit {
     /// not read it -- release ordering does not depend on the path -- but the
     /// attacker/oracle orchestration does, so it travels with the hit.
     pub path: Option<PathBuf>,
+    /// Stable POS identity of this event (plan section 3.2). The engine owns
+    /// `occurrence` assignment; the other policies ignore it.
+    pub event: EventId,
+    /// The conflict tokens this hit touches (plan section 3.2), empty for
+    /// non-path syscalls. FixedSchedule ignores them.
+    pub keys: Vec<ConflictKey>,
 }
 
 /// What a policy decided to do with the current ready set.
@@ -85,17 +93,15 @@ pub trait DecisionPolicy {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
+    use crate::event::ActorId;
+    use crate::event::Direction;
+    use crate::event::FileToken;
+    use crate::event::ThreadPath;
     use crate::role::RoleId;
 
     /// Build a ready-set entry for a `one` role named `name`.
     pub fn hit(name: &str, role: usize, checkpoint: &str, handle: u64) -> ReadyCheckpointHit {
-        ReadyCheckpointHit {
-            role: RoleRef::one(RoleId(role)),
-            role_name: name.to_string(),
-            checkpoint: CheckpointId::new(checkpoint),
-            handle: NotifyHandle(handle),
-            path: None,
-        }
+        hit_full(name, role, checkpoint, handle, 0, Vec::new())
     }
 
     /// Build a ready-set entry for pool member `member` of role `role`.
@@ -106,12 +112,62 @@ pub(crate) mod testing {
         checkpoint: &str,
         handle: u64,
     ) -> ReadyCheckpointHit {
+        let role_ref = RoleRef::pool_member(RoleId(role), member);
         ReadyCheckpointHit {
-            role: RoleRef::pool_member(RoleId(role), member),
+            role: role_ref,
             role_name: format!("{name}#{member}"),
             checkpoint: CheckpointId::new(checkpoint),
             handle: NotifyHandle(handle),
             path: None,
+            event: EventId::new(ActorId::role(role_ref), CheckpointId::new(checkpoint), 0),
+            keys: Vec::new(),
         }
+    }
+
+    /// Build a ready-set entry for thread `path` of a `one` role.
+    pub fn thread_hit(
+        name: &str,
+        role: usize,
+        path: &[u32],
+        checkpoint: &str,
+        handle: u64,
+    ) -> ReadyCheckpointHit {
+        let mut h = hit(name, role, checkpoint, handle);
+        h.event.actor.thread = Some(ThreadPath(path.to_vec()));
+        h
+    }
+
+    /// Build a ready-set entry with an explicit occurrence and conflict keys,
+    /// for the POS tests.
+    pub fn hit_full(
+        name: &str,
+        role: usize,
+        checkpoint: &str,
+        handle: u64,
+        occurrence: u32,
+        keys: Vec<ConflictKey>,
+    ) -> ReadyCheckpointHit {
+        let role_ref = RoleRef::one(RoleId(role));
+        ReadyCheckpointHit {
+            role: role_ref,
+            role_name: name.to_string(),
+            checkpoint: CheckpointId::new(checkpoint),
+            handle: NotifyHandle(handle),
+            path: None,
+            event: EventId::new(
+                ActorId::role(role_ref),
+                CheckpointId::new(checkpoint),
+                occurrence,
+            ),
+            keys,
+        }
+    }
+
+    /// A file conflict key for the POS tests: anchor `anchor_ino`, leaf `leaf`.
+    pub fn file_key(anchor_ino: u64, leaf: &str, dir: Direction) -> ConflictKey {
+        ConflictKey::file(
+            FileToken::leaf(10, anchor_ino, leaf.as_bytes().to_vec(), 10, anchor_ino),
+            dir,
+        )
     }
 }

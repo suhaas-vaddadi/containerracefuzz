@@ -24,7 +24,7 @@ build: \
 	$(S1)/victim $(S1)/racer \
 	$(S2)/threaded_victim $(S2)/mt_attacker \
 	$(S3)/mt_attacker \
-	$(FIX)/go_victim $(FIX)/mt_hold
+	$(FIX)/go_victim $(FIX)/mt_hold $(FIX)/spin_park $(FIX)/pinned_wake
 
 $(S1)/victim: $(S1)/victim.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -48,6 +48,13 @@ $(S3)/mt_attacker: $(S2)/mt_attacker.c
 $(FIX)/mt_hold: $(FIX)/mt_hold.c
 	$(CC) $(CFLAGS) -pthread -o $@ $<
 
+# -pthread: tests/full_readout.rs's spinner and pinned-reader fixtures.
+$(FIX)/spin_park: $(FIX)/spin_park.c
+	$(CC) $(CFLAGS) -pthread -o $@ $<
+
+$(FIX)/pinned_wake: $(FIX)/pinned_wake.c
+	$(CC) $(CFLAGS) -pthread -o $@ $<
+
 # CGO_ENABLED=0: a cgo binary drags in the dynamic loader, whose own
 # path-touching syscalls before main() are all structural checkpoints.
 $(FIX)/go_victim: $(FIX)/go_victim.go
@@ -68,6 +75,6 @@ clean:
 	rm -f $(S1)/victim $(S1)/racer \
 	      $(S2)/threaded_victim $(S2)/mt_attacker \
 	      $(S3)/mt_attacker \
-	      $(FIX)/go_victim $(FIX)/mt_hold
+	      $(FIX)/go_victim $(FIX)/mt_hold $(FIX)/spin_park $(FIX)/pinned_wake
 
 .PHONY: all build run-01 run-02 run-03 clean

@@ -38,7 +38,7 @@ pub struct RoleId(pub usize);
 /// `Ord` is derived (role declaration index, then member index) so a policy
 /// can canonically order or tie-break a set of ready hits by role identity
 /// alone, independent of the order they happened to arrive at the engine in
-/// -- see `policy::OrderedWalk` and the section 14-A discussion in `lib.rs`.
+/// -- see `policy::PosPolicy` and the section 14-A discussion in `lib.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RoleRef {
     pub role: RoleId,
@@ -102,7 +102,7 @@ pub struct RoleTable {
     tgid_role: HashMap<Pid, RoleRef>,
     /// Next member index to hand out, per pool role.
     pool_next: HashMap<RoleId, u32>,
-    /// Which roles have been seen at least once (barrier bookkeeping).
+    /// Which roles have been seen at least once (readout bookkeeping).
     seen: HashSet<RoleId>,
     /// The scenario-wide cgroup, used when a role declares no cgroup of its own.
     scenario_cgroup: String,
@@ -226,13 +226,13 @@ impl RoleTable {
         self.tgid_role.remove(&pid);
     }
 
-    /// Barrier condition (Background, plus design doc section 5).
+    /// The readout's role condition (Background, plus design doc section 5).
     ///
     /// Evaluated over `one`-cardinality roles only. A pool is open-ended by
     /// definition -- there is no fixed N to wait for -- so requiring "all pool
-    /// members seen" is not a well-formed condition and would hang the barrier
+    /// members seen" is not a well-formed condition and would hang the run
     /// forever. A pool is marked seen the first time any member matches, and
-    /// later matches are recorded without gating the barrier further.
+    /// later matches are recorded without gating the readout further.
     pub fn all_roles_seen(&self) -> bool {
         self.decls
             .iter()
@@ -360,10 +360,10 @@ mod tests {
     }
 
     #[test]
-    fn barrier_ignores_pool_roles_entirely() {
+    fn the_role_condition_ignores_pool_roles_entirely() {
         let mut t = table();
         assert!(!t.all_roles_seen());
-        // Only the pool has shown up: the barrier must still be waiting on the
+        // Only the pool has shown up: the readout must still be waiting on the
         // `one` role...
         t.resolve_role(&task(300, 300, 1, "racer")).unwrap();
         assert!(!t.all_roles_seen());

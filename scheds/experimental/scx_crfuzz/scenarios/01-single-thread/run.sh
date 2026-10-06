@@ -5,7 +5,7 @@
 # that path. POS samples the orderings of their path-touching syscalls.
 #
 # Needs root (seccomp user-notify) and scx_crfuzz_gated running: every run
-# holds through the sched_ext gate.
+# reads thread state from its sensor.
 #
 #   make run-01        # from scenarios/
 set -eu

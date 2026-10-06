@@ -97,9 +97,10 @@ pub fn build_config(
         checkpoints,
         on_divergence: DivergencePolicy::Block,
         attack: None,
+        watchdog_cpu_secs: 15,
         mode: Mode::Discovery {
             policy: PolicyDecl {
-                policy_type: PolicyType::OrderedWalk,
+                policy_type: PolicyType::Pos,
                 seed,
             },
         },
@@ -196,13 +197,13 @@ mod tests {
     }
 
     #[test]
-    fn policy_defaults_to_ordered_walk_with_the_given_seed() {
+    fn policy_defaults_to_pos_with_the_given_seed() {
         let victim = trace("victim", vec![("openat", "/p")]);
         let racer = trace("racer", vec![("openat", "/p")]);
         let cfg = build_config("s", "/c", 99, &[victim, racer]).unwrap();
         match cfg.mode {
             Mode::Discovery { policy } => {
-                assert_eq!(policy.policy_type, PolicyType::OrderedWalk);
+                assert_eq!(policy.policy_type, PolicyType::Pos);
                 assert_eq!(policy.seed, 99);
             }
             _ => panic!("expected discovery mode"),

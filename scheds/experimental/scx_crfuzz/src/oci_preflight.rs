@@ -26,8 +26,8 @@
 //!
 //! **This lives in the binary, not the library.** The crate docs are explicit
 //! that the mutator is upstream and "the engine never learns what OCI is"; a
-//! preflight check on a bundle is harness work, like `--spawn` and
-//! `--cgroup-path`, so it sits beside them rather than inside the engine.
+//! preflight check on a bundle is harness work, like `--spawn`, so it sits
+//! beside it rather than inside the engine.
 //!
 //! ## Why this compares numbers rather than names
 //!

@@ -1,108 +1,63 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// The intended holding mechanism: a `sched_ext` scheduler declines to place a
-// gated thread group on a CPU.
+// The `sched_ext` side of a run: the gate that keeps a thread or a thread
+// group off the CPU, and the thread-state sensor that reports what every
+// thread in the run's cgroup is doing.
 //
-// A decorator over another backend: seccomp supplies the precision (stop at
-// exactly this syscall), the gate supplies the coverage (nothing else in the
-// thread group gets CPU).
-//
-// WHAT THIS FIXES, AND WHAT IT DOES NOT.
-//
-// Fixed: holding a thread group without perturbing the syscall it holds. A
-// cgroup freeze would wake every task in the cgroup, including one parked in a
-// seccomp notification; that wait is interruptible, so the kernel would
-// restart the syscall and a fresh notification id would replace the one the
-// engine was told about. The gate never touches the held thread -- it stays
-// parked for the whole hold -- so the only state here is `owner`, mapping a
-// handle back to a thread group.
-//
-// Not fixed: the boundary is sharper, not zero. Between the notification
-// arriving and this code writing the gate entry, siblings still run -- one
-// userspace round trip.
-// `GateStats` measures it rather than asserting it away. Closing it needs the
-// gate set in-kernel in the trapping task's own context; see the spec's
-// "Residual window, and phase 2".
-//
-// Also not fixed: which thread inside a thread group arrives first. That is
-// section 14-A and the gate does not touch it. The gate makes the other
-// threads stop; it does not make them stop in a chosen order.
+// Wraps the seccomp backend, which still parks each checkpoint hit. This layer
+// does not decorate hits: holding beyond the parked thread is the engine's
+// call, through `freeze`/`thaw` (one thread, wherever it is) and
+// `gate_group`/`ungate_group` (a whole thread group, for `auto_attack`'s
+// attacker window). A gated thread is runnable but never dispatched, so it is
+// not disturbed: a thread parked in its seccomp notification stays parked, and
+// the notification id the engine holds stays valid.
 
 use crate::backend::BackendEvent;
 use crate::backend::CheckpointBackend;
 use crate::backend::NotifyHandle;
 use crate::backend::Poll;
+use crate::backend::ThreadStateKind;
+use crate::backend_seccomp::SeccompNotifyBackend;
 use crate::checkpoint::CheckpointDecl;
+use crate::event::ConflictKey;
 use crate::role::Pid;
 use anyhow::bail;
+use anyhow::Context;
 use anyhow::Result;
 use scx_crfuzz_gate::GateMap;
-use std::collections::HashMap;
+use scx_crfuzz_gate::RecordKind;
+use scx_crfuzz_gate::RunSensor;
+use scx_crfuzz_gate::ThreadRecord;
 use std::time::Duration;
 use std::time::Instant;
 
-/// What the gate cost and how fuzzy its boundary was.
-///
-/// The case against a mechanism should be evidence rather than theory, and
-/// the case *for* one is held to the same standard.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct GateStats {
-    pub gates: usize,
-    pub ungates: usize,
-    /// Worst notification-to-kick-complete seen: the cost to *issue* a hold,
-    /// which excludes the scheduling round in which it takes effect.
-    pub max_gate_latency: Duration,
-}
-
-pub struct GateBackend<B: CheckpointBackend> {
-    inner: B,
+pub struct GateBackend {
+    inner: SeccompNotifyBackend,
     map: GateMap,
-    /// Handle as the engine knows it -> the thread group it belongs to.
-    ///
-    /// There is no second map: the handle the engine was given stays valid
-    /// for the whole hold, because nothing disturbs it.
-    owner: HashMap<NotifyHandle, Pid>,
-    stats: GateStats,
+    /// Registered by `attach`, before anything is spawned into the cgroup.
+    sensor: Option<RunSensor>,
+    /// `SCX_EV_BYPASS_ACTIVATE` when the run started.
+    bypass_at_start: u64,
 }
 
-/// The thread group a task belongs to, from `/proc/<pid>/status`.
-///
-/// `CheckpointHit` carries only a pid, and gating is per-thread-group, so this
-/// is the one lookup the gate needs. A pid that has already gone (or never
-/// existed, as in the stub tests) is treated as its own leader, matching the
-/// engine's own default in `role.rs`.
-pub fn tgid_of(pid: Pid) -> Pid {
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-        return pid;
-    };
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("Tgid:"))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(pid)
-}
-
-impl<B: CheckpointBackend> GateBackend<B> {
-    pub fn new(inner: B) -> Result<Self> {
+impl GateBackend {
+    pub fn new(inner: SeccompNotifyBackend) -> Result<Self> {
         Ok(GateBackend {
             inner,
             map: GateMap::open()?,
-            owner: HashMap::new(),
-            stats: GateStats::default(),
+            sensor: None,
+            bypass_at_start: GateMap::bypass_activations()?,
         })
     }
 
-    pub fn stats(&self) -> &GateStats {
-        &self.stats
-    }
-
-    pub fn inner(&self) -> &B {
+    pub fn inner(&self) -> &SeccompNotifyBackend {
         &self.inner
     }
 
-    /// Fail the run if the kernel ejected the scheduler underneath us.
+    /// Fail the run if the kernel ejected the scheduler underneath us, or
+    /// put it in bypass mode.
     ///
-    /// Checked every round. An ejection releases every gate at once, and the
+    /// Checked every round. Either one releases every gate at once, and the
     /// engine would go on believing it holds tasks that are in fact running
     /// free -- producing a clean-looking verdict from a run that enforced
     /// nothing. That is worse than a crash, so it is treated as one.
@@ -114,71 +69,201 @@ impl<B: CheckpointBackend> GateBackend<B> {
                  -- a hold longer than 30s ejects the scheduler."
             );
         }
+        let bypass = GateMap::bypass_activations()?;
+        if bypass > self.bypass_at_start {
+            bail!(
+                "the sched_ext scheduler entered bypass mode mid-run \
+                 (SCX_EV_BYPASS_ACTIVATE {} -> {bypass}): the kernel scheduled every \
+                 task itself, so no gate was holding.",
+                self.bypass_at_start
+            );
+        }
         Ok(())
     }
 }
 
-impl<B: CheckpointBackend> CheckpointBackend for GateBackend<B> {
+fn thread_state(r: ThreadRecord) -> BackendEvent {
+    BackendEvent::ThreadState {
+        tid: r.tid,
+        tgid: r.tgid,
+        kind: match r.kind {
+            RecordKind::Created => ThreadStateKind::Created,
+            RecordKind::WakeStart => ThreadStateKind::WakeStart,
+            RecordKind::WakeDone => ThreadStateKind::WakeDone,
+            RecordKind::Asleep => ThreadStateKind::Asleep,
+            RecordKind::Exited => ThreadStateKind::Exited,
+            RecordKind::Joined => ThreadStateKind::Joined,
+            RecordKind::Left => ThreadStateKind::Left,
+        },
+        arg: r.arg,
+    }
+}
+
+/// A `Joined` for every thread of `tgid` but its leader, from
+/// `/proc/<tgid>/task`, in tid order.
+fn group_threads(tgid: Pid) -> Vec<BackendEvent> {
+    let Ok(dir) = std::fs::read_dir(format!("/proc/{tgid}/task")) else {
+        return Vec::new();
+    };
+    let mut tids: Vec<Pid> = dir
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<Pid>().ok())
+        .filter(|tid| *tid != tgid)
+        .collect();
+    // Sorted, so the clone paths they are numbered with do not follow
+    // directory order.
+    tids.sort_unstable();
+    tids.into_iter()
+        .map(|tid| BackendEvent::ThreadState {
+            tid,
+            tgid,
+            kind: ThreadStateKind::Joined,
+            arg: 0,
+        })
+        .collect()
+}
+
+impl CheckpointBackend for GateBackend {
+    fn spawned(&self) -> Vec<Pid> {
+        self.inner.spawned()
+    }
+
     fn attach(&mut self, checkpoints: &[CheckpointDecl]) -> Result<()> {
         self.check_still_attached()?;
+        // The sensor sees only what happens after it registers, so it
+        // registers before the seccomp backend spawns anything into the
+        // cgroup.
+        let dir = self.inner.cgroup_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating cgroup {}", dir.display()))?;
+        let sensor = RunSensor::register(&dir, self.map.epoch())?;
+        self.inner.wake_on(sensor.fd());
+        self.sensor = Some(sensor);
         self.inner.attach(checkpoints)
     }
 
-    fn poll(&mut self) -> Result<Poll> {
-        self.check_still_attached()?;
-        let polled = self.inner.poll()?;
-        let Poll::Events(events) = polled else {
-            return Ok(polled);
-        };
-
-        for event in &events {
-            let BackendEvent::CheckpointHit { pid, handle, .. } = event else {
-                continue;
+    /// Order is load-bearing, and the engine's thread table depends on it
+    /// (design doc section 2, "Draining"). It drains in rounds -- the
+    /// notification fds, then the sensor -- until a sensor drain comes back
+    /// empty, and delivers every record before every hit:
+    /// - every record a thread made before its notification was queued (the
+    ///   wakeup that let it reach the syscall) was reserved before that
+    ///   round's notification read, so it is in this batch or an earlier one;
+    /// - the kernel queues a notification before its thread's `Asleep`, so
+    ///   the round after the one that drained an `Asleep` reads its hit.
+    ///
+    /// `Idle` means `timeout` passed with nothing to report, or a signal: a
+    /// wake for a reaped child or a hung-up listener waits on.
+    fn poll(&mut self, timeout: Option<Duration>) -> Result<Poll> {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let (polled, records) = loop {
+            self.check_still_attached()?;
+            let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+            // Wakes for a record as well as a notification or an exit.
+            let woken = self.inner.wait(left)?;
+            let mut hits = Vec::new();
+            let mut closed = false;
+            let mut records = Vec::new();
+            loop {
+                match self.inner.poll(Some(Duration::ZERO))? {
+                    Poll::Events(e) => hits.extend(e),
+                    Poll::Closed => closed = true,
+                    Poll::Idle => {}
+                }
+                let before = records.len();
+                if let Some(sensor) = &mut self.sensor {
+                    sensor.drain(&mut records)?;
+                }
+                if records.len() == before {
+                    break;
+                }
+            }
+            let polled = match (hits.is_empty(), closed) {
+                (false, _) => Poll::Events(hits),
+                (true, true) => Poll::Closed,
+                (true, false) => Poll::Idle,
             };
-            let started = Instant::now();
-            let tgid = tgid_of(*pid);
-            self.map.gate(tgid)?;
-            // Gating only takes effect at a task's next enqueue, so a sibling
-            // already on-CPU needs a preempting kick to get there.
-            self.map.kick()?;
-            let latency = started.elapsed();
-
-            self.owner.insert(*handle, tgid);
-            self.stats.gates += 1;
-            self.stats.max_gate_latency = self.stats.max_gate_latency.max(latency);
+            if !records.is_empty() || polled != Poll::Idle || !woken || left == Some(Duration::ZERO)
+            {
+                break (polled, records);
+            }
+        };
+        if records.is_empty() {
+            return Ok(polled);
         }
-
+        let mut events = Vec::new();
+        for r in records {
+            events.push(thread_state(r));
+            // A group attach names only the leader; the rest of its group
+            // moved with it.
+            if r.kind == RecordKind::Joined && r.arg != 0 {
+                events.extend(group_threads(r.tgid));
+            }
+        }
+        if let Poll::Events(e) = polled {
+            events.extend(e);
+        }
         Ok(Poll::Events(events))
     }
 
     fn release(&mut self, handle: NotifyHandle) -> Result<()> {
         self.check_still_attached()?;
-
-        // Order is load-bearing: ungate before answering the notification, or
-        // the notifying thread returns from the kernel into a still-gated
-        // thread group and is parked again immediately.
-        //
-        // No `handle == EXIT_HANDLE` special case: `owner` only ever gains an
-        // entry from a real `CheckpointHit`, so a synthetic exit -- or any
-        // other handle this backend never gated -- simply finds nothing here
-        // and falls through to answering the inner backend directly. The
-        // single not-found fallback is the whole story.
-        if let Some(tgid) = self.owner.remove(&handle) {
-            self.map.ungate(tgid)?;
-            self.map.kick()?;
-            self.stats.ungates += 1;
-        }
         self.inner.release(handle)
+    }
+
+    fn recapture(&mut self, handle: NotifyHandle) -> Result<Option<Vec<ConflictKey>>> {
+        self.inner.recapture(handle)
+    }
+
+    fn freeze(&mut self, tid: Pid) -> Result<()> {
+        self.map.gate_tid(tid)?;
+        // A gate takes effect at a task's next enqueue, so a thread already
+        // on-CPU needs a preempting kick to get there.
+        self.map.kick()
+    }
+
+    fn thaw(&mut self, tid: Pid) -> Result<()> {
+        self.map.ungate_tid(tid)?;
+        self.map.kick()
+    }
+
+    fn gate_group(&mut self, tgid: Pid) -> Result<()> {
+        self.map.gate(tgid)?;
+        self.map.kick()
+    }
+
+    fn ungate_group(&mut self, tgid: Pid) -> Result<()> {
+        self.map.ungate(tgid)?;
+        self.map.kick()
+    }
+
+    fn cpu_ns(&self, tid: Pid) -> Option<u64> {
+        self.inner.cpu_ns(tid)
+    }
+
+    fn wakes_on_its_own(&self, tid: Pid) -> bool {
+        self.inner.wakes_on_its_own(tid)
+    }
+
+    /// The sensor's ringbuf is in the seccomp backend's epoll set.
+    fn pending(&self) -> bool {
+        self.inner.pending()
+    }
+
+    fn dropped(&self) -> Result<u64> {
+        match &self.sensor {
+            Some(sensor) => sensor.dropped(),
+            None => Ok(0),
+        }
     }
 }
 
-impl<B: CheckpointBackend> Drop for GateBackend<B> {
-    /// Clear this run's gates.
+impl Drop for GateBackend {
+    /// Clear this run's gates; the sensor's own `Drop` frees its slot.
     ///
-    /// Without it a crashed run leaves its thread groups gated forever, and
-    /// the next run's tasks inherit a machine that will not schedule them --
-    /// as a leaked hold that keeps inherited descriptors (the shared stdout
-    /// among them) open, hanging whatever launched the run.
+    /// Without it a crashed run leaves its threads gated forever, and the
+    /// next run's tasks inherit a machine that will not schedule them -- as a
+    /// leaked hold that keeps inherited descriptors (the shared stdout among
+    /// them) open, hanging whatever launched the run.
     fn drop(&mut self) {
         if let Err(e) = self.map.clear_epoch() {
             log::warn!("clearing this run's gates: {e:#}");
@@ -192,95 +277,38 @@ impl<B: CheckpointBackend> Drop for GateBackend<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::StubBackend;
-    use crate::backend::EXIT_HANDLE;
-    use crate::role::TaskInfo;
-
-    fn task(pid: Pid) -> TaskInfo {
-        TaskInfo { pid, tgid: pid, parent_tgid: 1, comm: "v".into(), cgroup: "/c".into() }
-    }
-
-    // Each test below gates a distinct high synthetic tgid (the
-    // 424242-and-up convention `scx_crfuzz_gate/src/client.rs` already uses)
-    // rather than a small pid like 10. This is not a stylistic choice:
-    //
-    //   - A low pid is very likely a live kernel thread on any real machine
-    //     (pid 10 is commonly `kworker/0:0H-events_highpri`). Gating one is
-    //     safe today only by accident -- kernel threads run `SCHED_OTHER`
-    //     and the gate's `SWITCH_PARTIAL` ignores anything not in
-    //     `SCHED_EXT` -- and it would take the real `/proc/<pid>/status`
-    //     read path, not the "pid does not exist" fallback these tests exist
-    //     to cover. A synthetic tgid makes `/proc/<tgid>/status` genuinely
-    //     absent, so `tgid_of` takes that fallback for real.
-    //   - Giving each test its own tgid also means the three tests -- which
-    //     cargo runs concurrently in one binary against `GateMap`'s
-    //     machine-global state -- cannot step on each other's gate-map entry.
-    fn skip() -> bool {
-        if unsafe { libc::getuid() } != 0 {
-            eprintln!("skipping: needs root");
-            return true;
-        }
-        if !scx_crfuzz_gate::GateMap::scheduler_enabled() {
-            eprintln!("skipping: scx_crfuzz_gated is not running");
-            return true;
-        }
-        false
-    }
+    use std::sync::Arc;
+    use std::sync::Barrier;
 
     #[test]
-    fn the_handle_the_engine_is_given_is_the_handle_it_releases() {
-        // GateBackend::release passes the engine's handle straight through to
-        // the inner backend, with no substitution. This test drives a
-        // StubBackend, so the mechanism it measures is the gate's own.
-        if skip() {
-            return;
+    fn a_group_s_threads_are_listed_in_tid_order_without_the_leader() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listed = Arc::new(Barrier::new(4));
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let (tx, listed) = (tx.clone(), listed.clone());
+                std::thread::spawn(move || {
+                    // SAFETY: a plain syscall.
+                    tx.send(unsafe { libc::gettid() }).unwrap();
+                    listed.wait();
+                })
+            })
+            .collect();
+        let spawned: Vec<Pid> = (0..3).map(|_| rx.recv().unwrap()).collect();
+        let tgid = std::process::id() as Pid;
+        let tids: Vec<Pid> = group_threads(tgid)
+            .into_iter()
+            .map(|e| match e {
+                BackendEvent::ThreadState { tid, tgid: g, .. } if g == tgid => tid,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        listed.wait();
+        for w in workers {
+            w.join().unwrap();
         }
-        let inner = StubBackend::new().task(task(424244)).hit(424244, "openat");
-        let mut b = GateBackend::new(inner).unwrap();
-
-        b.poll().unwrap();
-        let Poll::Events(e) = b.poll().unwrap() else { panic!("expected the hit") };
-        let BackendEvent::CheckpointHit { handle, .. } = e[0].clone() else { panic!() };
-
-        b.release(handle).unwrap();
-        assert_eq!(
-            b.inner().released,
-            vec![handle],
-            "released exactly the handle the engine was given, unchanged"
-        );
-    }
-
-    #[test]
-    fn a_hit_gates_the_thread_group_and_release_ungates_it() {
-        if skip() {
-            return;
-        }
-        let inner = StubBackend::new().task(task(424245)).hit(424245, "openat");
-        let mut b = GateBackend::new(inner).unwrap();
-        b.poll().unwrap();
-        let Poll::Events(e) = b.poll().unwrap() else { panic!() };
-        let BackendEvent::CheckpointHit { handle, .. } = e[0].clone() else { panic!() };
-
-        assert_eq!(b.stats().gates, 1, "the hit gated something");
-        b.release(handle).unwrap();
-        assert_eq!(b.stats().ungates, 1, "the release ungated it");
-    }
-
-    #[test]
-    fn a_synthetic_exit_is_not_credited_as_an_ungate() {
-        // This does not exercise anything special-cased for `EXIT_HANDLE` --
-        // there isn't one. It verifies the general not-found fallback in
-        // `release()`: a handle `owner` never gained an entry for (of which
-        // a synthetic exit is one example) finds nothing to ungate and stats
-        // stay put.
-        if skip() {
-            return;
-        }
-        let inner = StubBackend::new().task(task(424246)).hit(424246, "openat");
-        let mut b = GateBackend::new(inner).unwrap();
-        b.poll().unwrap();
-        b.poll().unwrap();
-        b.release(EXIT_HANDLE).unwrap();
-        assert_eq!(b.stats().ungates, 0, "a synthetic exit has no task to ungate");
+        assert!(tids.windows(2).all(|w| w[0] < w[1]), "{tids:?}");
+        assert!(!tids.contains(&tgid));
+        assert!(spawned.iter().all(|t| tids.contains(t)), "{spawned:?} in {tids:?}");
     }
 }

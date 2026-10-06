@@ -29,6 +29,7 @@
 
 static const char *root;
 static long deadline_ms;
+static long renames; // nonzero: exactly this many per thread, and no timer
 
 static long now_ms(void) {
     struct timespec ts;
@@ -55,20 +56,21 @@ static void *worker(void *arg) {
     struct timespec nap = {.tv_sec = 0, .tv_nsec = 2000000}; // 2ms
     long end = now_ms() + deadline_ms;
     int flip = 0;
-    while (now_ms() < end) {
+    for (long n = 0; renames ? n < renames : now_ms() < end; n++) {
         // renameat is a structural checkpoint: the thread parks here.
         if (flip)
             (void)!renameat(AT_FDCWD, a, AT_FDCWD, b);
         else
             (void)!renameat(AT_FDCWD, b, AT_FDCWD, a);
         flip = !flip;
-        nanosleep(&nap, NULL);
+        if (!renames)
+            nanosleep(&nap, NULL);
     }
     return NULL;
 }
 
 int main(int argc, char **argv) {
-    // <scratch-dir> <threads> <seconds>
+    // <scratch-dir> <threads> <seconds> [<renames>]
     if (argc < 4) {
         (void)!write(1, "ATTACKER:usage\n", 15);
         return 2;
@@ -76,6 +78,7 @@ int main(int argc, char **argv) {
     root = argv[1];
     long threads = atol(argv[2]);
     deadline_ms = atol(argv[3]) * 1000;
+    renames = argc > 4 ? atol(argv[4]) : 0;
 
     // Create this process's scratch namespace before any thread uses it.
     {

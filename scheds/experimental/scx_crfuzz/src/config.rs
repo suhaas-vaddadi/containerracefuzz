@@ -8,12 +8,13 @@
 // discovery are one engine answering one question two ways -- not two tools.
 
 use crate::checkpoint::default_discovery_checkpoints;
+use crate::checkpoint::default_pos_checkpoints;
 use crate::checkpoint::CheckpointDecl;
 use crate::checkpoint::CheckpointId;
+use crate::event::ThreadPath;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::fmt;
 
 /// Whether a role's `comm` is matched exactly or by substring.
 ///
@@ -69,57 +70,28 @@ impl RoleDecl {
     }
 }
 
-/// A step's stopping condition: a checkpoint, or "run until the role exits".
-///
-/// Serialized as a bare string: `"exit"`, or the checkpoint id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "String", into = "String")]
-pub enum StopCondition {
-    Checkpoint(CheckpointId),
-    Exit,
-}
-
-impl fmt::Display for StopCondition {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StopCondition::Exit => f.write_str("exit"),
-            StopCondition::Checkpoint(c) => write!(f, "{c}"),
-        }
-    }
-}
-
-impl From<String> for StopCondition {
-    fn from(s: String) -> Self {
-        if s == "exit" {
-            StopCondition::Exit
-        } else {
-            StopCondition::Checkpoint(CheckpointId::new(s))
-        }
-    }
-}
-
-impl From<StopCondition> for String {
-    fn from(s: StopCondition) -> String {
-        s.to_string()
-    }
-}
-
-/// One entry of a replay schedule's `steps[]`.
+/// One entry of a replay schedule's `steps[]`: release `role` (and, when
+/// given, only its thread `thread`) past checkpoint `until`.
 ///
 /// `role` is spelled the way `RoleTable::render` spells it -- `victim`, or
-/// `racer#2` for a pool member. This is exactly the pair of fields a canonical
-/// log entry carries, which is what makes section 3.5's projection a matter of
-/// dropping a field rather than a translation step.
+/// `racer#2` for a pool member -- and `thread` the way `ThreadPath` renders
+/// (`t0.1`). These are exactly the fields a canonical log entry carries, which
+/// is what makes section 3.5's projection a matter of dropping a field rather
+/// than a translation step. A step without `thread` matches any thread of the
+/// role, so hand-written schedules need not name one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub role: String,
-    pub until: StopCondition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    pub until: CheckpointId,
 }
 
 impl Step {
-    pub fn new(role: impl Into<String>, until: StopCondition) -> Self {
+    pub fn new(role: impl Into<String>, until: CheckpointId) -> Self {
         Step {
             role: role.into(),
+            thread: None,
             until,
         }
     }
@@ -136,7 +108,13 @@ pub enum PolicyType {
     /// ever held, so there is no "which role next" to decide -- and it requires
     /// the top-level `attack` section and exactly one role.
     AutoAttack,
-    OrderedWalk,
+    /// POS (Partial Order Aware Concurrency Sampling). Seeds a priority per
+    /// *event*, releases the highest-priority ready event, and redraws the
+    /// priorities of ready events whose conflict keys intersect the released
+    /// one. Its default checkpoint set is the structural set plus the
+    /// check-shaped set (all path-touching syscalls), because POS orders a
+    /// check against a later rebind rather than needing pre-labelled checks.
+    Pos,
 }
 
 /// One entry of `attack`: the external attacker the engine runs inside each
@@ -218,6 +196,9 @@ pub struct ScenarioConfig {
     /// for, `PolicyType::AutoAttack`; `None` for every other mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attack: Option<AttackDecl>,
+    /// CPU seconds a thread may run between decisions while others are
+    /// parked before the watchdog freezes it (design doc section 5).
+    pub watchdog_cpu_secs: u64,
 }
 
 impl ScenarioConfig {
@@ -262,6 +243,8 @@ struct RawScenarioConfig {
     policy: Option<PolicyDecl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attack: Option<AttackDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watchdog_cpu_secs: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -274,12 +257,20 @@ pub enum ConfigError {
     NoMode,
     #[error("`roles` must declare at least one role")]
     NoRoles,
+    #[error("cgroup `{0}` must be relative to the cgroup root (e.g. `/crfuzz`), not a /sys/fs/cgroup filesystem path")]
+    CgroupIsFilesystemPath(String),
     #[error("duplicate role id `{0}`")]
     DuplicateRole(String),
     #[error("duplicate checkpoint id `{0}`")]
     DuplicateCheckpoint(String),
-    #[error("`exit` is a reserved stop condition and cannot be declared as a checkpoint id")]
+    #[error(
+        "`exit` cannot be declared as a checkpoint id: a step naming `until: exit` is rejected"
+    )]
     ReservedCheckpointId,
+    #[error("step {index} says `until: exit`, but exits are not decision points; delete the step")]
+    ExitStep { index: usize },
+    #[error("step {index}: {reason}")]
+    BadStepThread { index: usize, reason: String },
     #[error("step {index} names role `{role}`, which is not declared")]
     UnknownStepRole { index: usize, role: String },
     #[error("step {index} names `{role}` with a member index, but `{base}` is not a `pool` role")]
@@ -304,6 +295,8 @@ pub enum ConfigError {
     AutoAttackEmptyArgv,
     #[error("`attack` is only valid with policy `auto_attack`")]
     AttackWithoutAutoAttack,
+    #[error("`watchdog_cpu_secs` must be positive")]
+    ZeroWatchdog,
 }
 
 impl TryFrom<RawScenarioConfig> for ScenarioConfig {
@@ -355,13 +348,19 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
         // more would change what the schedule enforces.
         let checkpoints = match (raw.checkpoints, &mode) {
             (Some(c), _) => c,
-            (None, Mode::Discovery { .. }) => default_discovery_checkpoints(),
+            (None, Mode::Discovery { policy }) => match policy.policy_type {
+                // POS needs check-shaped calls back (plan Phase 4): it orders a
+                // check against a later rebind by conflict key, which the
+                // depth-2 exclusion of check-shaped calls forbade.
+                PolicyType::Pos => default_pos_checkpoints(),
+                PolicyType::AutoAttack => default_discovery_checkpoints(),
+            },
             (None, Mode::Replay { .. }) => Vec::new(),
         };
 
         let mut seen_cp = HashSet::new();
         for c in &checkpoints {
-            if c.id.is_exit() {
+            if c.id.as_str() == "exit" {
                 return Err(ConfigError::ReservedCheckpointId);
             }
             if !seen_cp.insert(c.id.as_str()) {
@@ -373,6 +372,14 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
             validate_steps(steps, &raw.roles, &seen_cp)?;
         }
 
+        if raw.cgroup.starts_with("/sys/fs/cgroup") {
+            return Err(ConfigError::CgroupIsFilesystemPath(raw.cgroup));
+        }
+        let watchdog_cpu_secs = raw.watchdog_cpu_secs.unwrap_or(15);
+        if watchdog_cpu_secs == 0 {
+            return Err(ConfigError::ZeroWatchdog);
+        }
+
         Ok(ScenarioConfig {
             scenario_id: raw.scenario_id,
             cgroup: raw.cgroup,
@@ -381,6 +388,7 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
             on_divergence: raw.on_divergence,
             mode,
             attack: raw.attack,
+            watchdog_cpu_secs,
         })
     }
 }
@@ -422,13 +430,18 @@ fn validate_steps(
             }
             _ => {}
         }
-        if let StopCondition::Checkpoint(c) = &step.until {
-            if !checkpoints.contains(c.as_str()) {
-                return Err(ConfigError::UnknownStepCheckpoint {
-                    index,
-                    checkpoint: c.0.clone(),
-                });
-            }
+        if let Some(t) = &step.thread {
+            t.parse::<ThreadPath>()
+                .map_err(|reason| ConfigError::BadStepThread { index, reason })?;
+        }
+        if step.until.as_str() == "exit" {
+            return Err(ConfigError::ExitStep { index });
+        }
+        if !checkpoints.contains(step.until.as_str()) {
+            return Err(ConfigError::UnknownStepCheckpoint {
+                index,
+                checkpoint: step.until.0.clone(),
+            });
         }
     }
     Ok(())
@@ -460,6 +473,7 @@ impl From<ScenarioConfig> for RawScenarioConfig {
             steps,
             policy,
             attack: c.attack,
+            watchdog_cpu_secs: Some(c.watchdog_cpu_secs),
         }
     }
 }
@@ -470,17 +484,17 @@ mod tests {
 
     const DISCOVERY: &str = r#"{
         "scenario_id": "runc-exec-symlink",
-        "cgroup": "/sys/fs/cgroup/crfuzz",
+        "cgroup": "/crfuzz",
         "roles": [
             { "id": "victim", "comm": "runc" },
             { "id": "racer", "comm": "racer", "cardinality": "pool" }
         ],
-        "policy": { "type": "ordered_walk", "seed": 42 }
+        "policy": { "type": "pos", "seed": 42 }
     }"#;
 
     const AUTO_ATTACK: &str = r#"{
         "scenario_id": "runc-exec-symlink",
-        "cgroup": "/sys/fs/cgroup/crfuzz",
+        "cgroup": "/crfuzz",
         "roles": [{ "id": "victim", "comm": "runc" }],
         "policy": { "type": "auto_attack" },
         "attack": { "argv": ["/bin/racer", "--target", "{path}"] }
@@ -488,14 +502,14 @@ mod tests {
 
     const REPLAY: &str = r#"{
         "scenario_id": "runc-exec-symlink",
-        "cgroup": "/sys/fs/cgroup/crfuzz",
+        "cgroup": "/crfuzz",
         "roles": [{ "id": "victim", "comm": "runc" }],
         "checkpoints": [
             { "id": "pre_mount", "kind": "syscall", "target": "mount" }
         ],
         "steps": [
             { "role": "victim", "until": "pre_mount" },
-            { "role": "victim", "until": "exit" }
+            { "role": "victim", "thread": "t0.1", "until": "pre_mount" }
         ]
     }"#;
 
@@ -507,6 +521,17 @@ mod tests {
     }
 
     #[test]
+    fn the_watchdog_budget_defaults_to_15_s_and_must_be_positive() {
+        assert_eq!(ScenarioConfig::from_json(DISCOVERY).unwrap().watchdog_cpu_secs, 15);
+        let set = |n: &str| {
+            DISCOVERY.replace(r#""policy""#, &format!(r#""watchdog_cpu_secs": {n}, "policy""#))
+        };
+        assert_eq!(ScenarioConfig::from_json(&set("1")).unwrap().watchdog_cpu_secs, 1);
+        let err = ScenarioConfig::from_json(&set("0")).unwrap_err().to_string();
+        assert!(err.contains("must be positive"), "got: {err}");
+    }
+
+    #[test]
     fn cardinality_defaults_to_one() {
         let c = ScenarioConfig::from_json(DISCOVERY).unwrap();
         assert_eq!(c.roles[0].cardinality, Cardinality::One);
@@ -514,10 +539,10 @@ mod tests {
     }
 
     #[test]
-    fn discovery_mode_populates_the_structural_checkpoint_set_by_default() {
+    fn pos_defaults_to_the_full_path_touching_checkpoint_set() {
         let c = ScenarioConfig::from_json(DISCOVERY).unwrap();
-        assert_eq!(c.checkpoints, default_discovery_checkpoints());
-        assert!(c.checkpoints.iter().any(|c| c.id.as_str() == "openat"));
+        assert_eq!(c.checkpoints, default_pos_checkpoints());
+        assert!(c.checkpoints.iter().any(|c| c.id.as_str() == "newfstatat"));
     }
 
     #[test]
@@ -540,10 +565,17 @@ mod tests {
     fn a_config_with_both_steps_and_policy_fails_to_deserialize() {
         let both = REPLAY.replace(
             r#""steps""#,
-            r#""policy": { "type": "ordered_walk", "seed": 1 }, "steps""#,
+            r#""policy": { "type": "pos", "seed": 1 }, "steps""#,
         );
         let err = ScenarioConfig::from_json(&both).unwrap_err().to_string();
         assert!(err.contains("found both"), "got: {err}");
+    }
+
+    #[test]
+    fn a_cgroup_given_as_a_filesystem_path_is_rejected() {
+        let json = DISCOVERY.replace(r#""/crfuzz""#, r#""/sys/fs/cgroup/crfuzz""#);
+        let err = ScenarioConfig::from_json(&json).unwrap_err().to_string();
+        assert!(err.contains("relative to the cgroup root"), "got: {err}");
     }
 
     #[test]
@@ -566,8 +598,8 @@ mod tests {
     #[test]
     fn a_step_naming_an_undeclared_role_is_rejected_at_parse_time() {
         let typo = REPLAY.replace(
-            r#""role": "victim", "until": "exit""#,
-            r#""role": "vitcim", "until": "exit""#,
+            r#""role": "victim", "until": "pre_mount""#,
+            r#""role": "vitcim", "until": "pre_mount""#,
         );
         let err = ScenarioConfig::from_json(&typo).unwrap_err().to_string();
         assert!(err.contains("vitcim"), "got: {err}");
@@ -586,20 +618,20 @@ mod tests {
     #[test]
     fn a_one_role_step_must_not_name_a_member() {
         let cfg = REPLAY.replace(
-            r#""role": "victim", "until": "exit""#,
-            r#""role": "victim#0", "until": "exit""#,
+            r#""role": "victim", "until": "pre_mount""#,
+            r#""role": "victim#0", "until": "pre_mount""#,
         );
         let err = ScenarioConfig::from_json(&cfg).unwrap_err().to_string();
         assert!(err.contains("not a `pool` role"), "got: {err}");
     }
 
     #[test]
-    fn ordered_walk_policy_parses() {
-        let c = ScenarioConfig::from_json(DISCOVERY).unwrap();
-        let Mode::Discovery { policy } = &c.mode else {
-            panic!("expected discovery mode")
-        };
-        assert_eq!(policy.policy_type, PolicyType::OrderedWalk);
+    fn a_stale_actor_granularity_field_is_ignored() {
+        let stale = DISCOVERY.replace(
+            r#""policy":"#,
+            r#""actor_granularity": "role", "policy":"#,
+        );
+        assert!(!ScenarioConfig::from_json(&stale).unwrap().mode.is_auto_attack());
     }
 
     #[test]
@@ -637,8 +669,8 @@ mod tests {
     #[test]
     fn an_attack_section_without_auto_attack_is_rejected() {
         let bad = DISCOVERY.replace(
-            r#""policy": { "type": "ordered_walk", "seed": 42 }"#,
-            r#""policy": { "type": "ordered_walk", "seed": 42 }, "attack": { "argv": ["/bin/racer"] }"#,
+            r#""policy": { "type": "pos", "seed": 42 }"#,
+            r#""policy": { "type": "pos", "seed": 42 }, "attack": { "argv": ["/bin/racer"] }"#,
         );
         let err = ScenarioConfig::from_json(&bad).unwrap_err().to_string();
         assert!(
@@ -660,6 +692,32 @@ mod tests {
         let dup = DISCOVERY.replace(r#""id": "racer""#, r#""id": "victim""#);
         let err = ScenarioConfig::from_json(&dup).unwrap_err().to_string();
         assert!(err.contains("duplicate role"), "got: {err}");
+    }
+
+    #[test]
+    fn an_exit_step_is_rejected_at_parse_time_naming_the_step() {
+        let bad = REPLAY.replace(
+            r#""thread": "t0.1", "until": "pre_mount""#,
+            r#""until": "exit""#,
+        );
+        let err = ScenarioConfig::from_json(&bad).unwrap_err().to_string();
+        assert!(err.contains("step 1") && err.contains("exit"), "got: {err}");
+    }
+
+    #[test]
+    fn a_malformed_step_thread_is_rejected_at_parse_time() {
+        let bad = REPLAY.replace(r#""t0.1""#, r#""0.1""#);
+        let err = ScenarioConfig::from_json(&bad).unwrap_err().to_string();
+        assert!(err.contains("step 1") && err.contains("0.1"), "got: {err}");
+    }
+
+    #[test]
+    fn a_step_s_thread_is_serialized_only_when_present() {
+        let json = ScenarioConfig::from_json(REPLAY)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert_eq!(json.matches("\"thread\"").count(), 1, "{json}");
     }
 
     #[test]

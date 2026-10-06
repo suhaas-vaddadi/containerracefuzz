@@ -34,7 +34,6 @@ use super::Decision;
 use super::DecisionPolicy;
 use super::ReadyCheckpointHit;
 use crate::config::Step;
-use crate::config::StopCondition;
 
 #[derive(Debug)]
 pub struct FixedSchedule {
@@ -55,14 +54,12 @@ impl FixedSchedule {
         self.steps.len().saturating_sub(self.step_idx)
     }
 
+    /// A step without `thread` matches any thread of its role.
     fn matches(step: &Step, hit: &ReadyCheckpointHit) -> bool {
-        if step.role != hit.role_name {
-            return false;
-        }
-        match &step.until {
-            StopCondition::Exit => hit.checkpoint.is_exit(),
-            StopCondition::Checkpoint(c) => *c == hit.checkpoint,
-        }
+        let thread = hit.event.actor.thread.as_ref().map(ToString::to_string);
+        step.role == hit.role_name
+            && step.until == hit.checkpoint
+            && (step.thread.is_none() || step.thread == thread)
     }
 }
 
@@ -77,8 +74,14 @@ impl DecisionPolicy for FixedSchedule {
                 Decision::Release(i)
             }
             None => Decision::Divergence(format!(
-                "step {} expects role `{}` at `{}`, which is not in the ready set",
-                self.step_idx, step.role, step.until
+                "step {} expects role `{}{}` at `{}`, which is not in the ready set",
+                self.step_idx,
+                step.role,
+                step.thread
+                    .as_ref()
+                    .map(|t| format!("/{t}"))
+                    .unwrap_or_default(),
+                step.until
             )),
         }
     }
@@ -98,18 +101,13 @@ mod tests {
     use crate::checkpoint::CheckpointId;
     use crate::policy::testing::hit;
     use crate::policy::testing::pool_hit;
+    use crate::policy::testing::thread_hit;
 
     fn schedule() -> Vec<Step> {
         vec![
-            Step::new(
-                "victim",
-                StopCondition::Checkpoint(CheckpointId::new("stat")),
-            ),
-            Step::new(
-                "racer",
-                StopCondition::Checkpoint(CheckpointId::new("symlink")),
-            ),
-            Step::new("victim", StopCondition::Exit),
+            Step::new("victim", CheckpointId::new("stat")),
+            Step::new("racer", CheckpointId::new("symlink")),
+            Step::new("victim", CheckpointId::new("openat")),
         ]
     }
 
@@ -140,18 +138,22 @@ mod tests {
     }
 
     #[test]
-    fn exit_steps_match_only_the_reserved_exit_checkpoint() {
-        let mut p = FixedSchedule::new(schedule());
-        p.decide(&[hit("victim", 0, "stat", 1)]);
-        p.decide(&[hit("racer", 1, "symlink", 2)]);
-        assert!(matches!(
-            p.decide(&[hit("victim", 0, "openat", 3)]),
-            Decision::Divergence(_)
-        ));
-        assert_eq!(
-            p.decide(&[hit("victim", 0, "exit", 4)]),
-            Decision::Release(0)
-        );
+    fn a_step_s_thread_picks_between_two_threads_of_one_role_at_one_checkpoint() {
+        let mut step = Step::new("victim", CheckpointId::new("stat"));
+        step.thread = Some("t0.1".into());
+        let mut p = FixedSchedule::new(vec![step]);
+        let ready = vec![
+            thread_hit("victim", 0, &[0], "stat", 1),
+            thread_hit("victim", 0, &[0, 1], "stat", 2),
+        ];
+        assert_eq!(p.decide(&ready), Decision::Release(1));
+    }
+
+    #[test]
+    fn a_step_without_a_thread_matches_any_thread() {
+        let mut p = FixedSchedule::new(vec![Step::new("victim", CheckpointId::new("stat"))]);
+        let ready = vec![thread_hit("victim", 0, &[0, 1], "stat", 1)];
+        assert_eq!(p.decide(&ready), Decision::Release(0));
     }
 
     #[test]
@@ -175,7 +177,7 @@ mod tests {
         p.decide(&[hit("victim", 0, "stat", 1)]);
         assert!(!p.is_finished());
         p.decide(&[hit("racer", 1, "symlink", 2)]);
-        p.decide(&[hit("victim", 0, "exit", 3)]);
+        p.decide(&[hit("victim", 0, "openat", 3)]);
         assert!(p.is_finished());
     }
 
@@ -187,10 +189,7 @@ mod tests {
 
     #[test]
     fn pool_members_are_matched_by_their_disambiguated_name() {
-        let mut p = FixedSchedule::new(vec![Step::new(
-            "racer#1",
-            StopCondition::Checkpoint(CheckpointId::new("symlink")),
-        )]);
+        let mut p = FixedSchedule::new(vec![Step::new("racer#1", CheckpointId::new("symlink"))]);
         let ready = vec![
             pool_hit("racer", 1, 0, "symlink", 1),
             pool_hit("racer", 1, 1, "symlink", 2),

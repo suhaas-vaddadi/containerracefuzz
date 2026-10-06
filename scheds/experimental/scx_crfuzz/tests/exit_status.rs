@@ -43,14 +43,14 @@ fn a_spawned_childs_exit_code_is_recorded() {
         .expect("attach");
 
     assert_eq!(
-        backend.child_exit_code(),
+        backend.child_exit_code_at(0),
         None,
         "a child that has not exited has no exit code yet"
     );
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        match backend.poll().expect("poll") {
+        match backend.poll(Some(Duration::from_millis(50))).expect("poll") {
             Poll::Closed => break,
             Poll::Idle => {}
             Poll::Events(events) => {
@@ -64,7 +64,7 @@ fn a_spawned_childs_exit_code_is_recorded() {
     }
 
     assert_eq!(
-        backend.child_exit_code(),
+        backend.child_exit_code_at(0),
         Some(1),
         "/usr/bin/false exits 1; a wrapper standing in for runc has to be able to \
          report that rather than its own verdict"

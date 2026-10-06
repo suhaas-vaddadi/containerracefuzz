@@ -2,22 +2,21 @@
 # A stand-in for `runc`, for use as `ctr run --runc-binary <this>`, that also
 # launches two multithreaded attackers alongside the instrumented `runc create`.
 #
-# This is `runc_wrapper.sh` plus a second kind of actor. The shim protocol is
-# identical (see runc_wrapper.sh for the full explanation):
+# The shim protocol:
 #
 #     containerd (daemon)
 #       └─ containerd-shim-runc-v2
 #            └─ runc create/start/delete   <- exec'd by path; this replaces it
 #
-# Only `create` is instrumented. Unlike runc_wrapper.sh, this wrapper spawns the
-# attacker role too, so the engine runs three thread groups at once: `runc` and
-# two `mt_attacker` instances, the latter a pool. Because the shim reads the
+# Only `create` is instrumented. The wrapper spawns the attacker role too, so
+# the engine runs three thread groups at once: `runc` and two `mt_attacker`
+# instances, the latter a pool. Because the shim reads the
 # exit status to decide whether the container was created, the engine must still
 # answer for `runc` specifically -- hence `--exit-with-spawn 0` (runc is the
 # first `--spawn`).
 #
-# Requires scx_crfuzz_gated running and root. Under `pos` the gate holds one
-# thread at a time; the engine puts each run in its own cgroup.
+# Requires scx_crfuzz_gated running and root. Under `pos` each hit parks one
+# thread; the engine puts each run in its own cgroup.
 set -eu
 
 RUNC="${CRFUZZ_RUNC:-/usr/local/bin/runc}"

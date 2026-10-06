@@ -1,3 +1,4 @@
+Makefile
 libbpf/
 *.gitignore
 PKGBUILD

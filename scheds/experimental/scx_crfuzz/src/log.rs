@@ -11,17 +11,19 @@
 
 use crate::checkpoint::CheckpointId;
 use crate::config::Step;
-use crate::config::StopCondition;
 use crate::role::Pid;
 use crate::role::Provenance;
 use std::fmt::Write as _;
 
-/// One dispatch decision: `(step_idx, role, checkpoint_id)`.
+/// One dispatch decision: `(step_idx, role, thread, checkpoint_id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalEntry {
     pub step_idx: u64,
     /// The role as `RoleTable::render` spells it: `victim`, or `racer#2`.
     pub role: String,
+    /// The released thread's rendered `ThreadPath` (`t0.1`), for thread-level
+    /// actors; `None` for role-level ones.
+    pub thread: Option<String>,
     pub checkpoint: CheckpointId,
 }
 
@@ -53,11 +55,17 @@ impl CanonicalLog {
     }
 
     /// Record one release. Returns the step index assigned to it.
-    pub fn record(&mut self, role: impl Into<String>, checkpoint: CheckpointId) -> u64 {
+    pub fn record(
+        &mut self,
+        role: impl Into<String>,
+        thread: Option<String>,
+        checkpoint: CheckpointId,
+    ) -> u64 {
         let step_idx = self.entries.len() as u64;
         self.entries.push(CanonicalEntry {
             step_idx,
             role: role.into(),
+            thread,
             checkpoint,
         });
         step_idx
@@ -81,7 +89,11 @@ impl CanonicalLog {
         let mut out = String::new();
         let _ = writeln!(out, "# scenario {}", self.scenario_id);
         for e in &self.entries {
-            let _ = writeln!(out, "{}\t{}\t{}", e.step_idx, e.role, e.checkpoint);
+            let actor = match &e.thread {
+                Some(t) => format!("{}/{t}", e.role),
+                None => e.role.clone(),
+            };
+            let _ = writeln!(out, "{}\t{actor}\t{}", e.step_idx, e.checkpoint);
         }
         out
     }
@@ -89,7 +101,7 @@ impl CanonicalLog {
     /// Project the log into a replay schedule's `steps[]` (section 3.5).
     ///
     /// This is a field drop, not a translation: a canonical entry already
-    /// carries exactly the two fields a step needs. That is the whole mechanism
+    /// carries exactly the fields a step needs. That is the whole mechanism
     /// behind "a bug discovery mode finds is replayable" -- there is no second
     /// system here that has to be correct, and so nothing extra to validate.
     pub fn project_to_steps(&self) -> Vec<Step> {
@@ -97,11 +109,8 @@ impl CanonicalLog {
             .iter()
             .map(|e| Step {
                 role: e.role.clone(),
-                until: if e.checkpoint.is_exit() {
-                    StopCondition::Exit
-                } else {
-                    StopCondition::Checkpoint(e.checkpoint.clone())
-                },
+                thread: e.thread.clone(),
+                until: e.checkpoint.clone(),
             })
             .collect()
     }
@@ -150,9 +159,9 @@ mod tests {
 
     fn log() -> CanonicalLog {
         let mut l = CanonicalLog::new("runc-exec-symlink");
-        l.record("victim", CheckpointId::new("stat"));
-        l.record("racer#0", CheckpointId::new("symlink"));
-        l.record("victim", CheckpointId::exit());
+        l.record("victim", None, CheckpointId::new("stat"));
+        l.record("racer#0", None, CheckpointId::new("symlink"));
+        l.record("victim", Some("t0.1".into()), CheckpointId::new("mount"));
         l
     }
 
@@ -170,22 +179,16 @@ mod tests {
         let rendered = log().render();
         assert_eq!(
             rendered,
-            "# scenario runc-exec-symlink\n0\tvictim\tstat\n1\tracer#0\tsymlink\n2\tvictim\texit\n"
+            "# scenario runc-exec-symlink\n0\tvictim\tstat\n1\tracer#0\tsymlink\n2\tvictim/t0.1\tmount\n"
         );
         assert_eq!(rendered, log().render());
     }
 
     #[test]
-    fn projection_drops_step_idx_and_keeps_role_and_checkpoint() {
+    fn projection_drops_step_idx_and_keeps_role_thread_and_checkpoint() {
         let steps = log().project_to_steps();
         assert_eq!(steps.len(), 3);
-        assert_eq!(
-            steps[0],
-            Step::new(
-                "victim",
-                StopCondition::Checkpoint(CheckpointId::new("stat"))
-            )
-        );
+        assert_eq!(steps[0], Step::new("victim", CheckpointId::new("stat")));
         assert_eq!(
             steps[1].role, "racer#0",
             "pool member survives the projection"
@@ -193,9 +196,9 @@ mod tests {
     }
 
     #[test]
-    fn projection_maps_the_reserved_exit_checkpoint_back_to_an_exit_step() {
+    fn projection_keeps_the_thread_of_a_thread_level_entry() {
         let steps = log().project_to_steps();
-        assert_eq!(steps[2].until, StopCondition::Exit);
+        assert_eq!(steps[2].thread.as_deref(), Some("t0.1"));
     }
 
     #[test]
