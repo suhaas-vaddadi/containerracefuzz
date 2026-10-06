@@ -51,8 +51,12 @@ use anyhow::Context;
 use anyhow::Result;
 use libseccomp::ScmpSyscall;
 use scx_crfuzz::checkpoint::CheckpointDecl;
+use scx_crfuzz::oracle::MountDecl;
+use scx_crfuzz::oracle::OracleDecl;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// One checkpoint the profile would erase, or conditionally erase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,12 +88,65 @@ pub struct Report {
 #[derive(Deserialize)]
 struct OciConfig {
     linux: Option<OciLinux>,
+    root: Option<OciRoot>,
+    #[serde(default)]
+    mounts: Vec<OciMount>,
+    process: Option<OciProcess>,
 }
 
 #[derive(Deserialize)]
 struct OciLinux {
     seccomp: Option<OciSeccomp>,
+    #[serde(default, rename = "maskedPaths")]
+    masked_paths: Vec<String>,
+    #[serde(default, rename = "readonlyPaths")]
+    readonly_paths: Vec<String>,
 }
+
+#[derive(Deserialize)]
+struct OciRoot {
+    path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct OciMount {
+    destination: String,
+    #[serde(rename = "type")]
+    fstype: Option<String>,
+    #[serde(default)]
+    options: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct OciProcess {
+    #[serde(default, rename = "noNewPrivileges")]
+    no_new_privileges: bool,
+    capabilities: Option<OciCapabilities>,
+}
+
+#[derive(Deserialize)]
+struct OciCapabilities {
+    #[serde(default)]
+    bounding: Vec<String>,
+    #[serde(default)]
+    effective: Vec<String>,
+    #[serde(default)]
+    inheritable: Vec<String>,
+    #[serde(default)]
+    permitted: Vec<String>,
+    #[serde(default)]
+    ambient: Vec<String>,
+}
+
+/// Capability names in bit order, as `CapEff` numbers them.
+const CAPS: [&str; 41] = [
+    "CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID", "KILL", "SETGID", "SETUID",
+    "SETPCAP", "LINUX_IMMUTABLE", "NET_BIND_SERVICE", "NET_BROADCAST", "NET_ADMIN", "NET_RAW",
+    "IPC_LOCK", "IPC_OWNER", "SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT", "SYS_PTRACE", "SYS_PACCT",
+    "SYS_ADMIN", "SYS_BOOT", "SYS_NICE", "SYS_RESOURCE", "SYS_TIME", "SYS_TTY_CONFIG", "MKNOD",
+    "LEASE", "AUDIT_WRITE", "AUDIT_CONTROL", "SETFCAP", "MAC_OVERRIDE", "MAC_ADMIN", "SYSLOG",
+    "WAKE_ALARM", "BLOCK_SUSPEND", "AUDIT_READ", "PERFMON", "BPF", "CHECKPOINT_RESTORE",
+];
 
 #[derive(Deserialize)]
 struct OciSeccomp {
@@ -199,9 +256,114 @@ pub fn check(config_json: &str, checkpoints: &[CheckpointDecl]) -> Result<Report
     Ok(report)
 }
 
+/// Fill whatever `decl` leaves unset with the intended truth the bundle's
+/// `config.json` implies. The scenario's own values win, so a config can
+/// narrow or override the spec; `watch` and `canary` are never in a spec.
+pub fn oracle_truth(config_json: &str, bundle: &Path, mut decl: OracleDecl) -> Result<OracleDecl> {
+    let cfg: OciConfig =
+        serde_json::from_str(config_json).context("parsing the bundle's config.json")?;
+    if decl.rootfs.is_none() {
+        // `join` keeps an absolute `root.path` as is.
+        decl.rootfs = cfg.root.map(|r| bundle.join(r.path));
+    }
+    if decl.mounts.is_empty() {
+        decl.mounts = cfg
+            .mounts
+            .iter()
+            .map(|m| MountDecl {
+                target: m.destination.clone(),
+                // A bind reports the type of what it binds, and runc mounts a
+                // `cgroup` entry as cgroup2 on a unified host: neither type
+                // is checkable from the spec alone.
+                fstype: m.fstype.clone().filter(|t| {
+                    !matches!(t.as_str(), "" | "bind" | "none" | "cgroup")
+                        && !m.options.iter().any(|o| o == "bind" || o == "rbind")
+                }),
+            })
+            .collect();
+        // runc adds these without the spec listing them: the terminal's pty,
+        // and binds of host device nodes when it cannot mknod (userns), typed
+        // as whatever the host's `/dev` is. The pty is typed, so a substituted
+        // `/dev/console` (CVE-2025-52565) still fires.
+        let mut implicit = vec![("/dev/console", Some("devpts"))];
+        implicit.extend(["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"].map(|d| (d, None)));
+        for (target, fstype) in implicit {
+            if !decl.mounts.iter().any(|m| m.target == target) {
+                decl.mounts.push(MountDecl { target: target.into(), fstype: fstype.map(Into::into) });
+            }
+        }
+    }
+    if let Some(linux) = &cfg.linux {
+        if decl.masked_paths.is_empty() {
+            decl.masked_paths = linux.masked_paths.clone();
+        }
+        if decl.readonly_paths.is_empty() {
+            decl.readonly_paths = linux.readonly_paths.clone();
+        }
+        if decl.min_seccomp_filters.is_none() && linux.seccomp.is_some() {
+            // The engine's own notify filter, inherited by everything it
+            // spawns, plus the spec's.
+            decl.min_seccomp_filters = Some(2);
+        }
+    }
+    if let Some(process) = &cfg.process {
+        decl.no_new_privs |= process.no_new_privileges;
+        // No `capabilities` block: runc leaves the caps alone, so there is no
+        // bound to check. With one, a root process's effective set after exec
+        // is its permitted set, which the bounding and inheritable sets feed:
+        // the union of every set is what the container may hold.
+        if let (None, Some(c)) = (decl.max_cap_eff, &process.capabilities) {
+            let mut mask = 0u64;
+            let sets = [&c.bounding, &c.effective, &c.inheritable, &c.permitted, &c.ambient];
+            for name in sets.into_iter().flatten() {
+                let bare = name.strip_prefix("CAP_").unwrap_or(name);
+                let bit = CAPS
+                    .iter()
+                    .position(|c| *c == bare)
+                    .with_context(|| format!("unknown capability `{name}` in the bundle"))?;
+                mask |= 1 << bit;
+            }
+            decl.max_cap_eff = Some(mask);
+        }
+    }
+    Ok(decl)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bundle_fills_the_oracle_s_intended_truth() {
+        let json = r#"{
+            "root": { "path": "rootfs" },
+            "process": { "noNewPrivileges": true,
+                         "capabilities": { "effective": ["CAP_CHOWN", "CAP_KILL"] } },
+            "mounts": [
+                { "destination": "/proc", "type": "proc", "source": "proc" },
+                { "destination": "/etc/hosts", "type": "bind", "source": "/h", "options": ["rbind"] },
+                { "destination": "/data", "type": "none", "source": "/d", "options": ["bind"] }
+            ],
+            "linux": { "maskedPaths": ["/proc/kcore"], "readonlyPaths": ["/proc/sys"],
+                       "seccomp": { "defaultAction": "SCMP_ACT_ERRNO" } }
+        }"#;
+        let watch = OracleDecl { watch: vec!["/usr/bin/runc".into()], ..Default::default() };
+        let d = oracle_truth(json, Path::new("/b"), watch).unwrap();
+        assert_eq!(d.rootfs.as_deref(), Some(Path::new("/b/rootfs")));
+        assert_eq!(d.mounts[..3].iter().map(|m| m.fstype.as_deref()).collect::<Vec<_>>(), [Some("proc"), None, None]);
+        assert_eq!(d.masked_paths, ["/proc/kcore"]);
+        assert_eq!(d.readonly_paths, ["/proc/sys"]);
+        assert_eq!(d.max_cap_eff, Some(0b10_0001));
+        assert!(d.no_new_privs);
+        assert_eq!(d.min_seccomp_filters, Some(2));
+        assert_eq!(d.watch.len(), 1, "the scenario's own fields survive");
+        assert!(d.mounts.iter().any(|m| m.target == "/dev/console" && m.fstype.as_deref() == Some("devpts")));
+        assert!(oracle_truth(r#"{ "process": { "capabilities": { "effective": ["CAP_NOPE"] } } }"#, Path::new("/b"), OracleDecl::default()).is_err());
+        let uncapped = oracle_truth(r#"{ "process": {} }"#, Path::new("/b"), OracleDecl::default()).unwrap();
+        assert_eq!(uncapped.max_cap_eff, None, "no capabilities block: runc leaves caps alone");
+        let wide = oracle_truth(r#"{ "process": { "capabilities": { "bounding": ["CAP_SYS_ADMIN"], "effective": ["CAP_CHOWN"] } } }"#, Path::new("/b"), OracleDecl::default()).unwrap();
+        assert_eq!(wide.max_cap_eff, Some(1 | 1 << 21));
+    }
 
     fn cp(target: &str) -> CheckpointDecl {
         CheckpointDecl::syscall(target)

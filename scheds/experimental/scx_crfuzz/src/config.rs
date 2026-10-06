@@ -12,6 +12,7 @@ use crate::checkpoint::default_pos_checkpoints;
 use crate::checkpoint::CheckpointDecl;
 use crate::checkpoint::CheckpointId;
 use crate::event::ThreadPath;
+use crate::oracle::OracleDecl;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -196,6 +197,10 @@ pub struct ScenarioConfig {
     /// for, `PolicyType::AutoAttack`; `None` for every other mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attack: Option<AttackDecl>,
+    /// The intended truth the oracle rules against. Only meaningful for
+    /// `PolicyType::AutoAttack`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<OracleDecl>,
     /// CPU seconds a thread may run between decisions while others are
     /// parked before the watchdog freezes it (design doc section 5).
     pub watchdog_cpu_secs: u64,
@@ -243,6 +248,8 @@ struct RawScenarioConfig {
     policy: Option<PolicyDecl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attack: Option<AttackDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oracle: Option<OracleDecl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watchdog_cpu_secs: Option<u64>,
 }
@@ -295,6 +302,8 @@ pub enum ConfigError {
     AutoAttackEmptyArgv,
     #[error("`attack` is only valid with policy `auto_attack`")]
     AttackWithoutAutoAttack,
+    #[error("`oracle` is only valid with policy `auto_attack`")]
+    OracleWithoutAutoAttack,
     #[error("`watchdog_cpu_secs` must be positive")]
     ZeroWatchdog,
 }
@@ -325,6 +334,9 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
             (None, true) => return Err(ConfigError::AutoAttackMissingAttack),
             (Some(_), false) => return Err(ConfigError::AttackWithoutAutoAttack),
             (None, false) => {}
+        }
+        if raw.oracle.is_some() && !is_auto_attack {
+            return Err(ConfigError::OracleWithoutAutoAttack);
         }
         if is_auto_attack && raw.roles.len() != 1 {
             return Err(ConfigError::AutoAttackNeedsSingleRole(raw.roles.len()));
@@ -388,6 +400,7 @@ impl TryFrom<RawScenarioConfig> for ScenarioConfig {
             on_divergence: raw.on_divergence,
             mode,
             attack: raw.attack,
+            oracle: raw.oracle,
             watchdog_cpu_secs,
         })
     }
@@ -473,6 +486,7 @@ impl From<ScenarioConfig> for RawScenarioConfig {
             steps,
             policy,
             attack: c.attack,
+            oracle: c.oracle,
             watchdog_cpu_secs: Some(c.watchdog_cpu_secs),
         }
     }

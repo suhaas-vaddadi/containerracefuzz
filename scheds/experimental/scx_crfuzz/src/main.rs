@@ -44,7 +44,10 @@ struct Args {
     spawn: Vec<String>,
 
     /// An OCI bundle to check before running: if its `linux.seccomp` profile
-    /// denies a syscall a checkpoint sits on, refuse to start.
+    /// denies a syscall a checkpoint sits on, refuse to start. Under
+    /// `auto_attack` it also supplies the oracle's intended truth (rootfs,
+    /// mounts, masked and read-only paths, privileges) wherever the config's
+    /// `oracle` block leaves it unset.
     ///
     /// Seccomp filters stack and the kernel takes the most restrictive action,
     /// and `USER_NOTIF` -- the whole holding mechanism -- loses to `ERRNO`. A
@@ -295,13 +298,25 @@ impl Drop for CgroupGuard {
 /// victim's thread group during an `auto_attack` window. Without
 /// `scx_crfuzz_gated` attached, `GateBackend` refuses to start.
 #[cfg(target_os = "linux")]
-fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
+fn run(mut config: ScenarioConfig, args: &Args) -> Result<RunReport> {
     use scx_crfuzz::backend_gate::GateBackend;
     use scx_crfuzz::backend_seccomp::ProcessSpec;
     use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
 
     if let Some(bundle) = &args.oci_bundle {
         preflight_bundle(bundle, &config)?;
+        // The oracle rules against what the spec implies; deriving that here
+        // keeps OCI out of the library.
+        if config.mode.is_auto_attack() {
+            let path = bundle.join("config.json");
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            // Absolute, so the rootfs it implies holds whatever the cwd.
+            let bundle = std::fs::canonicalize(bundle)
+                .with_context(|| format!("resolving {}", bundle.display()))?;
+            let decl = config.oracle.take().unwrap_or_default();
+            config.oracle = Some(oci_preflight::oracle_truth(&text, &bundle, decl)?);
+        }
     }
 
     if let Some(i) = args.exit_with_spawn {

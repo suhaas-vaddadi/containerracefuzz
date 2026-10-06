@@ -53,15 +53,24 @@ fn write_attacker(dir: &std::path::Path, log_path: &std::path::Path) -> std::pat
 }
 
 fn auto_attack_config(attacker: &std::path::Path) -> ScenarioConfig {
+    watching(attacker, &[])
+}
+
+/// An `auto_attack` config whose oracle watches `paths` as host paths nothing
+/// in the run may change.
+fn watching(attacker: &std::path::Path, paths: &[&std::path::Path]) -> ScenarioConfig {
+    let watch: Vec<String> = paths.iter().map(|p| format!("\"{}\"", p.display())).collect();
     ScenarioConfig::from_json(&format!(
         r#"{{
             "scenario_id": "auto-attack-toy",
             "cgroup": "{CGROUP}",
             "roles": [{{ "id": "victim", "comm": "runc" }}],
             "policy": {{ "type": "auto_attack", "seed": 0 }},
-            "attack": {{ "argv": ["{}"] }}
+            "attack": {{ "argv": ["{}"] }},
+            "oracle": {{ "watch": [{}] }}
         }}"#,
-        attacker.display()
+        attacker.display(),
+        watch.join(", ")
     ))
     .expect("auto_attack config should parse")
 }
@@ -178,10 +187,10 @@ fn a_failing_attacker_primitive_does_not_derail_the_run() {
 }
 
 #[test]
-fn the_oracle_fires_when_the_attacker_changes_the_path_type() {
-    // The real oracle end to end: the engine snapshots a regular file before
-    // the attacker runs, the attacker replaces it with a symlink, and the
-    // oracle reports the type change when the window is observed at exit.
+fn the_oracle_fires_when_a_watched_host_file_becomes_a_symlink() {
+    // The real oracle end to end: the oracle snapshots a watched host file
+    // before the run, the attacker replaces it with a symlink, and the oracle
+    // reports it when the window is observed at exit.
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target");
     let secret = dir.path().join("secret");
@@ -208,7 +217,7 @@ fn the_oracle_fires_when_the_attacker_changes_the_path_type() {
         .hit_path(100, "openat", Some(target.to_str().unwrap()))
         .exit(100);
 
-    let mut engine = Engine::new(auto_attack_config(&attacker), backend);
+    let mut engine = Engine::new(watching(&attacker, &[&target]), backend);
     let outcome = engine.run().expect("engine run");
     assert_eq!(outcome, RunOutcome::Completed);
 
@@ -224,7 +233,7 @@ fn the_oracle_fires_when_the_attacker_changes_the_path_type() {
 #[test]
 fn the_oracle_fires_on_a_same_type_directory_exchange() {
     // Directory -> directory: type is preserved, so only the identity can tell
-    // it apart. This is the runc-rootfs case the type-only oracle missed.
+    // it apart.
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("rootfs");
     std::fs::create_dir(&target).unwrap();
@@ -249,7 +258,7 @@ fn the_oracle_fires_on_a_same_type_directory_exchange() {
         .hit_path(100, "mount", Some(target.to_str().unwrap()))
         .exit(100);
 
-    let mut engine = Engine::new(auto_attack_config(&attacker), backend);
+    let mut engine = Engine::new(watching(&attacker, &[&target]), backend);
     engine.run().expect("engine run");
 
     let verdicts = engine.oracle_verdicts();
@@ -293,7 +302,7 @@ fn each_window_runs_gate_fingerprint_attacker_fingerprint_ungate_release_in_orde
         .exit(101)
         .exit(100);
 
-    let mut engine = Engine::new(auto_attack_config(&attacker), backend);
+    let mut engine = Engine::new(watching(&attacker, &[&target]), backend);
     assert_eq!(engine.run().expect("engine run"), RunOutcome::Completed);
     // The group is ungated before the release: a hit released into a gated
     // group would be held again on its way back to userspace.

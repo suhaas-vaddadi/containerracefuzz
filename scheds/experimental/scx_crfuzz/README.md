@@ -74,10 +74,15 @@ others. Sibling bytes written during a 300 ms hold:
 `pos` is POS (Yuan et al., CAV 2018): seeded per-event priorities, release the
 highest, redraw only the ready events that conflict with it. Each thread is a
 process in the paper's sense, so siblings stay runnable and reach their own
-checkpoints; the next decision waits for the full readout. The oracle is
-`oracle::observe` (`src/oracle.rs`): it flags a path whose object identity
-changed across the attacker's turn — type or inode — the signature of a
-substitution. The full invariant battery is future work.
+checkpoints; the next decision waits for the full readout. The oracle
+(`src/oracle.rs`) rules on each window against the config's `oracle` block,
+which `--oci-bundle` fills from the spec: a watched host path changed, a host
+canary's bytes appear in the rootfs, or the container process (after its
+entrypoint exec) has an undeclared or wrong-type mount, an unmasked masked
+path, a writable read-only path, a cwd or directory fd outside its root, or
+privileges beyond the spec. Each finding is reported at the first window that
+shows it. Use a long-lived entrypoint: a container that has exited by the last
+window cannot be inspected.
 
 ## Build and test
 
@@ -173,5 +178,5 @@ affected; runc's own work happens before the profile is installed.
   (`CheckpointBackend::attach`).
 
 Not built: mutator, campaign driver, Class B PID-reuse (see "Seams" in
-`src/lib.rs`). The oracle is the first real one; its full invariant battery is
-still future work.
+`src/lib.rs`). The oracle checks outcomes only; a
+read escape is caught only when its bytes land in the rootfs.

@@ -144,9 +144,9 @@ pub mod engine;
 /// host; the kernel-side key capture lives in `backend_seccomp`.
 pub mod event;
 pub mod log;
-/// The oracle: the harness-owned detector run after each use. `observe` fires
-/// when a path's object identity changed across the attacker's turn; the full
-/// invariant battery grows here.
+/// The oracle: the harness-owned detector run after each use. Each window runs
+/// the full battery -- host integrity, canary, mounts, handles, privileges --
+/// against the intended truth in the config's `oracle` block.
 pub mod oracle;
 pub mod policy;
 pub mod role;

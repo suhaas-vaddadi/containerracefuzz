@@ -29,6 +29,7 @@ use crate::event::ThreadPath;
 use crate::log::CanonicalLog;
 use crate::log::DebugEntry;
 use crate::log::DebugLog;
+use crate::oracle::Oracle;
 use crate::oracle::OracleVerdict;
 use crate::oracle::PathIdentity;
 use crate::oracle::WindowContext;
@@ -71,6 +72,7 @@ struct AttackDriver {
     /// first point the use has provably completed and the victim is frozen
     /// again.
     pending: Option<WindowContext>,
+    oracle: Oracle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -999,7 +1001,7 @@ impl<B: CheckpointBackend> Engine<B> {
             Driver::Attack(a) => a
                 .pending
                 .take()
-                .map(|ctx| (ctx.step_idx, crate::oracle::observe(&ctx))),
+                .map(|ctx| (ctx.step_idx, a.oracle.observe(&ctx))),
             Driver::Policy(_) => None,
         };
         if let Some((step_idx, verdict)) = observed {
@@ -1074,6 +1076,7 @@ fn build_driver(config: &ScenarioConfig) -> Driver {
                     .clone()
                     .expect("auto_attack config carries an attack section (validated)"),
                 pending: None,
+                oracle: Oracle::new(config.oracle.clone().unwrap_or_default()),
             }),
             // POS: seeded per-event priority with conflict-only redraw. See
             // `policy::PosPolicy`.
