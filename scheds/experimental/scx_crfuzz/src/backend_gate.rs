@@ -244,6 +244,10 @@ impl CheckpointBackend for GateBackend {
         self.inner.wakes_on_its_own(tid)
     }
 
+    fn in_scope(&self, tid: Pid) -> bool {
+        self.inner.in_scope(tid)
+    }
+
     /// The sensor's ringbuf is in the seccomp backend's epoll set.
     fn pending(&self) -> bool {
         self.inner.pending()

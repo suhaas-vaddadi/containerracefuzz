@@ -41,6 +41,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use libseccomp::error::SeccompErrno;
 use libseccomp::ScmpAction;
 use libseccomp::ScmpFilterContext;
 use libseccomp::ScmpNotifReq;
@@ -601,11 +602,7 @@ fn read_task_info(pid: Pid) -> Result<TaskInfo> {
 
     // cgroup v2 unified: a single `0::/path` line, where the path is relative
     // to the cgroup root -- NOT prefixed with /sys/fs/cgroup.
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .unwrap_or_default()
-        .lines()
-        .find_map(|l| l.strip_prefix("0::").map(str::to_string))
-        .unwrap_or_default();
+    let cgroup = read_task_cgroup(pid).unwrap_or_default();
 
     Ok(TaskInfo {
         pid,
@@ -614,6 +611,15 @@ fn read_task_info(pid: Pid) -> Result<TaskInfo> {
         comm,
         cgroup,
     })
+}
+
+/// The cgroup v2 path in `/proc/<pid>/cgroup` (`0::/path`, path relative to the
+/// cgroup root), not `/sys/fs/cgroup`-prefixed. `None` when unreadable.
+fn read_task_cgroup(pid: Pid) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(str::to_string))
 }
 
 /// Capture the path a held use-shaped syscall resolved, for the attacker/oracle
@@ -1128,10 +1134,24 @@ impl CheckpointBackend for SeccompNotifyBackend {
         // would be the wrong answer, because the arguments can change between
         // the check and the call -- but that TOCTOU is the subject here, not a
         // hazard to avoid.)
-        ScmpNotifResp::new_continue(handle.0, ScmpNotifRespFlags::CONTINUE)
-            .respond(fd)
-            .with_context(|| format!("releasing notification {}", handle.0))?;
-        Ok(())
+        //
+        // A stale id is expected: the tracee can die, or the kernel otherwise
+        // abandon the notification, between its hit reaching the engine and
+        // this release. The kernel then rejects the response even though the
+        // id was still in our table -- and the tracee is already past the
+        // syscall, so there is nothing left to answer. Failing here would
+        // abort the engine and close the listener, stranding every *other*
+        // parked notification (the kernel aborts them with ENOSYS).
+        match ScmpNotifResp::new_continue(handle.0, ScmpNotifRespFlags::CONTINUE).respond(fd) {
+            Ok(()) => Ok(()),
+            Err(e) => match e.errno() {
+                Some(SeccompErrno::ENOENT | SeccompErrno::ECANCELED | SeccompErrno::ESRCH) => {
+                    log::debug!("notification {} already gone: {e:#}", handle.0);
+                    Ok(())
+                }
+                _ => Err(e).with_context(|| format!("releasing notification {}", handle.0)),
+            },
+        }
     }
 
     fn recapture(&mut self, handle: NotifyHandle) -> Result<Option<Vec<ConflictKey>>> {
@@ -1168,6 +1188,13 @@ impl CheckpointBackend for SeccompNotifyBackend {
 
     fn wakes_on_its_own(&self, tid: Pid) -> bool {
         wakes_on_its_own(tid)
+    }
+
+    /// `tid` is still under the run's cgroup. A task that has left it (the
+    /// container init entering the container's own cgroup, say) is not part
+    /// of the run.
+    fn in_scope(&self, tid: Pid) -> bool {
+        read_task_cgroup(tid).is_some_and(|c| c.starts_with(&self.cgroup))
     }
 
     /// No sensor, so nothing to lose.

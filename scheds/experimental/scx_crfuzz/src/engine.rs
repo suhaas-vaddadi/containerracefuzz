@@ -466,6 +466,29 @@ impl<B: CheckpointBackend> Engine<B> {
     /// thread is frozen (to reach its forced thaw), else none. Wall time only
     /// decides when to look.
     fn watchdog(&mut self) -> Result<Option<Duration>> {
+        // Retire any tracked thread that has left the scenario cgroup. The
+        // cgroup-scoped sensor can no longer report it, so it can never reach
+        // rest on its own; leaving it would keep `at_rest()` false forever.
+        // Such a task is not part of the run, so retiring it is safe.
+        let outside: Vec<Pid> = self
+            .threads
+            .iter()
+            .filter(|(&tid, t)| t.state != State::Exited && !self.backend.in_scope(tid))
+            .map(|(&tid, _)| tid)
+            .collect();
+        for tid in outside {
+            log::warn!(
+                "watchdog: tid {tid} ({}) left the scenario cgroup; retiring it",
+                proc_file(tid, "comm"),
+            );
+            if let Some(handle) = self.threads[&tid].hit.as_ref().map(|h| h.handle) {
+                if let Err(e) = self.backend.release(handle) {
+                    log::warn!("watchdog: releasing out-of-scope tid {tid}: {e:#}");
+                }
+            }
+            self.exit_thread(tid);
+        }
+
         let due: Vec<(Pid, bool)> = self
             .threads
             .iter()
@@ -619,7 +642,14 @@ impl<B: CheckpointBackend> Engine<B> {
     fn handle_event(&mut self, event: BackendEvent) -> Result<()> {
         match event {
             BackendEvent::TaskAppeared(task) => {
-                self.thread(task.pid, task.tgid, None);
+                // Only a task inside the run's scope is part of the run. A
+                // task that has left it -- runc's init entering the
+                // container's own cgroup, say -- is invisible to the
+                // cgroup-scoped sensor, so tracking it would leave a `Running`
+                // entry nothing can ever retire and stall the readout.
+                if self.backend.in_scope(task.pid) {
+                    self.thread(task.pid, task.tgid, None);
+                }
                 if let Some((_, provenance)) = self.roles.resolve_role(&task) {
                     self.provenance.insert(task.pid, provenance);
                 }
@@ -631,16 +661,26 @@ impl<B: CheckpointBackend> Engine<B> {
                 path,
                 keys,
             } => {
-                if self.thread(pid, pid, None).state == State::Exited {
-                    // Its notification died with it.
+                if self
+                    .threads
+                    .get(&pid)
+                    .is_some_and(|t| t.state == State::Exited)
+                {
+                    // Its notification died with it. Still answer it: a
+                    // notification left unanswered parks the tracee forever,
+                    // and `release` tolerates an id the kernel already
+                    // abandoned (it logs and returns).
+                    self.backend.release(handle)?;
                     return Ok(());
                 }
-                // A task the role table does not recognise is not ours to
-                // schedule: release it at once and never record it. That is the
-                // blast-radius guarantee -- a bug in this engine must not be
-                // able to degrade or hang unrelated work on the machine.
+                // A task the role table does not recognise -- including one
+                // that has left the scenario cgroup -- is not ours to
+                // schedule: release it at once and never create an entry for
+                // it. Recording it would leave a `Running` entry the sensor
+                // can never retire. That is the blast-radius guarantee -- a
+                // bug in this engine must not be able to degrade or hang
+                // unrelated work on the machine.
                 let Some(role) = self.roles.lookup(pid) else {
-                    self.thread(pid, pid, None).state = State::Running;
                     self.backend.release(handle)?;
                     return Ok(());
                 };
@@ -1232,6 +1272,61 @@ mod tests {
         e.handle_event(state(100, 100, ThreadStateKind::WakeDone)).unwrap();
         e.handle_event(state(100, 100, ThreadStateKind::Asleep)).unwrap();
         assert_eq!(e.threads[&100].state, State::Parked);
+    }
+
+    #[test]
+    fn an_out_of_scope_hit_is_released_and_never_recorded() {
+        let mut e = Engine::new(
+            config(r#"{ "type": "pos", "seed": 1 }"#, ""),
+            StubBackend::new().out_of_scope(100),
+        );
+        // It matches the role's comm, but its cgroup is outside the scenario:
+        // forked by an in-scope runc, then moved into the container's own
+        // cgroup. The role table must not hand it a role.
+        e.handle_event(BackendEvent::TaskAppeared(TaskInfo {
+            pid: 100,
+            tgid: 100,
+            parent_tgid: 1,
+            comm: "v".into(),
+            cgroup: "/other/ctr0".into(),
+        }))
+        .unwrap();
+        assert!(e.roles.lookup(100).is_none(), "out of scope: no role");
+        e.handle_event(hit(100, 7)).unwrap();
+        assert_eq!(e.backend.released, [NotifyHandle(7)], "answered at once");
+        assert!(
+            !e.threads.contains_key(&100),
+            "never tracked: no stale Running entry the sensor cannot retire"
+        );
+    }
+
+    #[test]
+    fn a_tracked_thread_that_leaves_scope_is_retired_by_the_watchdog() {
+        // Resolved in scope, then moved out (the container's own cgroup): the
+        // sensor can no longer report it, so it must not keep `at_rest()` false.
+        let mut e = Engine::new(
+            config(r#"{ "type": "pos", "seed": 1 }"#, ""),
+            StubBackend::new().out_of_scope(100),
+        );
+        e.handle_event(state(100, 100, ThreadStateKind::Joined)).unwrap();
+        assert_eq!(e.threads[&100].state, State::Running);
+        e.watchdog().unwrap();
+        assert_eq!(e.threads[&100].state, State::Exited, "retired, not waited on");
+        assert!(e.at_rest());
+    }
+
+    #[test]
+    fn a_hit_for_an_exited_thread_still_answers_its_notification() {
+        let mut e = pos();
+        e.handle_event(state(100, 100, ThreadStateKind::Joined)).unwrap();
+        e.handle_event(state(100, 100, ThreadStateKind::Exited)).unwrap();
+        assert_eq!(e.threads[&100].state, State::Exited);
+        e.handle_event(hit(100, 3)).unwrap();
+        assert_eq!(
+            e.backend.released,
+            [NotifyHandle(3)],
+            "the dead hit is answered, not left parked"
+        );
     }
 
     #[test]

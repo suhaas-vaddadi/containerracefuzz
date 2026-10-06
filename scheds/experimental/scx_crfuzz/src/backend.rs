@@ -149,6 +149,17 @@ pub trait CheckpointBackend {
     fn pending(&self) -> bool {
         false
     }
+
+    /// Whether `tid` is still inside the run's scope.
+    ///
+    /// The thread-state sensor is cgroup-scoped, so a task that has left the
+    /// run's cgroup can no longer be reported at rest; the seccomp filter is
+    /// only namespace-scoped, so it still delivers that task's checkpoints.
+    /// The engine must not track such a task -- it would sit `Running` forever
+    /// and stall the readout. `true` where the concept does not apply.
+    fn in_scope(&self, _tid: Pid) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +201,8 @@ pub struct StubBackend {
     asleep_first: bool,
     /// What `wakes_on_its_own` answers yes for.
     timed: Vec<Pid>,
+    /// What `in_scope` answers no for.
+    out_of_scope: Vec<Pid>,
     /// See `spinner`.
     spinners: Vec<Pid>,
     /// See `late`.
@@ -284,6 +297,12 @@ impl StubBackend {
     /// Script `tid` as in a timed sleep whenever it is Blocked.
     pub fn timed_sleeper(mut self, tid: Pid) -> Self {
         self.timed.push(tid);
+        self
+    }
+
+    /// Script `tid` as having left the run's cgroup, so `in_scope` answers no.
+    pub fn out_of_scope(mut self, tid: Pid) -> Self {
+        self.out_of_scope.push(tid);
         self
     }
 
@@ -526,6 +545,10 @@ impl CheckpointBackend for StubBackend {
 
     fn wakes_on_its_own(&self, tid: Pid) -> bool {
         self.timed.contains(&tid)
+    }
+
+    fn in_scope(&self, tid: Pid) -> bool {
+        !self.out_of_scope.contains(&tid)
     }
 
     fn dropped(&self) -> Result<u64> {

@@ -146,10 +146,27 @@ impl RoleTable {
     /// scheduling -- has a parent pointer that refers to the wrong process.
     /// Resolving such a thread through its parent would misattribute it.
     ///
+    /// Every step is gated by the scope requirement: a task whose cgroup is
+    /// not inside the scenario cgroup is not part of this run, whatever its
+    /// parentage. The seccomp filter is inherited by the whole spawned tree
+    /// (it is namespace-, not cgroup-scoped), so a task that has left the
+    /// run's cgroup -- `runc:[2]INIT` entering the container's own cgroup,
+    /// say -- can still reach the engine's watched syscalls even though the
+    /// cgroup-scoped thread-state sensor will never report it. Such a task
+    /// must not inherit a role via its own thread group or its parent; it is
+    /// returned as `None` so the caller dispatches it unmodified.
+    ///
     /// Returns `None` for any task that is not part of a declared role. The
     /// caller must dispatch those unmodified: that is the blast-radius
     /// guarantee (Background, "Blast radius and harness").
     pub fn resolve_role(&mut self, task: &TaskInfo) -> Option<(RoleRef, Provenance)> {
+        // Scope first: an out-of-cgroup task never resolves, however it was
+        // forked. Step 4's own prefix matcher below keeps its existing
+        // per-declaration cgroup semantics.
+        if !task.cgroup.starts_with(&self.scenario_cgroup) {
+            return None;
+        }
+
         // 1. Sticky per-pid cache.
         if let Some(r) = self.cache.get(&task.pid) {
             return Some((*r, Provenance::Cached));
@@ -285,6 +302,43 @@ mod tests {
         let mut outsider = task(100, 100, 1, "runc");
         outsider.cgroup = "/sys/fs/cgroup/system.slice".to_string();
         assert!(t.resolve_role(&outsider).is_none());
+    }
+
+    #[test]
+    fn an_out_of_scope_child_cannot_inherit_its_parent_s_role() {
+        let mut t = table();
+        t.resolve_role(&task(100, 100, 1, "runc")).unwrap();
+
+        // `runc:[2:INIT]`: forked by in-scope runc, but it has moved into the
+        // container's own cgroup, outside the run's. Parent inheritance must
+        // not hand it a role.
+        let mut init = task(150, 150, 100, "runc:[2:INIT]");
+        init.cgroup = "/sys/fs/cgroup/default/ctr0".to_string();
+        assert!(t.resolve_role(&init).is_none());
+    }
+
+    #[test]
+    fn an_out_of_scope_thread_cannot_inherit_its_own_thread_group() {
+        let mut t = table();
+        t.resolve_role(&task(100, 100, 1, "runc")).unwrap();
+
+        // A sibling of the same thread group that is somehow outside the
+        // cgroup (the sensor will never report it): still not a role.
+        let mut sibling = task(101, 100, 1, "runc");
+        sibling.cgroup = "/sys/fs/cgroup/default/ctr0".to_string();
+        assert!(t.resolve_role(&sibling).is_none());
+    }
+
+    #[test]
+    fn an_in_scope_child_still_inherits_its_parent_s_role() {
+        let mut t = table();
+        t.resolve_role(&task(100, 100, 1, "runc")).unwrap();
+
+        // The same fork, but still inside the run's cgroup: inheritance is
+        // unchanged.
+        let (r, p) = t.resolve_role(&task(150, 150, 100, "runc:[2:INIT]")).unwrap();
+        assert_eq!(r, RoleRef::one(RoleId(0)));
+        assert_eq!(p, Provenance::Parent);
     }
 
     #[test]
