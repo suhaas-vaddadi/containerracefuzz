@@ -1,9 +1,9 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0
 #
-# One run of the sweep against a runc bundle: with a window, the swap attacker
-# substitutes the path runc's syscall resolves at that one window, and the
-# oracle reports any escape; without one, a dry run that lists the windows.
+# One run of the sweep against a runc bundle: with a window, the attacker acts
+# on the path runc's syscall resolves at that one window, and the oracle reports
+# any escape; without one, a dry run that lists the windows.
 # The cgroup, gate, bundle preflight and spawn are assembled here so the
 # command line stays short.
 #
@@ -67,20 +67,12 @@ sudo env \
     CRFUZZ_EVIL_DIR="$EVIL_DIR" \
     CRFUZZ_EVIL_FILE="$EVIL_FILE" \
     CRFUZZ_ATTACK_ROOT="$WORK" \
-    CRFUZZ_CVE="${CRFUZZ_CVE:-}" \
-    CRFUZZ_ATTACK_FAMILY="${CRFUZZ_ATTACK_FAMILY:-}" \
-    CRFUZZ_ATTACK_KIND="${CRFUZZ_ATTACK_KIND:-}" \
-    CRFUZZ_ATTACK_CROSS_MAP="${CRFUZZ_ATTACK_CROSS_MAP:-}" \
-    CRFUZZ_ATTACK_VERBS="${CRFUZZ_ATTACK_VERBS:-}" \
     CRFUZZ_ATTACK_SEED="${CRFUZZ_ATTACK_SEED:-}" \
     CRFUZZ_ATTACK_MAX_STEPS="${CRFUZZ_ATTACK_MAX_STEPS:-}" \
     CRFUZZ_ATTACK_EXCLUDE_KNOWN="${CRFUZZ_ATTACK_EXCLUDE_KNOWN:-}" \
     CRFUZZ_ATTACK_LOG="${CRFUZZ_ATTACK_LOG:-}" \
     CRFUZZ_ATTACK_PLAN_LOG="${CRFUZZ_ATTACK_PLAN_LOG:-}" \
     CRFUZZ_ATTACK_ALLOW_MOUNT="${CRFUZZ_ATTACK_ALLOW_MOUNT:-0}" \
-    CRFUZZ_REDIR_TARGET="${CRFUZZ_REDIR_TARGET:-}" \
-    CRFUZZ_REDIR_ANCHOR="${CRFUZZ_REDIR_ANCHOR:-}" \
-    CRFUZZ_EVIL_MODE="${CRFUZZ_EVIL_MODE:-}" \
     "$BIN" \
     --config "${CRFUZZ_CONFIG:-$HERE/runc_attack.json}" \
     --cgroup-path "/crfuzz/$ID" \
