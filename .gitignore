@@ -27,3 +27,10 @@ CLAUDE.md
 
 # Thesis working documents: kept on disk, not tracked.
 docs/
+
+# scx_crfuzz scenario fixtures. Built by scenarios/Makefile from the adjacent
+# .c/.go sources; the binaries are large and host-specific, so they are not
+# tracked. (A nested .gitignore cannot carry these: `*.gitignore` above ignores
+# every nested one.)
+scheds/experimental/scx_crfuzz/scenarios/threaded_victim
+scheds/experimental/scx_crfuzz/scenarios/go_victim

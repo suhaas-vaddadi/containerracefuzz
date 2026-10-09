@@ -1,188 +1,51 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-//! # ContainerRaceFuzz scheduling engine
+//! # ContainerRaceFuzz engine
 //!
-//! One engine, two modes, per `docs/sched_replay/design_doc.md`:
+//! Finds check-then-use races in a container runtime by sweeping attack
+//! windows. The victim (runc) is held at every checkpoint hit: seccomp
+//! user-notification parks the thread at syscall entry, and with `--gate` the
+//! `sched_ext` gate keeps the rest of its thread group off the CPU. At one
+//! selected window an attacker runs while the victim is frozen, so the race
+//! is won by construction rather than by timing. An oracle then diffs the
+//! underlying objects the window resolved.
 //!
-//! - **Replay** enforces a schedule someone already wrote: the right tool for
-//!   *reproducing* a known vulnerability.
-//! - **Discovery** has no such schedule and must *decide* which of several
-//!   roles sitting at their own checkpoints moves next, systematically enough
-//!   that a TOCTOU violation gets found rather than hoped for.
+//! A dry run lists the windows; the sweep runs once per window
+//! (`scenarios/sweep.sh`). One attack per run makes every finding
+//! attributable, and `(scenario, window)` replays it. This covers races whose
+//! trigger is one swap placed between a check and a use -- depth 2 with one
+//! attacker. A race that needs two swaps at two windows would need a sweep over
+//! window pairs.
 //!
-//! They differ in exactly one place -- the answer to "what happens next" --
-//! which is why `policy::DecisionPolicy` is an interface inside one engine
-//! rather than a second binary (section 3.1). Because both modes write the
-//! same canonical log, turning a discovery finding into a replayable schedule
-//! is a field drop (`log::CanonicalLog::project_to_steps`), not a translation
-//! step that would itself need validating.
-//!
-//! ## Module map
-//!
-//! | Module | Design doc |
+//! | Module | |
 //! |---|---|
-//! | [`config`] | section 8 (schema), Background |
-//! | [`role`] | Background (role resolution), section 5 (pools) |
-//! | [`checkpoint`] | section 4 (placement, the structural syscall set) |
-//! | [`policy`] | section 3 (the decision-policy abstraction) |
-//! | [`engine`] | Background (three-phase state machine) |
-//! | [`log`] | Background (canonical log), section 3.5 (projection) |
-//! | [`backend`] | Background (checkpoint mechanisms) |
+//! | [`config`] | scenario schema |
+//! | [`role`] | which tasks are the victim |
+//! | [`checkpoint`] | the structural syscall set, path-argument table |
+//! | [`engine`] | one run: hold, observe, attack, release |
+//! | [`attacker`] | runs the external attacker in the window |
+//! | [`oracle`] | a lightweight object diff of the window paths |
+//! | [`backend`] | the holding seam, plus `StubBackend` for tests |
 //!
-//! ## Status
-//!
-//! The engine, the policies, the role algebra and the log are real and tested
-//! on any host against [`backend::StubBackend`], which scripts events instead
-//! of holding anything.
-//!
-//! On Linux, [`backend_seccomp::SeccompNotifyBackend`] holds real processes at
-//! real syscalls via `SECCOMP_RET_USER_NOTIF`. It covers every `syscall`
-//! checkpoint, which is the whole of the section 4.2 default set, and needs
-//! neither eBPF nor a `sched_ext` attach.
-//!
-//! It is not the whole story. seccomp user-notification holds the *thread*
-//! that made the syscall; Background requires holding the whole thread group.
-//! For a single-threaded target those coincide, and this backend is sound. For
-//! a Go binary -- runc, containerd, the actual targets -- they do not, and the
-//! `ops.dispatch` half of the base design ([`backend_gate::GateBackend`], over
-//! `scx_crfuzz_gate`) is what closes the gap: it declines to dispatch a held
-//! role's whole thread group, so a multi-threaded target is held without
-//! restarting the syscall the way a cgroup freezer would. Section 14-A is
-//! still open, so run-to-run reproducibility against a multi-threaded target
-//! is not guaranteed.
-//!
-//! ## Seams
-//!
-//! Components the design doc specifies but that are deliberately not in this
-//! crate, with the interface each would attach to:
-//!
-//! - **`sched_ext` `struct_ops` backend** (Background). Implemented, but in a
-//!   separate crate: `scx_crfuzz_gate`, whose BPF program (`crfuzz_gate_ops`)
-//!   and daemon (`scx_crfuzz_gated`) supply the map and the dispatch queue
-//!   that decline to place a gated thread group's tasks on a CPU. It is a
-//!   separate crate because BPF needs a `build.rs`, and a `build.rs` runs on
-//!   every host -- keeping it out of this crate is what preserves this
-//!   crate's "builds and tests anywhere, macOS included" property. This
-//!   crate's own [`backend_gate::GateBackend`] talks to it over the pinned
-//!   maps and implements the same [`backend::CheckpointBackend`]; nothing
-//!   above it changed when it landed.
-//! - **Mutator** (section 6.1). A pipeline stage strictly *upstream*: it emits
-//!   an OCI spec plus the list of paths that spec references, before `runc` is
-//!   invoked and therefore before any process tree exists for roles to be
-//!   resolved against. It produces a [`config::ScenarioConfig`]; it never calls
-//!   into the engine, and the engine never learns what OCI is.
-//! - **Racer** (section 6.2). Not engine code at all -- an ordinary role, whose
-//!   action vocabulary (symlink swap, rename, unlink-and-recreate) is fixed and
-//!   small, and whose *targets* come from the mutator's path list. That
-//!   separation is what makes discovery capable of finding something novel
-//!   rather than re-running three known scripts with randomized timing.
-//! - **Oracle** (section 7). Strictly *downstream*: consumes
-//!   [`engine::RunOutcome`] and the canonical log, and derives what should have
-//!   been true from the same OCI spec the mutator generated. Sections 14-B and
-//!   14-H are open here -- what separates a genuine violation from a cleanly
-//!   rejected racer action or an uninteresting failure to start, and when
-//!   post-run state is sampled -- so the engine deliberately does not
-//!   pre-empt either question.
-//! - **Harness** (Background). Owns the disposable VM, the fresh scenario
-//!   cgroup, and the supervisory wall-clock timeout measured from the canonical
-//!   log's last advance.
-//! - **PID/identity-reuse module, Class B** (section 9). Consumes the role,
-//!   checkpoint and decision-policy machinery here and adds a cursor tracker
-//!   and filler-cycle planner. That planner sits *outside*
-//!   [`policy::DecisionPolicy`] by section 9.2's own argument: it is
-//!   once-per-iteration resource planning over a namespace's whole allocation
-//!   history, not a per-syscall reactive decision. The dependency runs one way
-//!   only -- nothing in this crate references Class B -- which is what makes it
-//!   deletable without touching Class A.
-//!
-//! ## Open questions that touch this code
-//!
-//! Design doc section 14 raises eleven; five bear directly on types here and
-//! are marked at the relevant declaration: **14-A** (is the *ready set's*
-//! arrival order itself deterministic? -- **answered, see below**), **14-C**
-//! (how a pool hit is identified in the log -- [`role::RoleRef`]), **14-D** (nothing links a log to its originating config --
-//! [`log::CanonicalLog`]), **14-H** (the run-outcome taxonomy --
-//! [`engine::RunOutcome`]), **14-J** (the attachment race for late pool members
-//! -- [`backend::CheckpointBackend::attach`]). Only 14-A is resolved.
-//!
-//! ## Section 14-A is no longer open, and the answer is no
-//!
-//! The ready-set arrival order is **not** reproducible. Measured directly
-//! against real processes (`scenarios/flake.sh`): holding the seed fixed and
-//! varying nothing, roughly one run in a few hundred sees the two roles reach
-//! their first checkpoint in the opposite order. The ready set then arrives at
-//! `decide()` with the same two members in the other position; a policy that
-//! indexes by position releases a different member, and the entire run
-//! diverges -- including the security verdict, which flips between "the victim
-//! read the secret" and "the victim refused a symlink". (This was measured
-//! against the since-retired `RandomWalk`, which indexed by position.)
-//!
-//! Section 10.1 says ordering determinism "holds trivially if `decide()` is a
-//! pure function of `(seed, ready-set-sequence)`". That premise is true here --
-//! `decide()` is pure, and the unit tests prove it -- and the conclusion is
-//! still false, because nothing makes the ready-set-sequence itself
-//! reproducible. The condition is necessary, not sufficient.
-//!
-//! The exposure is concentrated where more than one role is runnable at once.
-//! Once `Enforcing` is holding everyone but the single role it released, only
-//! one process can be approaching a checkpoint, so arrival order is forced. The
-//! window is the startup gap before the first hold, and any moment a released
-//! role does not immediately reach its next checkpoint.
-//!
-//! Two fixes are available here. A narrow one -- canonicalise the ready set's
-//! order before handing it to `decide()` (sort by role declaration index and
-//! checkpoint id) -- would still leave a policy exposed to a subtler case:
-//! two runs that see the same arrivals in the same order can still diverge,
-//! because what `decide()` is handed is whichever ready-set snapshot existed
-//! at that exact instant, and that snapshot's *membership* is itself
-//! timing-dependent, not just its order.
-//!
-//! [`policy::OrderedWalk`] takes the stronger fix instead: it draws a target
-//! *role* from the seed alone, before anything has run and independent of
-//! the ready set entirely, and `decide()` only ever searches for that target
-//! rather than indexing into arrival order. Real-world timing can then only
-//! change *when* the target shows up, never *which* target was chosen.
-//! The arrival-order-dependent `RandomWalk` that
-//! this flake was measured against has since been retired; its config slot now
-//! selects the `auto_attack` orchestration.
-//!
-//! This is still a scaffold-level judgment call, not something the design
-//! doc itself has decided: §3.4 describes the baseline as uniform choice
-//! "over the ready set," and `OrderedWalk`'s role-first, ready-set-blind
-//! draw is a different reading of that. It is recorded here as the concrete
-//! fix, with the reasoning that motivates it, not as a doc amendment.
+//! The engine, oracle and victim resolution build and test on any host; the
+//! seccomp and gate backends are Linux-only.
 
-/// The attacker runner: how the engine invokes a user-authored attacker inside
-/// each window (`PolicyType::AutoAttack`). Portable -- `std::process` -- so it
-/// tests on any host.
 pub mod attacker;
 pub mod backend;
-/// The `ops.dispatch` gate -- the holding mechanism for whole thread groups.
-///
-/// Linux-only. On a checkpoint hit it gates the held task's thread group by
-/// declining to dispatch it, with the held thread left parked in its seccomp
-/// notification for the whole hold, so the notification id the engine was
-/// given stays valid.
+/// Holds the victim's whole thread group via the `sched_ext` gate, without
+/// restarting the syscall the held thread sits in. Linux-only.
 #[cfg(target_os = "linux")]
 pub mod backend_gate;
-/// The seccomp user-notification backend -- the one that holds real processes.
-///
-/// Linux-only, and deliberately so: keeping it behind a target cfg is what
-/// lets the engine, policies, role algebra and log build and test on any host.
+/// Holds a real process at a real syscall via `SECCOMP_RET_USER_NOTIF`.
+/// Linux-only.
 #[cfg(target_os = "linux")]
 pub mod backend_seccomp;
 pub mod checkpoint;
 pub mod config;
 pub mod engine;
-pub mod log;
-/// The oracle: the harness-owned detector run after each use. `observe` fires
-/// when a path's object identity changed across the attacker's turn; the full
-/// invariant battery grows here.
 pub mod oracle;
-pub mod policy;
 pub mod role;
 
 pub use config::ScenarioConfig;
 pub use engine::Engine;
 pub use engine::RunOutcome;
-pub use log::CanonicalLog;

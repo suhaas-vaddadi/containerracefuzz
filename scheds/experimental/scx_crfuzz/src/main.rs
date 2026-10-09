@@ -1,42 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// CLI entry point.
+// CLI entry point: one run of the sweep.
 //
-// There is no `--replay` / `--discover` flag: the mode is a property of the
-// config, which carries either `steps[]` or a `policy` block and never both
-// (design doc section 8). That is section 3.1's argument made operational --
-// one engine, one log format, used two ways.
-//
-// Which *processes* to launch is not in that schema, and deliberately stays
-// out of it: launching the scenario is the harness's job (Background, "Blast
-// radius and harness"), and section 6.1 makes the same separation for the
-// mutator. `--spawn` is a placeholder for the harness, not a schema addition.
+// Which processes to launch is not in the config: launching the scenario is
+// the harness's job (Background, "Blast radius and harness"), so `--spawn`
+// carries it.
 
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
-use scx_crfuzz::config::Mode;
-use scx_crfuzz::log::CanonicalLog;
-use scx_crfuzz::log::DebugLog;
-use scx_crfuzz::oracle::OracleVerdict;
+use scx_crfuzz::engine::Finding;
+use scx_crfuzz::engine::Window;
 use scx_crfuzz::RunOutcome;
 use scx_crfuzz::ScenarioConfig;
 use simplelog::ColorChoice;
 use simplelog::LevelFilter;
 use simplelog::TermLogger;
 use simplelog::TerminalMode;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "scx_crfuzz",
-    about = "ContainerRaceFuzz: deterministic replay and race discovery for container runtime TOCTOU bugs"
+    about = "ContainerRaceFuzz: sweep attack windows for container runtime TOCTOU bugs"
 )]
 struct Args {
-    /// Scenario config (JSON). Replay mode if it carries `steps`, discovery
-    /// mode if it carries `policy`.
+    /// Scenario config (JSON).
     #[arg(short, long)]
     config: PathBuf,
+
+    /// The window to attack, `<checkpoint>#<n>`; overrides `attack.at`.
+    /// Without either, this is a dry run that only lists the windows.
+    #[arg(long)]
+    at: Option<String>,
 
     /// A process to launch and instrument, as a whitespace-separated command
     /// line. Repeat for each. Linux only.
@@ -49,39 +46,31 @@ struct Args {
     #[arg(long, default_value = "/crfuzz/run0")]
     cgroup_path: String,
 
-    /// Hold thread groups with the `sched_ext` gate. Requires
-    /// `scx_crfuzz_gated` to be running.
+    /// Hold the victim's whole thread group with the `sched_ext` gate.
+    /// Requires `scx_crfuzz_gated` to be running.
     ///
-    /// On a checkpoint hit the gate declines to dispatch the held role's whole
-    /// thread group, so a multi-threaded target -- a Go binary such as `runc`
-    /// -- is held without restarting the syscall it sits in.
+    /// Without it only the thread at the checkpoint is held, and a Go
+    /// victim's other threads keep running through the attacker's window.
     #[arg(long)]
     gate: bool,
 
-    /// An OCI bundle to check before running: if its `linux.seccomp` profile
-    /// denies a syscall a checkpoint sits on, refuse to start.
+    /// An OCI bundle: refuse to start if its `linux.seccomp` profile denies a
+    /// syscall a checkpoint sits on, and read the container's cgroup from it
+    /// for victim matching.
     ///
-    /// Seccomp filters stack and the kernel takes the most restrictive action,
-    /// and `USER_NOTIF` -- the whole holding mechanism -- loses to `ERRNO`. A
-    /// profile that denies a checkpoint's syscall therefore erases that
-    /// checkpoint silently: no error, no failed release, the notification
-    /// simply never arrives. Refusing up front turns a timeout that looks like
-    /// an engine bug, or a discovery run that quietly explores less than it
-    /// claims, into a config error that says what is wrong.
+    /// Seccomp filters stack and `USER_NOTIF` -- the whole holding mechanism
+    /// -- loses to `ERRNO`, so a profile that denies a checkpoint's syscall
+    /// erases that checkpoint silently.
     #[arg(long, value_name = "DIR")]
     oci_bundle: Option<PathBuf>,
 
     /// Exit with the spawned process's status instead of the engine's verdict.
     ///
-    /// For standing in for the binary being instrumented. `ctr run
+    /// For standing in for the binary being instrumented: `ctr run
     /// --runc-binary <wrapper>` makes containerd's shim exec the wrapper where
     /// it would have exec'd `runc`, and the shim reads the exit status to
-    /// decide whether the container was created -- so reporting "the scheduling
-    /// run completed" there would tell it a container exists when it does not.
-    ///
-    /// Requires exactly one `--spawn`: with several there is no single status
-    /// to report. The engine's own outcome still goes to the log, and to
-    /// `--canonical-log` / `--project-schedule` if asked for.
+    /// decide whether the container was created. Requires exactly one
+    /// `--spawn`.
     #[arg(long)]
     exit_with_child: bool,
 
@@ -89,41 +78,28 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     poll_timeout_ms: u64,
 
-    /// Write the canonical log here instead of stdout.
+    /// Write the report (windows and findings) here instead of stdout.
     #[arg(long)]
-    canonical_log: Option<PathBuf>,
-
-    /// Write the projected replay schedule (design doc section 3.5) here.
-    #[arg(long)]
-    project_schedule: Option<PathBuf>,
-
-    /// Write the debug log (pids, timings) here. Never byte-compared.
-    #[arg(long)]
-    debug_log: Option<PathBuf>,
+    report: Option<PathBuf>,
 
     #[arg(short, long)]
     verbose: bool,
 }
 
-/// Whether the container's own seccomp profile would erase our checkpoints.
-///
-/// Binary-only, deliberately: the crate docs put OCI strictly upstream of the
-/// engine, so this sits with `--spawn` and `--cgroup-path` as harness work
-/// rather than inside the library.
+/// Whether the container's own seccomp profile would erase our checkpoints,
+/// and the container's cgroup. Binary-only, so the library never learns what
+/// OCI is.
 #[cfg(target_os = "linux")]
 mod oci_preflight;
 
 /// What a run produced, independent of which backend produced it.
 struct RunReport {
     outcome: RunOutcome,
-    canonical: CanonicalLog,
-    debug: DebugLog,
-    /// Oracle rulings, one per observed window. Empty unless `auto_attack`.
-    verdicts: Vec<(u64, OracleVerdict)>,
-    /// Backend-specific diagnostics, if any.
+    windows: Vec<Window>,
+    findings: Vec<Finding>,
+    attacked: bool,
     notes: Option<String>,
-    /// The spawned process's own exit status, for `--exit-with-child`. `None`
-    /// when there was no real process, or it was never reaped.
+    /// The spawned process's own exit status, for `--exit-with-child`.
     child_exit: Option<i32>,
 }
 
@@ -136,84 +112,77 @@ fn main() -> Result<()> {
             LevelFilter::Info
         },
         simplelog::Config::default(),
-        // Stderr, not Mixed: stdout carries the canonical log, and a run
-        // redirected to a file must produce a log that can be byte-compared,
-        // not one with log lines interleaved into it.
+        // Stderr: stdout carries the report.
         TerminalMode::Stderr,
         ColorChoice::Auto,
     )?;
 
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("reading {}", args.config.display()))?;
-    let config = ScenarioConfig::from_json(&text)
+    let mut config = ScenarioConfig::from_json(&text)
         .with_context(|| format!("parsing {}", args.config.display()))?;
-
+    if args.at.is_some() {
+        config.attack.at = args.at.clone();
+    }
+    let at = config.attack.at.clone();
     log::info!(
-        "scenario `{}`: {} role(s), {} checkpoint(s), mode {}",
-        config.scenario_id,
-        config.roles.len(),
+        "victim `{}`, {} checkpoint(s), {}",
+        config.victim.comm,
         config.checkpoints.len(),
-        match &config.mode {
-            Mode::Replay { steps } => format!("replay ({} steps)", steps.len()),
-            Mode::Discovery { policy } => format!("discovery ({:?})", policy.policy_type),
+        match &at {
+            Some(w) => format!("attacking {w}"),
+            None => "dry run".to_string(),
         }
     );
 
     let report = run(config, &args)?;
 
     log::info!(
-        "outcome: {:?} after {} decision(s)",
+        "outcome: {:?}, {} window(s), {} finding(s)",
         report.outcome,
-        report.canonical.len()
+        report.windows.len(),
+        report.findings.len()
     );
     if let Some(notes) = &report.notes {
         log::info!("{notes}");
     }
-
-    // Findings are the point of a discovery run: print each one plainly and
-    // summarise, so a run that found something is obvious in the log rather
-    // than buried in a warn line.
-    let findings: Vec<(u64, &str)> = report
-        .verdicts
-        .iter()
-        .filter_map(|(step, v)| match v {
-            OracleVerdict::Violation(reason) => Some((*step, reason.as_str())),
-            OracleVerdict::Clean => None,
-        })
-        .collect();
-    if !report.verdicts.is_empty() {
-        log::info!(
-            "oracle: {} window(s) observed, {} finding(s)",
-            report.verdicts.len(),
-            findings.len()
-        );
+    if let (Some(w), false) = (&at, report.attacked) {
+        log::error!("window {w} was never reached: nothing was attacked");
     }
-    for (step, reason) in &findings {
-        log::error!("FINDING at step {step}: {reason}");
+    for f in &report.findings {
+        log::error!("FINDING at {}: {}", f.seen_at, f.reason);
     }
 
-    match &args.canonical_log {
-        Some(p) => std::fs::write(p, report.canonical.render())?,
-        None => print!("{}", report.canonical.render()),
+    // One line per window, then per finding, then `unreached` if the selected
+    // window never came, tab-separated so the sweep can cut it. Paths under the
+    // bundle are written relative to it, so a run on a scratch copy compares
+    // with another.
+    let bundle = args.oci_bundle.as_deref().and_then(|b| std::fs::canonicalize(b).ok());
+    let mut out = String::new();
+    for w in &report.windows {
+        let path = w.path.as_ref().map(|p| {
+            match bundle.as_deref().and_then(|b| p.strip_prefix(b).ok()) {
+                Some(rel) => format!("<bundle>/{}", rel.display()),
+                None => p.display().to_string(),
+            }
+        });
+        let _ = writeln!(out, "window\t{}\t{}", w.key, path.as_deref().unwrap_or("-"));
     }
-    if let Some(p) = &args.project_schedule {
-        std::fs::write(
-            p,
-            serde_json::to_string_pretty(&report.canonical.project_to_steps())?,
-        )?;
+    for f in &report.findings {
+        let _ = writeln!(out, "finding\t{}\t{}", f.seen_at, f.reason);
     }
-    if let Some(p) = &args.debug_log {
-        std::fs::write(p, report.debug.render())?;
+    if let (Some(w), false) = (&at, report.attacked) {
+        let _ = writeln!(out, "unreached\t{w}");
+    }
+    match &args.report {
+        Some(p) => std::fs::write(p, out)?,
+        None => print!("{out}"),
     }
 
-    // A run that did not complete is a failed run, and the exit status should
-    // say so: these are driven from shell loops that need to tell the cases
-    // apart without parsing the log.
     if args.exit_with_child {
-        // Deliberately unconditional on the outcome: the caller asked to stand
-        // in for the child, and a wrapper that substitutes its own verdict on a
-        // timeout is exactly the failure this flag exists to avoid. The outcome
-        // was logged above either way.
+        // Unconditional on the outcome: the caller asked to stand in for the
+        // child, and substituting the engine's verdict is exactly what this
+        // flag exists to avoid. The outcome was logged above.
         match report.child_exit {
             Some(code) => std::process::exit(code),
             None => {
@@ -241,13 +210,19 @@ fn run(_config: ScenarioConfig, _args: &Args) -> Result<RunReport> {
 }
 
 #[cfg(target_os = "linux")]
-fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
+fn run(mut config: ScenarioConfig, args: &Args) -> Result<RunReport> {
     use scx_crfuzz::backend_seccomp::ProcessSpec;
     use scx_crfuzz::backend_seccomp::SeccompNotifyBackend;
     use std::time::Duration;
 
     if let Some(bundle) = &args.oci_bundle {
-        preflight_bundle(bundle, &config)?;
+        let path = bundle.join("config.json");
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        preflight_bundle(&path, &text, &config)?;
+        if config.container_cgroup.is_none() {
+            config.container_cgroup = oci_preflight::container_cgroup(&text)?;
+        }
     }
 
     if args.exit_with_child && args.spawn.len() != 1 {
@@ -257,10 +232,10 @@ fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
         );
     }
 
-    if !args.cgroup_path.starts_with(&config.cgroup) {
+    if !scx_crfuzz::config::under_cgroup(&args.cgroup_path, &config.cgroup) {
         anyhow::bail!(
             "--cgroup-path `{}` is not inside the config's cgroup `{}`, so no spawned \
-             process could ever match a role",
+             process could ever be the victim",
             args.cgroup_path,
             config.cgroup
         );
@@ -283,35 +258,24 @@ fn run(config: ScenarioConfig, args: &Args) -> Result<RunReport> {
             backend,
             |b| {
                 let s = b.stats();
-                format!(
-                    "{}\ngate: {} gate(s), {} ungate(s), max gate latency {:?} \
+                Some(format!(
+                    "gate: {} gate(s), {} ungate(s), max gate latency {:?} \
                      (the cost to issue the hold: notification to kick-complete, \
                      not the residual window before it takes effect)",
-                    b.inner().arrival_trace().join(" "),
-                    s.gates,
-                    s.ungates,
-                    s.max_gate_latency
-                )
+                    s.gates, s.ungates, s.max_gate_latency
+                ))
             },
             |b| b.inner().child_exit_code(),
         );
     }
 
-    run_engine(
-        config,
-        seccomp,
-        |b| b.arrival_trace().join(" "),
-        |b| b.child_exit_code(),
-    )
+    run_engine(config, seccomp, |_| None, |b| b.child_exit_code())
 }
 
 /// Refuse to run a scenario whose checkpoints the bundle's profile would erase.
 #[cfg(target_os = "linux")]
-fn preflight_bundle(bundle: &std::path::Path, config: &ScenarioConfig) -> Result<()> {
-    let path = bundle.join("config.json");
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let report = oci_preflight::check(&text, &config.checkpoints)?;
+fn preflight_bundle(path: &std::path::Path, text: &str, config: &ScenarioConfig) -> Result<()> {
+    let report = oci_preflight::check(text, &config.checkpoints)?;
 
     if !report.profile_present {
         log::info!(
@@ -362,34 +326,21 @@ fn preflight_bundle(bundle: &std::path::Path, config: &ScenarioConfig) -> Result
 }
 
 /// Drive an engine to completion and package what it produced.
-///
-/// Generic over the backend so the gate-wrapped and bare cases share one
-/// path; `arrival` is the only thing that differs, since reaching the section
-/// 14-A arrival trace means going through the wrapper when there is one.
 #[cfg(target_os = "linux")]
 fn run_engine<B: scx_crfuzz::backend::CheckpointBackend>(
     config: ScenarioConfig,
     backend: B,
-    arrival: impl FnOnce(&B) -> String,
+    notes: impl FnOnce(&B) -> Option<String>,
     child_exit: impl FnOnce(&B) -> Option<i32>,
 ) -> Result<RunReport> {
     let mut engine = scx_crfuzz::Engine::new(config, backend);
     let outcome = engine.run()?;
-    // Printed rather than only counted: section 14-A is a question about this
-    // exact sequence, and the only way to answer it is to compare it across
-    // runs.
-    let notes = format!("arrival: {}", arrival(engine.backend()));
-    let notes = format!(
-        "{notes}\nready-sets: {}",
-        engine.decision_trace().join(" | ")
-    );
-    let child_exit = child_exit(engine.backend());
     Ok(RunReport {
         outcome,
-        canonical: engine.canonical_log().clone(),
-        debug: engine.debug_log().clone(),
-        verdicts: engine.oracle_verdicts().to_vec(),
-        notes: Some(notes),
-        child_exit,
+        windows: engine.windows().to_vec(),
+        findings: engine.findings().to_vec(),
+        attacked: engine.attacked(),
+        notes: notes(engine.backend()),
+        child_exit: child_exit(engine.backend()),
     })
 }

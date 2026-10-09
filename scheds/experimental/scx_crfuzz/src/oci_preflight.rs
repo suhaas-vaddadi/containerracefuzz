@@ -18,10 +18,9 @@
 //! dropped the engine from 5 observed `openat` checkpoints to 4, with no error,
 //! no warning and no failed release.
 //!
-//! That silence is the whole problem. In replay a step naming the erased
-//! checkpoint can never be satisfied, so the run ends in a timeout that looks
-//! like an engine bug. In discovery the interleaving space is quietly smaller
-//! than it appears and the run reports "no race found". Both are worse than a
+//! That silence is the whole problem. The erased checkpoint's windows never
+//! appear in the dry run, so the sweep never attacks them and reports "no
+//! escape" over a space quietly smaller than it appears. That is worse than a
 //! refusal to start, which is what this module produces instead.
 //!
 //! **This lives in the binary, not the library.** The crate docs are explicit
@@ -89,6 +88,8 @@ struct OciConfig {
 #[derive(Deserialize)]
 struct OciLinux {
     seccomp: Option<OciSeccomp>,
+    #[serde(rename = "cgroupsPath")]
+    cgroups_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +112,11 @@ struct OciSyscallGroup {
 }
 
 /// Whether an action wins against `SCMP_ACT_NOTIFY` and so erases a checkpoint.
+///
+/// The order is the kernel's: `KILL_PROCESS > KILL_THREAD > TRAP > ERRNO >
+/// USER_NOTIF > TRACE > LOG > ALLOW`. `TRACE` sits *below* `USER_NOTIF`, so it
+/// loses to our notify filter and does not erase a checkpoint; listing it here
+/// would refuse a run that would in fact work.
 fn outranks_notify(action: &str) -> bool {
     matches!(
         action,
@@ -119,7 +125,6 @@ fn outranks_notify(action: &str) -> bool {
             | "SCMP_ACT_KILL"
             | "SCMP_ACT_TRAP"
             | "SCMP_ACT_ERRNO"
-            | "SCMP_ACT_TRACE"
     )
 }
 
@@ -199,6 +204,28 @@ pub fn check(config_json: &str, checkpoints: &[CheckpointDecl]) -> Result<Report
     Ok(report)
 }
 
+/// The cgroup runc moves the container into, as `/proc/<pid>/cgroup` spells it.
+///
+// ponytail: absolute cgroupfs paths only (what ctr and attack_run.sh write);
+// add the systemd `slice:prefix:name` form and runc's default when a bundle
+// needs them.
+pub fn container_cgroup(config_json: &str) -> Result<Option<String>> {
+    let cfg: OciConfig =
+        serde_json::from_str(config_json).context("parsing the bundle's config.json")?;
+    let path = cfg.linux.and_then(|l| l.cgroups_path);
+    Ok(match path {
+        Some(p) if p.starts_with('/') => Some(p),
+        Some(p) => {
+            log::warn!(
+                "linux.cgroupsPath `{p}` is not an absolute cgroupfs path: tasks in the \
+                 container's cgroup are the victim's only by genealogy"
+            );
+            None
+        }
+        None => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +236,15 @@ mod tests {
 
     fn bundle(seccomp: &str) -> String {
         format!(r#"{{ "ociVersion": "1.0.0", "linux": {{ "seccomp": {seccomp} }} }}"#)
+    }
+
+    #[test]
+    fn the_container_cgroup_is_read_when_absolute() {
+        let abs = r#"{ "linux": { "cgroupsPath": "/default/ctr1" } }"#;
+        assert_eq!(container_cgroup(abs).unwrap().as_deref(), Some("/default/ctr1"));
+        let systemd = r#"{ "linux": { "cgroupsPath": "system.slice:cri:ctr1" } }"#;
+        assert_eq!(container_cgroup(systemd).unwrap(), None);
+        assert_eq!(container_cgroup(r#"{ "linux": {} }"#).unwrap(), None);
     }
 
     #[test]
@@ -274,6 +310,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.masked.len(), 1);
+    }
+
+    /// `TRACE` sits *below* `USER_NOTIF` in the kernel's precedence order, so a
+    /// profile rule with `TRACE` loses to our notify filter and the checkpoint
+    /// still fires. Counting it as an erasure refused runs that would work.
+    #[test]
+    fn a_trace_action_does_not_erase_a_checkpoint() {
+        let r = check(
+            &bundle(
+                r#"{ "defaultAction": "SCMP_ACT_ALLOW",
+                     "syscalls": [{ "names": ["openat"], "action": "SCMP_ACT_TRACE" }] }"#,
+            ),
+            &[cp("openat")],
+        )
+        .unwrap();
+        assert!(
+            r.masked.is_empty(),
+            "USER_NOTIF outranks TRACE, so openat still notifies: {:?}",
+            r.masked
+        );
+        assert!(r.conditional.is_empty(), "{:?}", r.conditional);
     }
 
     /// The regression that motivated comparing numbers instead of names. A real

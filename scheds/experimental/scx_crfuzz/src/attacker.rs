@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // The attacker runner: the engine's side of invoking a user-authored attacker
-// inside a window (attacker brainstorm, "the attacker and the oracle are
+// inside the selected window (attacker brainstorm, "the attacker and the oracle are
 // separate"; attacker.md).
 //
 // In this orchestration the attacker is *not* a held role. The victim is frozen
@@ -91,6 +91,7 @@ mod tests {
     fn spec(argv: &[&str]) -> AttackDecl {
         AttackDecl {
             argv: argv.iter().map(|s| s.to_string()).collect(),
+            at: None,
         }
     }
 

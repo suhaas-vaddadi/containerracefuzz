@@ -30,11 +30,17 @@
 # be running.
 set -eu
 
+HERE=$(cd "$(dirname "$0")" && pwd)
 RUNC="${CRFUZZ_RUNC:-/usr/bin/runc}"
 BIN="${CRFUZZ_BIN:-/workspace/scx/target-linux/debug/scx_crfuzz}"
-CONFIG="${CRFUZZ_CONFIG:-$(cd "$(dirname "$0")" && pwd)/runc.json}"
+CONFIG="${CRFUZZ_CONFIG:-$HERE/runc_attack.json}"
 OUTDIR="${CRFUZZ_OUTDIR:-/tmp/crfuzz-runc}"
 CGROUP_ROOT="${CRFUZZ_CGROUP:-/crfuzz}"
+
+# The scenario config names its attacker by bare name (`attacker.sh`), so put
+# this directory on PATH: the engine resolves argv[0] through it, and unlike a
+# relative path that keeps working whatever working directory the shim uses.
+PATH="$HERE:$PATH"; export PATH
 
 # Find the subcommand: the first argument that is not a global flag and not a
 # global flag's value. Scanning for the literal string "create" would misfire on
@@ -85,10 +91,11 @@ set -- \
     --cgroup-path "$CGROUP_ROOT/$id" \
     --gate \
     --exit-with-child \
-    --canonical-log "$OUTDIR/$id.log" \
-    --debug-log "$OUTDIR/$id.debug" \
+    --report "$OUTDIR/$id.report" \
     --spawn "$RUNC $ARGS"
 
 [ -n "$bundle" ] && set -- "$@" --oci-bundle "$bundle"
+# The window to attack; unset is a dry run that lists the windows.
+[ -n "${CRFUZZ_AT:-}" ] && set -- "$@" --at "$CRFUZZ_AT"
 
 exec "$BIN" "$@"

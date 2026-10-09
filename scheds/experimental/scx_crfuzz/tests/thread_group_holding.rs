@@ -65,12 +65,16 @@ fn sibling_progress_while_held<B: CheckpointBackend>(
         );
         match backend.poll().expect("poll") {
             Poll::Events(events) => {
-                if events.iter().any(|e| {
-                    matches!(e, BackendEvent::CheckpointHit { .. })
-                }) {
-                    // The main thread is now parked inside the kernel. Whatever
-                    // the sibling writes from here on is a thread that the role
-                    // contract says should be held.
+                if let Some(&BackendEvent::CheckpointHit { pid, handle, .. }) = events
+                    .iter()
+                    .find(|e| matches!(e, BackendEvent::CheckpointHit { .. }))
+                {
+                    // The engine resolves a hit to the victim and only then
+                    // holds its whole thread group (`Engine::on_hit`); mirror
+                    // that sequence here. The main thread is now parked inside
+                    // the kernel. Whatever the sibling writes from here on is a
+                    // thread that the role contract says should be held.
+                    backend.hold(pid, handle).expect("hold");
                     let at_hit = progress_len(progress);
                     std::thread::sleep(OBSERVE);
                     return (at_hit, progress_len(progress));
