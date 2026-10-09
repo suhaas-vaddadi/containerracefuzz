@@ -4,8 +4,8 @@
 // notification for the whole hold, so the notification id the engine was given
 // stays valid and answerable. A thread-group hold must not disturb the syscall
 // it holds -- a restarted syscall re-enters the filter and raises a *second*
-// notification under a new id, which would corrupt the ready set and the
-// canonical log.
+// notification under a new id: a second window that never happened, and a
+// stale id for the one the engine holds.
 //
 // Driven through a raw `SeccompNotifyBackend` with `GateMap` applied by hand,
 // not through `GateBackend`: this is the one place low enough to see what the
@@ -43,7 +43,7 @@ fn skip_unless_scheduler(test: &str) -> bool {
     false
 }
 
-/// A single narrowed checkpoint, NOT `default_discovery_checkpoints()`: the
+/// A single narrowed checkpoint, NOT `default_checkpoints()`: the
 /// full structural set holds the fixture at its progress-file `openat`, which
 /// happens before the sibling thread is created. Matches the `newfstatat`
 /// narrowing `thread_group_holding.rs` already uses for this fixture.

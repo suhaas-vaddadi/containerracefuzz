@@ -1,60 +1,25 @@
-# Synthetic check-then-use scenario
+# Scenarios
 
-(Other fixtures here — `threaded_victim`, `go_victim`, `runc.json` — are covered
-in the crate README.)
-
-The minimal target the engine was first validated against (design doc §10.1,
-§10.2). Two single-threaded static C programs and a three-file fixture.
-
-| | syscalls it makes |
+| File | What it is |
 |---|---|
-| `victim` | `readlinkat` (glibc startup), `fstatat`, `openat` |
-| `racer` | `readlinkat` (glibc startup), `renameat` |
+| `runc_attack.json` | The runc scenario: victim `runc` (substring, so `runc:[2:INIT]` too), held at `mount` and `symlinkat`, attacked by `attacker.sh`. |
+| `attack_run.sh [window] [bundle] [id]` | One run against a scratch copy of an OCI bundle, under `--gate`. No window is a dry run. `CRFUZZ_CONFIG` picks the scenario. |
+| `sweep.sh [bundle] [outdir]` | Dry run, then one `attack_run.sh` per listed window; prints every finding. |
+| `fuzz.sh [bundle] [outdir]` | The seeded fuzzer: dry run, a reachability pass over the windows, then `CRFUZZ_FUZZ_SEEDS` seeds per reachable window. `(scenario, window, seed)` is the reproducer; the plan log records what each seed tried. |
+| `attacker.sh` | The attacker: a **seeded, compositional mutator**, not a CVE-preset table. `CRFUZZ_ATTACK_SEED` fixes the plan; the sampler picks a target (leaf or an in-scope ancestor) and a recipe from a verb grammar (`symlink`, `exchange`, `recreate`, `hardlink`, `tree`, `overmount`, `meta`, `chain`, `compose`), with host-internal link payloads. It writes a plan record (seed, checkpoint, status, target, recipe, payload, result, `known=0/1`) so a finding is a replayable `(scenario, window, seed)` and is classifiable old vs new. The CVE corpus survives only as the `known=` tag. See the header for the full contract. |
+| `runc_wrapper.sh` | Stands in for `runc` under `ctr run --runc-binary`; instruments only `runc create`. `CRFUZZ_AT` selects the window. |
+| `threaded_victim.c`, `go_victim.go` | Fixtures for the backend tests (`make` builds them). |
 
-The victim checks a path with `fstatat(AT_SYMLINK_NOFOLLOW)` — "is this a plain
-file, not a symlink?" — and then opens that path **by name**. The racer renames
-a pre-made symlink over it. Land the rename between the two and the victim
-reads a file it explicitly refused to accept.
+Run in the VM as root, with `scx_crfuzz_gated` attached. The engine binary is
+`$CRFUZZ_BIN`, defaulting to `/workspace/scx/target-linux/debug/scx_crfuzz`;
+build the guest side with `CARGO_TARGET_DIR=/workspace/scx/target-linux`, since
+host and guest share this checkout and macOS binaries in `./target` fail in the
+VM with "cannot execute binary file".
 
-Built `-static` on purpose: a dynamically-linked binary's loader makes dozens of
-`openat`/`readlinkat`/`fstatat` calls before `main`, every one of them a
-checkpoint in the §4.2 structural set. That is a real finding about
-instrumenting real targets — and noise in a scenario meant to isolate two
-syscalls. Even static glibc makes one `readlinkat` before `main`, which is why
-it shows up in every canonical log here.
-
-## Build and run
-
-```sh
-make                                     # all fixtures (see Makefile)
-./run.sh race_wins.json                  # swap lands between check and use
-./run.sh race_loses.json                 # swap lands after the use
-./experiment.sh <seed> <runs> <policy>   # distinct logs / arrival orders
-./flake.sh <seed> <runs>                 # §14-A: per-run reproducibility
-```
-
-The engine binary is taken from `$CRFUZZ_BIN`, defaulting to
-`/workspace/scx/target-linux/debug/scx_crfuzz`. **Build the guest side with a
-separate target dir:**
-
-```sh
-CARGO_TARGET_DIR=/workspace/scx/target-linux cargo build -p scx_crfuzz
-```
-
-Host and guest share this checkout over the VM mount. Without separate target
-dirs, a `cargo build` on the macOS host drops Mach-O binaries into `./target`
-and every subsequent run in the VM dies with "cannot execute binary file" —
-which, mid-experiment, looks exactly like a resource leak in the backend.
-
-## What the fixture is
-
-`setup.sh` builds it fresh, because the racer consumes the symlink by renaming
-it — the state is single-use, so every run needs a rebuild:
-
-- `target` — a regular file containing `BENIGN`, what the victim expects
-- `secret` — a file containing `SECRET`, what it must never read
-- `evil` — a symlink to `secret`, which the racer renames over `target`
-
-The victim's stdout is the oracle: `VERDICT:read=SECRET` (race won),
-`VERDICT:read=BENIGN` (swap too late), `VERDICT:refused-symlink` (swap too
-early — the check did its job).
+A report is tab-separated: `window <key> <path>` per victim hit (a path under
+the bundle is written `<bundle>/...`), then `finding <seen-at> <reason>`, then
+`unreached <key>` if the selected window never came. A window key is
+`<checkpoint>#<n>`, the victim's nth hit of that checkpoint. A finding in a dry
+run is a false positive; an attacked run keeps only findings first seen after
+the attack. The sweep flags a window whose path differs from the dry run's: two
+thread groups hit that checkpoint concurrently and the key moved.

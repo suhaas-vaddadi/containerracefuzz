@@ -24,11 +24,10 @@
 // gate set in-kernel in the trapping task's own context; see the spec's
 // "Residual window, and phase 2".
 //
-// Also not fixed: which thread inside a thread group arrives first. That is
-// section 14-A and the gate does not touch it. The gate makes the other
+// Also not fixed: which thread inside a thread group arrives first. The gate
+// does not touch it: it makes the other
 // threads stop; it does not make them stop in a chosen order.
 
-use crate::backend::BackendEvent;
 use crate::backend::CheckpointBackend;
 use crate::backend::NotifyHandle;
 use crate::backend::Poll;
@@ -126,29 +125,26 @@ impl<B: CheckpointBackend> CheckpointBackend for GateBackend<B> {
 
     fn poll(&mut self) -> Result<Poll> {
         self.check_still_attached()?;
-        let polled = self.inner.poll()?;
-        let Poll::Events(events) = polled else {
-            return Ok(polled);
-        };
+        // The group hold is applied in `hold`, once the engine has resolved the
+        // hit to the victim: the backend does not know victim-ness (that is the
+        // engine's job), so gating here would gate a bystander's siblings too.
+        self.inner.poll()
+    }
 
-        for event in &events {
-            let BackendEvent::CheckpointHit { pid, handle, .. } = event else {
-                continue;
-            };
-            let started = Instant::now();
-            let tgid = tgid_of(*pid);
-            self.map.gate(tgid)?;
-            // Gating only takes effect at a task's next enqueue, so a sibling
-            // already on-CPU needs a preempting kick to get there.
-            self.map.kick()?;
-            let latency = started.elapsed();
+    fn hold(&mut self, pid: Pid, handle: NotifyHandle) -> Result<()> {
+        self.check_still_attached()?;
+        let started = Instant::now();
+        let tgid = tgid_of(pid);
+        self.map.gate(tgid)?;
+        // Gating only takes effect at a task's next enqueue, so a sibling
+        // already on-CPU needs a preempting kick to get there.
+        self.map.kick()?;
+        let latency = started.elapsed();
 
-            self.owner.insert(*handle, tgid);
-            self.stats.gates += 1;
-            self.stats.max_gate_latency = self.stats.max_gate_latency.max(latency);
-        }
-
-        Ok(Poll::Events(events))
+        self.owner.insert(handle, tgid);
+        self.stats.gates += 1;
+        self.stats.max_gate_latency = self.stats.max_gate_latency.max(latency);
+        Ok(())
     }
 
     fn release(&mut self, handle: NotifyHandle) -> Result<()> {
@@ -157,12 +153,6 @@ impl<B: CheckpointBackend> CheckpointBackend for GateBackend<B> {
         // Order is load-bearing: ungate before answering the notification, or
         // the notifying thread returns from the kernel into a still-gated
         // thread group and is parked again immediately.
-        //
-        // No `handle == EXIT_HANDLE` special case: `owner` only ever gains an
-        // entry from a real `CheckpointHit`, so a synthetic exit -- or any
-        // other handle this backend never gated -- simply finds nothing here
-        // and falls through to answering the inner backend directly. The
-        // single not-found fallback is the whole story.
         if let Some(tgid) = self.owner.remove(&handle) {
             self.map.ungate(tgid)?;
             self.map.kick()?;
@@ -192,8 +182,8 @@ impl<B: CheckpointBackend> Drop for GateBackend<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendEvent;
     use crate::backend::StubBackend;
-    use crate::backend::EXIT_HANDLE;
     use crate::role::TaskInfo;
 
     fn task(pid: Pid) -> TaskInfo {
@@ -212,7 +202,7 @@ mod tests {
     //     read path, not the "pid does not exist" fallback these tests exist
     //     to cover. A synthetic tgid makes `/proc/<tgid>/status` genuinely
     //     absent, so `tgid_of` takes that fallback for real.
-    //   - Giving each test its own tgid also means the three tests -- which
+    //   - Giving each test its own tgid also means the tests -- which
     //     cargo runs concurrently in one binary against `GateMap`'s
     //     machine-global state -- cannot step on each other's gate-map entry.
     fn skip() -> bool {
@@ -251,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hit_gates_the_thread_group_and_release_ungates_it() {
+    fn a_hit_does_not_gate_until_the_victim_is_held() {
         if skip() {
             return;
         }
@@ -261,26 +251,18 @@ mod tests {
         let Poll::Events(e) = b.poll().unwrap() else { panic!() };
         let BackendEvent::CheckpointHit { handle, .. } = e[0].clone() else { panic!() };
 
-        assert_eq!(b.stats().gates, 1, "the hit gated something");
+        assert_eq!(
+            b.stats().gates,
+            0,
+            "delivering a hit does not gate: the engine has not resolved the victim yet"
+        );
+        b.hold(424245, handle).unwrap();
+        assert_eq!(
+            b.stats().gates,
+            1,
+            "holding the victim gates its whole thread group"
+        );
         b.release(handle).unwrap();
         assert_eq!(b.stats().ungates, 1, "the release ungated it");
-    }
-
-    #[test]
-    fn a_synthetic_exit_is_not_credited_as_an_ungate() {
-        // This does not exercise anything special-cased for `EXIT_HANDLE` --
-        // there isn't one. It verifies the general not-found fallback in
-        // `release()`: a handle `owner` never gained an entry for (of which
-        // a synthetic exit is one example) finds nothing to ungate and stats
-        // stay put.
-        if skip() {
-            return;
-        }
-        let inner = StubBackend::new().task(task(424246)).hit(424246, "openat");
-        let mut b = GateBackend::new(inner).unwrap();
-        b.poll().unwrap();
-        b.poll().unwrap();
-        b.release(EXIT_HANDLE).unwrap();
-        assert_eq!(b.stats().ungates, 0, "a synthetic exit has no task to ungate");
     }
 }

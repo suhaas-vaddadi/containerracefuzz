@@ -1,11 +1,10 @@
 [workspace]
 members = [
-    # The ContainerRaceFuzz engine and its two companions.
+    # The ContainerRaceFuzz engine and its gate.
     "scheds/experimental/scx_crfuzz",
     "scheds/experimental/scx_crfuzz_gate",
-    "scheds/experimental/scx_crfuzz_gen",
 
-    # Upstream scx crates retained because the three above need them:
+    # Upstream scx crates retained because the two above need them:
     # scx_crfuzz_gate depends on scx_utils (runtime) and scx_cargo (BPF build),
     # and scx_utils in turn depends on scx_stats.
     "rust/scx_cargo",

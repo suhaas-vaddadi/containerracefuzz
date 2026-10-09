@@ -7,10 +7,9 @@
 // mode, `ops.dispatch` declining to place a task on a CPU (Background,
 // "Checkpoint") -- is Linux-only, privileged, and
 // untestable off-target. It therefore lives behind this trait, so the engine's
-// phase machine, role resolution, policies and log can be exercised on any
-// host against `StubBackend`.
-//
-// The real backend is not implemented here. See `lib.rs`, "Seams".
+// loop, victim resolution and oracle calls can be exercised on any
+// host against `StubBackend`. The real ones are `backend_seccomp` and
+// `backend_gate`.
 
 use crate::checkpoint::CheckpointDecl;
 use crate::checkpoint::CheckpointId;
@@ -28,9 +27,6 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NotifyHandle(pub u64);
 
-/// The reserved handle for a synthetic exit hit, which has no task to release.
-pub const EXIT_HANDLE: NotifyHandle = NotifyHandle(u64::MAX);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendEvent {
     /// A task entered the scenario's scope and is available for role
@@ -46,7 +42,7 @@ pub enum BackendEvent {
         /// it (`checkpoint::path_arg_index` names the register, and the backend
         /// reads it from the target's memory). `None` for syscalls with no
         /// path argument, backends that do not capture arguments, or a capture
-        /// that failed. The attacker/oracle orchestration acts on this path.
+        /// that failed. The attacker is pointed at this path.
         path: Option<PathBuf>,
     },
     TaskExited(Pid),
@@ -64,18 +60,22 @@ pub enum Poll {
 }
 
 pub trait CheckpointBackend {
-    /// Attach the declared checkpoints. Called once, before `Barrier`.
-    ///
-    /// NOTE (design doc section 14-J, unresolved): for `one` roles this happens
-    /// before `Enforcing` begins, so nothing races it. Pool members, though,
-    /// can be recognised at any point (section 5), and the doc does not say
-    /// whether there is a window between a late member's first path-touching
-    /// syscall and attachment to it -- which would be a hole in the synchronous
-    /// holding guarantee for exactly those members. A real backend has to
-    /// answer this; the trait shape does not settle it either way.
+    /// Attach the declared checkpoints. Called once, before the first poll.
     fn attach(&mut self, checkpoints: &[CheckpointDecl]) -> Result<()>;
 
     fn poll(&mut self) -> Result<Poll>;
+
+    /// Extend the backend's hold to cover the victim's whole thread group.
+    ///
+    /// Called only for a `CheckpointHit` whose task the engine has resolved to
+    /// the victim, before it observes the window or runs the attacker. A backend
+    /// that already holds the calling thread (seccomp) needs nothing here; one
+    /// that holds a thread group (`--gate`) gates it now. Applying the group
+    /// hold only after resolution is what keeps a bystander's checkpoint from
+    /// freezing the bystander's siblings.
+    fn hold(&mut self, _pid: Pid, _handle: NotifyHandle) -> Result<()> {
+        Ok(())
+    }
 
     /// Let a held task proceed past its checkpoint.
     fn release(&mut self, handle: NotifyHandle) -> Result<()>;
@@ -88,14 +88,8 @@ pub trait CheckpointBackend {
 /// A scripted backend for testing the engine off-target.
 ///
 /// Each task has its own event queue. A task that hits a checkpoint is *held*
-/// and produces no further events until released, which is what lets a script
-/// put several roles at their own checkpoints simultaneously -- the situation
-/// section 3.2 introduces and that the base design never had to handle.
-///
-/// IMPORTANT (design doc section 14-A): the script fixes arrival order, so a
-/// green determinism test here says nothing about real processes, where
-/// arrival order is not reproducible. See the crate docs, "Section 14-A is no
-/// longer open".
+/// and produces no further events until released. The script fixes arrival
+/// order, so a green test here says nothing about real processes' timing.
 #[derive(Debug, Default)]
 pub struct StubBackend {
     /// Task pids in the order they were first scripted; drives emission order.
@@ -192,9 +186,7 @@ impl CheckpointBackend for StubBackend {
     }
 
     fn release(&mut self, handle: NotifyHandle) -> Result<()> {
-        if handle != EXIT_HANDLE {
-            self.held.remove(&handle);
-        }
+        self.held.remove(&handle);
         self.released.push(handle);
         Ok(())
     }
@@ -236,7 +228,6 @@ mod tests {
 
     #[test]
     fn two_tasks_can_be_held_at_their_own_checkpoints_at_once() {
-        // The situation section 3.2 introduces: a ready set with >1 member.
         let mut b = StubBackend::new()
             .task(task(10, "victim"))
             .task(task(20, "racer"))
@@ -261,17 +252,8 @@ mod tests {
     #[test]
     fn attach_records_what_it_was_given() {
         let mut b = StubBackend::new();
-        let cps = crate::checkpoint::default_discovery_checkpoints();
+        let cps = crate::checkpoint::default_checkpoints();
         b.attach(&cps).unwrap();
         assert_eq!(b.attached.len(), cps.len());
-    }
-
-    #[test]
-    fn releasing_the_exit_handle_is_a_no_op_that_cannot_unhold_a_task() {
-        let mut b = StubBackend::new().task(task(10, "v")).hit(10, "stat");
-        b.poll().unwrap();
-        b.poll().unwrap();
-        b.release(EXIT_HANDLE).unwrap();
-        assert_eq!(b.poll().unwrap(), Poll::Idle, "the real hold survives");
     }
 }

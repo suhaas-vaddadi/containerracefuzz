@@ -1,27 +1,25 @@
 # ContainerRaceFuzz
 
-Deterministic replay and race discovery for container-runtime TOCTOU bugs.
+Sweeps attack windows for container-runtime TOCTOU bugs.
 
-A scenario names **roles** (thread groups, matched by cgroup and comm) and
-**checkpoints** (syscalls where execution may be stopped). A **backend** holds
-tasks at those checkpoints and reports who is waiting. The **engine** keeps a
-**ready set** of held roles and asks a **policy** which one to release, one at a
-time, so exactly one role runs at any moment. Every release is appended to a
-**canonical log**, which projects back into a replayable schedule.
+The **victim** (runc) is held at every **checkpoint** (a syscall) it hits. A
+dry run lists those hits as **windows**; the sweep then runs once per window,
+and at that one window an **attacker** runs while the victim is frozen. An
+**oracle** then diffs the underlying objects those windows resolved. One attack
+per run makes every finding attributable, and the window is the reproducer.
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
-| [`scx_crfuzz`](scheds/experimental/scx_crfuzz) | The engine: roles, checkpoints, decision policies, the canonical log, and the checkpoint backends. Pure Rust; builds and tests on any host, macOS included. |
+| [`scx_crfuzz`](scheds/experimental/scx_crfuzz) | The engine: victim resolution, checkpoints, the sweep run, the attacker runner, the oracle, and the checkpoint backends. Pure Rust; builds and tests on any host, macOS included. |
 | [`scx_crfuzz_gate`](scheds/experimental/scx_crfuzz_gate) | The `sched_ext` scheduler that holds a whole thread group by declining to dispatch it, plus the `scx_crfuzz_gated` daemon. Linux only — it is a separate crate because BPF needs a `build.rs`, and a `build.rs` runs on every host. |
-| [`scx_crfuzz_gen`](scheds/experimental/scx_crfuzz_gen) | `crfuzz_gen`: derives a discovery-mode scenario config by tracing each role with `strace` and keeping only the paths two or more roles touch. |
 
 ## Building
 
 ```bash
-cargo test -p scx_crfuzz     # 103 tests on any host; 124 on Linux, which adds
-                             # the seccomp and gate backend tests
+cargo test -p scx_crfuzz     # any host; on Linux it adds the seccomp and
+                             # gate backend tests (root, gate attached)
 cargo build --workspace      # scx_crfuzz_gate needs Linux, clang and libbpf
 ```
 

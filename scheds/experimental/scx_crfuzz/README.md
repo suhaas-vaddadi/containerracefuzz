@@ -1,26 +1,23 @@
 # scx_crfuzz — ContainerRaceFuzz engine
 
-Enforces a chosen ordering of execution across the processes of a real
-container lifecycle, so a TOCTOU race happens on demand rather than by chance.
-
-- **Replay** enforces a written schedule — to reproduce a known bug.
-- **Discovery** decides which held role moves next — to find one.
-
-The modes differ only in the answer to "what runs next", which is the
-`DecisionPolicy` interface. Both write the same canonical log, so a discovery
-finding becomes a replay schedule by dropping a field. A config carries either
-`steps[]` (replay) or a `policy` block (discovery), never both.
-
-Design doc: `docs/sched_replay/design_doc.md`, one level above this checkout.
+Sweeps attack windows in a real container lifecycle, so a TOCTOU race is won
+by construction rather than by timing.
 
 ## How it works
 
-A scenario names **roles** (thread groups, matched by cgroup and `comm`) and
-**checkpoints** (syscalls). A **backend** holds each role at its checkpoints;
-the **engine** keeps the held roles in a **ready set** and asks a **policy**
-which to release, one at a time. Tasks that match no role are released
-immediately — the engine can't hang unrelated work, but a mismatched `comm`
-silently lets a target run free.
+A scenario names the **victim** (thread groups matched by cgroup and `comm`,
+plus their threads and children) and **checkpoints** (syscalls). The backend
+holds the victim at every checkpoint hit. Each hit is a **window**, keyed
+`<checkpoint>#<n>` (the victim's nth hit of that checkpoint). At one selected
+window the engine runs the **attacker** on the path the syscall resolved, while
+the victim is frozen; it then releases the victim. Tasks that are not the
+victim's are released immediately.
+
+A dry run (no window) lists the windows. The sweep (`scenarios/sweep.sh`) then
+runs once per window. One attack per run makes every finding that window's
+doing, and `(scenario, window)` is the reproducer. This finds races whose
+trigger is one swap between a check and a use; two swaps at two windows would
+need a sweep over pairs.
 
 | Backend | Holds | Notes |
 |---|---|---|
@@ -37,23 +34,50 @@ a 300 ms hold:
 | `threaded_victim.c` | 2 | 255 | 0 |
 | `go_victim.go` | 11 | 920 | 0 |
 
-Policies: `FixedSchedule` (replay), `OrderedWalk` (discovery), plus the
-`auto_attack` orchestration (discovery; runs an attacker on each use's path and
-an oracle after — see `docs/arch/policies.md`). The oracle is `oracle::observe`
-(`src/oracle.rs`): it flags a path whose object identity changed across the
-attacker's turn — type or inode — the signature of a substitution. The full
-invariant battery is future work.
+## Oracle
+
+The oracle (`src/oracle.rs`) is a lightweight object diff. The engine collects
+the path every window resolved; around the attacked window it takes an object
+token of each before the attacker runs and again after, and reports any object
+that changed. The token is a cheap, per-run-keyed hash of the object's identity
+and metadata (device, inode, mode, owner, link count, size, mtime and ctime
+with nanoseconds) -- one stat per path, no reads.
+
+A finding is therefore always a change to a watched object, attributed to the
+attacked window; detection does not depend on the attacker, so a new attacker
+gets it for free.
+
+**Coverage.** This is deliberately a minimal, lightweight subset of the bug
+space. It sees object substitution and mutation (the leaf, content and
+ancestor-redirection families). It does **not** see, and does not claim to:
+pure reads (a canary-style leak leaves no object change), mount-table changes
+that touch no watched path, cwd or directory-fd escapes, or privilege changes.
+Those are future work.
+
+## Config
+
+```json
+{
+  "cgroup": "/crfuzz",
+  "victim": { "comm": "runc", "comm_match": "substring" },
+  "checkpoints": [{ "id": "mount", "kind": "syscall", "target": "mount" }],
+  "attack": { "argv": ["attacker.sh", "{path}"], "at": "mount#3" },
+  "oracle": {}
+}
+```
+
+`checkpoints` defaults to the whole structural set; `at` and `oracle` are
+optional, and `--at` overrides `at`.
 
 ## Build and test
 
 ```bash
-cargo test -p scx_crfuzz      # 103 tests; any host, macOS included
+cargo test -p scx_crfuzz      # any host, macOS included
 ```
 
-The engine is pure Rust with no `build.rs`. The seccomp and gate backends are
-`#[cfg(target_os = "linux")]`. On Linux the same command runs 124; the
-Linux-only integration tests skip unless root, and the gate cases
-unless `scx_crfuzz_gated` is attached. In the VM:
+On Linux the same command adds the seccomp and gate backend tests, which skip
+unless root, and the gate cases unless `scx_crfuzz_gated` is attached. In the
+VM:
 
 ```bash
 CARGO_TARGET_DIR=/workspace/scx/target-linux cargo build -p scx_crfuzz -p scx_crfuzz_gate
@@ -62,90 +86,32 @@ sudo /workspace/scx/target-linux/debug/scx_crfuzz_gated &
 sudo CARGO_TARGET_DIR=/workspace/scx/target-linux cargo test -p scx_crfuzz
 ```
 
-Use a separate target dir in the guest: host and guest share the checkout, and
-macOS binaries in `./target` fail in the VM with "cannot execute binary file".
-
 ## Run
 
-In the VM, as root:
+See [`scenarios/README.md`](scenarios/README.md). In the VM, as root:
 
 ```bash
-cd scheds/experimental/scx_crfuzz/scenarios && make
-./run.sh race_wins.json            # swap lands between check and use
-./run.sh race_loses.json           # swap lands after the use
-./run.sh race_wins.json --gate     # hold whole thread groups
-./go_run.sh                        # Go victim; thread-group hold via --gate
+./attack_run.sh                 # dry run: list runc's windows
+./attack_run.sh mount#3         # attack one window
+./sweep.sh                      # every window
 ```
 
-### runc
+Under containerd, intercept the `runc` the shim execs:
 
 ```bash
-sudo scx_crfuzz --config scenarios/runc.json --cgroup-path /crfuzz/runc0 \
-    --gate --spawn "/usr/bin/runc run -b /tmp/bundle ctr1"
+sudo CRFUZZ_AT=mount#3 ctr run --rm --runc-binary scenarios/runc_wrapper.sh \
+    docker.io/library/busybox:latest ctr1 /bin/sleep 30
 ```
 
-The runc scripts use `--gate`. The gate is validated against runc: one
-`runc run` issues 37 holds across its `mount`/`symlinkat` setup, and runc's
-whole thread group sits at each.
+## Things to know
 
-Use `comm_match: substring` (`runc init`'s comm is `runc:[2:INIT]`). A full
-`runc run` is 279 structural syscalls across 31 tasks; two tasks notify, and
-both resolve to one role through the parent-thread-group rule.
-
-### containerd
-
-Intercept the `runc` the shim execs; containerd is unchanged:
-
-```bash
-sudo ctr run --rm --runc-binary scenarios/runc_wrapper.sh \
-    docker.io/library/busybox:latest ctr1 /bin/echo hello
-```
-
-The wrapper instruments only `runc create`, under `--gate`. It passes
-`--exit-with-child` so the shim sees runc's exit status rather than the
-engine's verdict, and `--oci-bundle` from runc's `--bundle`.
-`--exit-with-child` allows one `--spawn`, so no racer can run alongside yet.
-
-### runc auto-attack
-
-```bash
-./attack_run.sh [bundle] [id]   # swap attacker + oracle, --gate
-```
-
-One command for the whole orchestration: it copies the bundle to a scratch dir,
-scopes the attacker to it (`CRFUZZ_ATTACK_ROOT`), and runs `scx_crfuzz` in
-`auto_attack` mode. The attacker (`scenarios/swap_attacker.sh`) attempts a
-symlink exchange, an unlink-and-recreate, and a bind mount on each held path;
-the oracle reports any path whose object type changed.
-
-### `--oci-bundle`
-
-Seccomp filters stack and `ERRNO` beats `USER_NOTIF`, so a bundle profile that
-denies a checkpoint's syscall erases it silently. `--oci-bundle <dir>` compares
-syscall numbers against the bundle's profile and refuses to start if any
-checkpoint is masked. Only denied syscalls in the container payload are
-affected; runc's own work happens before the profile is installed.
-
-## Things to know before reading the code
-
-- **A step is one release, not "run until".** `{ "role": "victim", "until":
-  "mount" }` lets the victim past exactly one `mount`, so a schedule names
-  every release (the Go victim needs five leading `openat`s). Use
-  `--project-schedule` or `scx_crfuzz_gen` instead of writing them by hand.
-- **Same seed ≠ same run** for position-indexing policies. About one run in a
-  few hundred, two roles reach their first checkpoint in the other order
-  (§14-A, `scenarios/flake.sh`). `OrderedWalk` draws its target role from the
-  seed alone and is unaffected.
+- **`--oci-bundle`** refuses to start if the bundle's seccomp profile denies a
+  checkpoint's syscall: filters stack, `ERRNO` beats `USER_NOTIF`, and the
+  checkpoint would silently never fire.
 - **The gate caps holds at 30 s.** Longer trips the `sched_ext` watchdog, which
   ejects the scheduler and releases every gate on the machine. `GateBackend`
   detects the ejection and fails the run.
+- **Use `comm_match: substring` for runc** (`runc init`'s comm is
+  `runc:[2:INIT]`).
 - **On aarch64, 15 of the 44 structural syscalls don't exist** (the legacy
-  x86_64 names); each has an `*at` form in the set that does, and the backend
-  warns about the rest. The set holds only syscalls that can be the *use* in a
-  check-then-use race; see design doc §4.2 for why checks are left out.
-- **Open design questions** are marked where they bite: §14-C (`RoleRef`), §14-D (`CanonicalLog`), §14-H (`RunOutcome`), §14-J
-  (`CheckpointBackend::attach`).
-
-Not built: mutator, campaign driver, Class B PID-reuse (see "Seams" in
-`src/lib.rs`). The oracle is the first real one; its full invariant battery is
-still future work.
+  x86_64 names); each has an `*at` form in the set that does.

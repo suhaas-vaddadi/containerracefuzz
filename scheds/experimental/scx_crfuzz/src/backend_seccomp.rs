@@ -11,9 +11,9 @@
 // instruction past the checkpointed syscall until released, because the kernel
 // itself, not this program's reaction time, is what blocks it.
 //
-// This needs no eBPF and no `sched_ext` attach. All 21 entries of the section
-// 4.2 structural set are `syscall` checkpoints, so this one mechanism covers
-// the whole default discovery checkpoint set.
+// This needs no eBPF and no `sched_ext` attach. Every entry of the section 4.2
+// structural set is a `syscall` checkpoint, so this one mechanism covers the
+// whole default checkpoint set.
 //
 // WHAT THIS BACKEND DOES NOT DO, and why the design doc needs the second
 // mechanism as well: seccomp user-notification holds the *thread* that made the
@@ -29,7 +29,6 @@ use crate::backend::BackendEvent;
 use crate::backend::CheckpointBackend;
 use crate::backend::NotifyHandle;
 use crate::backend::Poll;
-use crate::backend::EXIT_HANDLE;
 use crate::checkpoint::CheckpointDecl;
 use crate::checkpoint::CheckpointId;
 use crate::role::Pid;
@@ -136,10 +135,9 @@ pub struct SeccompNotifyBackend {
     /// Syscall number -> the checkpoint id the config declared for it.
     ///
     /// The *config's* spelling wins over the kernel's canonical name, so a
-    /// schedule stays matched to the checkpoints its author wrote. Without
-    /// this, a config saying `fstatat` would never match an aarch64 kernel
-    /// reporting `newfstatat`, and replay would diverge for a reason that has
-    /// nothing to do with the scenario.
+    /// window key stays matched to the checkpoints its author wrote. Without
+    /// this, a config saying `fstatat` would key its windows `newfstatat#<n>`
+    /// on aarch64, and `--at fstatat#<n>` would never be reached.
     watched: HashMap<i32, CheckpointId>,
     /// Notification id -> the fd it must be answered on.
     pending: HashMap<u64, RawFd>,
@@ -151,24 +149,6 @@ pub struct SeccompNotifyBackend {
     /// un-enrolled task stays on CFS, which is exactly what the non-`--gate`
     /// paths want.
     sched_ext: bool,
-    /// Every notification, in the order it was received, as
-    /// `<spawn index>:<checkpoint>`.
-    ///
-    /// This is the direct measurement for design doc section 14-A. Section 10.1
-    /// claims ordering determinism "holds trivially if `decide()` is a pure
-    /// function of `(seed, ready-set-sequence)`" -- but that constrains only
-    /// `decide()`. 14-A points out it says nothing about whether the
-    /// ready-set-sequence is itself reproducible, since arrival order is a
-    /// function of real OS scheduling races between processes independently
-    /// approaching their own checkpoints.
-    ///
-    /// Deliberately free of pids and timings, for the same reason the canonical
-    /// log is (Background): they differ every run by construction, so including
-    /// them would make two runs incomparable and answer nothing. The spawn
-    /// index is stable because it is the position of the `--spawn` argument,
-    /// and it is taken from the listener fd the notification arrived on, so a
-    /// fork/exec descendant is attributed to the tree it belongs to.
-    arrival: Vec<String>,
 }
 
 impl SeccompNotifyBackend {
@@ -182,7 +162,6 @@ impl SeccompNotifyBackend {
             announced: Vec::new(),
             poll_timeout: Duration::from_millis(50),
             sched_ext: false,
-            arrival: Vec::new(),
         }
     }
 
@@ -194,11 +173,6 @@ impl SeccompNotifyBackend {
     pub fn with_poll_timeout(mut self, d: Duration) -> Self {
         self.poll_timeout = d;
         self
-    }
-
-    /// The ready-set arrival order, for section 14-A. See `arrival`.
-    pub fn arrival_trace(&self) -> &[String] {
-        &self.arrival
     }
 
     /// Resolve declared `syscall` checkpoints to numbers on this architecture.
@@ -350,13 +324,6 @@ impl SeccompNotifyBackend {
                     if let Some(i) = self.listeners.iter().position(|l| l.child == raw) {
                         self.listeners[i].reaped = true;
                         self.listeners[i].exit_code = Some(code);
-                        // An exit becomes a ready-set entry too (the engine
-                        // turns it into a synthetic `exit` checkpoint), so
-                        // section 14-A applies to exits exactly as it does to
-                        // checkpoint hits -- and exits arrive by a completely
-                        // separate channel (waitpid) from notifications, with
-                        // no ordering relationship between the two.
-                        self.arrival.push(format!("{i}:exit"));
                     }
                     events.push(BackendEvent::TaskExited(raw));
                 }
@@ -710,8 +677,7 @@ impl CheckpointBackend for SeccompNotifyBackend {
                     // first notification is that exec if `execve` is watched.
                     // It is the backend's own action, not the target's: let it
                     // through unreported, so it neither reaches the engine
-                    // under the engine's own `comm` nor shows up in the
-                    // arrival trace section 14-A's experiments compare.
+                    // under the engine's own `comm` nor becomes a window.
                     let listener = &mut self.listeners[spawn_idx];
                     if !listener.launched && pid == listener.child {
                         listener.launched = true;
@@ -754,7 +720,6 @@ impl CheckpointBackend for SeccompNotifyBackend {
                     // orchestration can point the attacker at it. Best-effort:
                     // a failure leaves `path` None and the run continues.
                     let path = capture_path(pid, &req.data.args, &name, fd, req.id);
-                    self.arrival.push(format!("{spawn_idx}:{checkpoint}"));
                     self.pending.insert(req.id, fd);
                     events.push(BackendEvent::CheckpointHit {
                         pid,
@@ -784,9 +749,6 @@ impl CheckpointBackend for SeccompNotifyBackend {
     }
 
     fn release(&mut self, handle: NotifyHandle) -> Result<()> {
-        if handle == EXIT_HANDLE {
-            return Ok(());
-        }
         let Some(fd) = self.pending.remove(&handle.0) else {
             log::warn!("release of unknown notification id {}", handle.0);
             return Ok(());
