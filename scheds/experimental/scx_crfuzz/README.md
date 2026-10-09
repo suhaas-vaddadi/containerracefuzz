@@ -41,7 +41,11 @@ the path every window resolved; around the attacked window it takes an object
 token of each before the attacker runs and again after, and reports any object
 that changed. The token is a cheap, per-run-keyed hash of the object's identity
 and metadata (device, inode, mode, owner, link count, size, mtime and ctime
-with nanoseconds) -- one stat per path, no reads.
+with nanoseconds) -- one stat per path, no reads. Set
+`"oracle": { "content": true }` to also fold in a regular file's first 64 KiB
+(or a symlink's target) and to content-token each immediate child of a watched
+directory, so a canary file the attacker plants in a swapped directory is
+reported by name.
 
 A finding is therefore always a change to a watched object, attributed to the
 attacked window; detection does not depend on the attacker, so a new attacker
@@ -62,7 +66,7 @@ Those are future work.
   "victim": { "comm": "runc", "comm_match": "substring" },
   "checkpoints": [{ "id": "mount", "kind": "syscall", "target": "mount" }],
   "attack": { "argv": ["attacker.sh", "{path}"], "at": "mount#3" },
-  "oracle": {}
+  "oracle": { "content": false }
 }
 ```
 
