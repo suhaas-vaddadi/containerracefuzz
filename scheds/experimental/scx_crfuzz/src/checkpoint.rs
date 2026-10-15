@@ -209,6 +209,38 @@ pub fn path_arg_index(name: &str) -> Option<usize> {
     Some(idx)
 }
 
+/// The dirfd register the primary path resolves against: the one just before
+/// it, for every `*at`-shaped form. `None` for the absolute/cwd-relative forms
+/// (`symlink`'s and `mount`'s path sits at index 1 with no dirfd before it).
+pub fn dirfd_arg_index(name: &str) -> Option<usize> {
+    match (name, path_arg_index(name)?) {
+        ("symlink" | "mount", _) | (_, 0) => None,
+        (_, i) => Some(i - 1),
+    }
+}
+
+/// Whether the checkpoint's primary path is *rebound* -- created, removed,
+/// renamed, retargeted or its object changed -- rather than merely resolved.
+/// Two resolves never conflict (`key`).
+///
+/// ponytail: an open is a resolve even with `O_CREAT`/`O_TRUNC`; per-argument
+/// direction from the flags is #12.
+pub fn rebinds(name: &str) -> bool {
+    let name = canonical_syscall(name);
+    STRUCTURAL_SYSCALLS.contains(&name)
+        && !matches!(
+            name,
+            "open"
+                | "openat"
+                | "openat2"
+                | "execve"
+                | "execveat"
+                | "chdir"
+                | "open_tree"
+                | "fspick"
+        )
+}
+
 /// The default `checkpoints[]`: the whole structural set. Supplying
 /// `checkpoints[]` overrides it, which is how a scenario narrows its windows.
 pub fn default_checkpoints() -> Vec<CheckpointDecl> {
@@ -264,5 +296,24 @@ mod tests {
         assert_eq!(path_arg_index("chdir"), Some(0));
         // A syscall we do not resolve a path for degrades to None.
         assert_eq!(path_arg_index("fchmod"), None);
+    }
+
+    #[test]
+    fn the_dirfd_is_the_register_before_an_at_forms_path() {
+        assert_eq!(dirfd_arg_index("open"), None);
+        assert_eq!(dirfd_arg_index("openat"), Some(0));
+        assert_eq!(dirfd_arg_index("symlinkat"), Some(1)); // (target, DIRFD, linkpath)
+        assert_eq!(dirfd_arg_index("symlink"), None);
+        assert_eq!(dirfd_arg_index("mount"), None);
+        assert_eq!(dirfd_arg_index("fchmod"), None);
+    }
+
+    #[test]
+    fn opens_resolve_and_entry_mutations_rebind() {
+        assert!(!rebinds("openat"));
+        assert!(!rebinds("chdir"));
+        assert!(rebinds("renameat2"));
+        assert!(rebinds("unlinkat"));
+        assert!(rebinds("mount"));
     }
 }

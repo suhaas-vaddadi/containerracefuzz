@@ -24,6 +24,7 @@ use crate::backend::NotifyHandle;
 use crate::backend::Poll;
 use crate::checkpoint::CheckpointId;
 use crate::config::ScenarioConfig;
+use crate::key::ConflictKey;
 use crate::oracle::Oracle;
 use crate::role::Pid;
 use crate::role::Victims;
@@ -51,6 +52,8 @@ pub struct Window {
     pub key: String,
     /// The path the held syscall resolved, when the backend captured it.
     pub path: Option<PathBuf>,
+    /// That path's resolution key, when the backend walked it.
+    pub keys: Vec<ConflictKey>,
 }
 
 /// An oracle finding: an object the attacked window changed, and the window
@@ -149,7 +152,8 @@ impl<B: CheckpointBackend> Engine<B> {
                 checkpoint,
                 handle,
                 path,
-            } => self.on_hit(pid, checkpoint, handle, path)?,
+                keys,
+            } => self.on_hit(pid, checkpoint, handle, path, keys)?,
         }
         Ok(())
     }
@@ -160,6 +164,7 @@ impl<B: CheckpointBackend> Engine<B> {
         checkpoint: CheckpointId,
         handle: NotifyHandle,
         path: Option<PathBuf>,
+        keys: Vec<ConflictKey>,
     ) -> Result<()> {
         // Not the victim's: release at once and never record it. A bug here
         // must not be able to hang unrelated work on the machine.
@@ -208,7 +213,7 @@ impl<B: CheckpointBackend> Engine<B> {
         }
 
         log::debug!("window {key} pid {pid} path {path:?}");
-        self.windows.push(Window { key, path });
+        self.windows.push(Window { key, path, keys });
         self.backend.release(handle)
     }
 }

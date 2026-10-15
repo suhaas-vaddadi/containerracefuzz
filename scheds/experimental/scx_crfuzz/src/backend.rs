@@ -13,6 +13,7 @@
 
 use crate::checkpoint::CheckpointDecl;
 use crate::checkpoint::CheckpointId;
+use crate::key::ConflictKey;
 use crate::role::Pid;
 use crate::role::TaskInfo;
 use anyhow::Result;
@@ -44,6 +45,10 @@ pub enum BackendEvent {
         /// path argument, backends that do not capture arguments, or a capture
         /// that failed. The attacker is pointed at this path.
         path: Option<PathBuf>,
+        /// The resolution key of that path: the chain the walk took to reach
+        /// it, tagged resolve or rebind. Empty whenever `path` is `None`, or
+        /// the walk could not open its anchor.
+        keys: Vec<ConflictKey>,
     },
     TaskExited(Pid),
 }
@@ -136,6 +141,7 @@ impl StubBackend {
             checkpoint: CheckpointId::new(checkpoint),
             handle,
             path: path.map(PathBuf::from),
+            keys: Vec::new(),
         });
         self
     }

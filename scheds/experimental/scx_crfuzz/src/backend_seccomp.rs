@@ -31,6 +31,9 @@ use crate::backend::NotifyHandle;
 use crate::backend::Poll;
 use crate::checkpoint::CheckpointDecl;
 use crate::checkpoint::CheckpointId;
+use crate::key::ConflictKey;
+use crate::key::Direction;
+use crate::key::ObjToken;
 use crate::role::Pid;
 use crate::role::TaskInfo;
 use anyhow::anyhow;
@@ -496,40 +499,72 @@ fn read_task_info(pid: Pid) -> Result<TaskInfo> {
     })
 }
 
-/// Capture the path a held use-shaped syscall resolved, for the attacker/oracle
-/// orchestration (attacker brainstorm, "The window model").
+/// Capture the path a held use-shaped syscall resolves -- as written, for the
+/// attacker/oracle orchestration (attacker brainstorm, "The window model"), and
+/// as its resolution key (`walk`).
 ///
 /// The seccomp notification carries the syscall's raw register arguments; the
 /// path is a userspace pointer in one of them (`checkpoint::path_arg_index`
 /// names which). The pointer is into the *target's* address space, so it is read
-/// from `/proc/<pid>/mem`. The target is parked in its notification, so the
-/// memory is stable while it is held.
+/// from `/proc/<pid>/mem`, and the walk then resolves it from the target's own
+/// root, cwd or dirfd. Both run before the engine's hold lands, so a sibling
+/// thread can still change the memory or a component mid-walk: the residual
+/// window the gate measures.
 ///
-/// After reading, the notification id is revalidated: if the target was killed
-/// between the notification and the read, the address space we read is
-/// meaningless, so the path is dropped. Returns `None` for a syscall with no
-/// path argument, a NULL pointer, or any read/validation failure -- the engine
-/// treats a missing path as "no path", never as an error.
-fn capture_path(
+/// After the walk, the notification id is revalidated: if the target died (and
+/// its pid could be reused) since the notification, what was read and walked
+/// is meaningless, so both are dropped. Returns `None` and no keys for a
+/// syscall with no path argument, a NULL pointer, or any read/validation
+/// failure -- the engine treats a missing path as "no path", never as an error.
+fn capture(
     pid: Pid,
     args: &[u64; 6],
     syscall_name: &str,
     fd: RawFd,
     id: u64,
-) -> Option<PathBuf> {
-    let idx = crate::checkpoint::path_arg_index(syscall_name)?;
-    let addr = *args.get(idx)?;
-    if addr == 0 {
-        return None;
-    }
-    let bytes = read_cstr_from_mem(pid, addr)?;
-    // The read above dereferenced the target's memory; only trust it if the
-    // notification is still live (the kernel invalidates the id when the target
-    // dies). This is the mandatory guard for reading a notified task's memory.
+) -> (Option<PathBuf>, Vec<ConflictKey>) {
+    let Some(bytes) = crate::checkpoint::path_arg_index(syscall_name)
+        .map(|i| args[i])
+        .filter(|addr| *addr != 0)
+        .and_then(|addr| read_cstr_from_mem(pid, addr))
+    else {
+        return (None, Vec::new());
+    };
+    // The register is a u64; a dirfd is its low 32 bits (`AT_FDCWD` is -100).
+    let dirfd = crate::checkpoint::dirfd_arg_index(syscall_name).map(|i| args[i] as i32);
+    // ponytail: only `open`/`openat` read their flags; every other syscall
+    // follows a final symlink. Per-syscall leaf handling (lstat, unlink) is #12.
+    let flags = match syscall_name {
+        "open" => args[1],
+        "openat" => args[2],
+        _ => 0,
+    } as i32;
+    let token = crate::walk::file_token(pid, dirfd, &bytes, flags & libc::O_NOFOLLOW == 0);
+    // This is the mandatory guard for reading a notified task's memory and
+    // /proc: only trust them if the notification is still live (the kernel
+    // invalidates the id when the target dies).
     if libseccomp::notify_id_valid(fd, id).is_err() {
-        return None;
+        return (None, Vec::new());
     }
-    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    if token.is_none() {
+        log::debug!("pid {pid}: could not open the anchor to walk {syscall_name}");
+    }
+    let dir = if crate::checkpoint::rebinds(syscall_name) {
+        Direction::Rebind
+    } else {
+        Direction::Resolve
+    };
+    let keys = token
+        .map(|t| ConflictKey {
+            obj: ObjToken::File(t),
+            dir,
+        })
+        .into_iter()
+        .collect();
+    (
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes))),
+        keys,
+    )
 }
 
 /// Read a NUL-terminated C string from another process's memory, capped at
@@ -716,16 +751,18 @@ impl CheckpointBackend for SeccompNotifyBackend {
                     if name == "execve" || name == "execveat" {
                         self.announced.retain(|p| *p != pid);
                     }
-                    // Capture the path this use-shaped syscall resolved, so the
-                    // orchestration can point the attacker at it. Best-effort:
-                    // a failure leaves `path` None and the run continues.
-                    let path = capture_path(pid, &req.data.args, &name, fd, req.id);
+                    // Capture the path this use-shaped syscall resolves, so the
+                    // orchestration can point the attacker at it, and its
+                    // resolution key. Best-effort: a failure leaves `path` None
+                    // and the run continues.
+                    let (path, keys) = capture(pid, &req.data.args, &name, fd, req.id);
                     self.pending.insert(req.id, fd);
                     events.push(BackendEvent::CheckpointHit {
                         pid,
                         checkpoint,
                         handle: NotifyHandle(req.id),
                         path,
+                        keys,
                     });
                 }
             }
