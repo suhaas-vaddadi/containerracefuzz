@@ -23,6 +23,7 @@
 //! | [`role`] | which tasks are the victim |
 //! | [`checkpoint`] | the structural syscall set, path-argument table |
 //! | [`key`] | the resolution-chain conflict key and its conflict relation |
+//! | `walk` | fills a key by walking the held task's path (Linux) |
 //! | [`engine`] | one run: hold, observe, attack, release |
 //! | [`attacker`] | runs the external attacker in the window |
 //! | [`oracle`] | a lightweight object diff of the window paths |
@@ -47,6 +48,9 @@ pub mod engine;
 pub mod key;
 pub mod oracle;
 pub mod role;
+/// Walks a held task's path into its resolution key. Linux-only.
+#[cfg(target_os = "linux")]
+pub mod walk;
 
 pub use config::ScenarioConfig;
 pub use engine::Engine;
