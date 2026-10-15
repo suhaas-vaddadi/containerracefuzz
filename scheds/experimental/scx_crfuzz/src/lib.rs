@@ -22,6 +22,7 @@
 //! | [`config`] | scenario schema |
 //! | [`role`] | which tasks are the victim |
 //! | [`checkpoint`] | the structural syscall set, path-argument table |
+//! | [`key`] | the resolution-chain conflict key and its conflict relation |
 //! | [`engine`] | one run: hold, observe, attack, release |
 //! | [`attacker`] | runs the external attacker in the window |
 //! | [`oracle`] | a lightweight object diff of the window paths |
@@ -43,6 +44,7 @@ pub mod backend_seccomp;
 pub mod checkpoint;
 pub mod config;
 pub mod engine;
+pub mod key;
 pub mod oracle;
 pub mod role;
 
