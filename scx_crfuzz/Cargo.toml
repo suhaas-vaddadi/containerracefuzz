@@ -1,0 +1,8 @@
+[package]
+name = "scx_crfuzz"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[dependencies]
+scx_crfuzz_gate = { path = "../scx_crfuzz_gate" }

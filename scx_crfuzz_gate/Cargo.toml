@@ -1,0 +1,14 @@
+[package]
+name = "scx_crfuzz_gate"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+# BPF only builds on Linux; on other hosts the crate compiles empty so
+# scx_crfuzz still builds (spec §3.1).
+[target.'cfg(target_os = "linux")'.dependencies]
+libbpf-rs = "=0.27.2"
+scx_utils = "=1.1.4"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+scx_cargo = "=1.1.4"
