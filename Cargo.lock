@@ -843,7 +843,9 @@ dependencies = [
 name = "scx_crfuzz_gate"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "libbpf-rs",
+ "libc",
  "scx_cargo",
  "scx_utils",
 ]
