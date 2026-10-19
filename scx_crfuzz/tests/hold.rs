@@ -2,6 +2,9 @@
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
+mod common;
+use common::{go_bin, trigger_file};
+
 use scx_crfuzz::backend::{Event, GateBackend, Poll};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,12 +16,6 @@ use std::time::{Duration, Instant};
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
-}
-
-fn trigger_file(name: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(name);
-    std::fs::write(&p, "").unwrap();
-    p
 }
 
 /// Spawn the SUT with stdout counted byte-by-byte.
@@ -124,20 +121,12 @@ fn check(be: &mut GateBackend, bytes: &AtomicU64, trigger: &Path, label: &str) {
     assert!(after > 0, "SUT did not resume after release");
 }
 
-fn go_hold_bin() -> PathBuf {
-    let out = std::env::temp_dir().join("crfuzz_go_hold");
-    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/go_hold");
-    let ok = Command::new("go").args(["build", "-o"]).arg(&out).current_dir(src).status().unwrap().success();
-    assert!(ok, "go build failed");
-    out
-}
-
 /// Spec §4 milestone 2: zero sibling bytes during a hold on the Go fixture.
 #[test]
 #[ignore]
 fn tree_hold_stops_go_siblings() {
     let trigger = trigger_file("crfuzz_go_trigger");
-    let mut cmd = Command::new(go_hold_bin());
+    let mut cmd = Command::new(go_bin("go_hold"));
     cmd.arg(&trigger);
     let (mut be, bytes) = spawn_counted(cmd);
     check(&mut be, &bytes, &trigger, "go");
@@ -168,12 +157,10 @@ fn watched_execve_spawns_and_holds_next_exec() {
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", "exec /bin/true"]);
     let mut be = GateBackend::spawn(cmd, &[libc::SYS_execve]).unwrap();
-    let ev = loop {
-        match be.poll(ms(1000)).unwrap() {
-            Poll::Events(mut evs) => break evs.remove(0),
-            Poll::Idle => panic!("sh's exec never trapped"),
-            Poll::Closed => panic!("SUT exited unheld"),
-        }
+    let ev = match be.poll(ms(1000)).unwrap() {
+        Poll::Events(mut evs) => evs.remove(0),
+        Poll::Idle => panic!("sh's exec never trapped"),
+        Poll::Closed => panic!("SUT exited unheld"),
     };
     assert_eq!(ev.path.as_deref(), Some(Path::new("/bin/true")));
     sleep(ms(100));

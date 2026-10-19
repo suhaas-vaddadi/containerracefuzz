@@ -116,11 +116,13 @@ impl GateBackend {
         let helper = std::thread::spawn(move || -> Result<OwnedFd> {
             let fd = recv_fd(ours.as_raw_fd()).context("receive seccomp listener")?;
             // Before the child's exec, anything trapped is spawn plumbing.
-            while exec_watched {
-                let req = notif_recv(fd.as_raw_fd())?;
-                notif_continue(fd.as_raw_fd(), req.id)?;
-                if req.data.nr as i64 == libc::SYS_execve {
-                    break;
+            if exec_watched {
+                loop {
+                    let req = notif_recv(fd.as_raw_fd())?;
+                    notif_continue(fd.as_raw_fd(), req.id)?;
+                    if req.data.nr as i64 == libc::SYS_execve {
+                        break;
+                    }
                 }
             }
             Ok(fd)
@@ -139,6 +141,11 @@ impl GateBackend {
 
     pub fn gate(&self) -> &GateMap {
         &self.gate
+    }
+
+    /// The run cgroup; the SUT tree lives in it and its children.
+    pub fn cgroup(&self) -> &Path {
+        &self.cgroup
     }
 
     /// Tgids currently gated by `gate_tree`.
@@ -296,7 +303,7 @@ fn notif_continue(fd: RawFd, id: u64) -> std::io::Result<()> {
 }
 
 /// `root` and every cgroup below it, parents before children.
-fn cgroup_dirs(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn cgroup_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![root.to_path_buf()];
     let mut i = 0;
     while i < dirs.len() {
@@ -441,8 +448,8 @@ mod tests {
         // Arch mismatch -> ALLOW.
         assert_eq!(2 + f[1].jf as usize, notify - 1);
         // Each watched nr -> NOTIFY; last miss falls through to ALLOW.
-        for i in 3..notify - 1 {
-            assert_eq!(i + 1 + f[i].jt as usize, notify);
+        for (i, ins) in f.iter().enumerate().take(notify - 1).skip(3) {
+            assert_eq!(i + 1 + ins.jt as usize, notify);
         }
     }
 
