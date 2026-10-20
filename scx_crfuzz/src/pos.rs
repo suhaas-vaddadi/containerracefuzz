@@ -73,6 +73,16 @@ impl Pos {
     /// Priority from the seed and the event alone, never its ready-set position
     /// (L:Engine, arrival order).
     pub fn prio(&self, id: &EventId) -> u64 {
+        self.hash(id, &self.redraws.get(id).copied().unwrap_or(0).to_le_bytes())
+    }
+
+    /// The mutator's seed at this event's hold: from the seed and the event
+    /// alone, so a replay fires the same mutation (D6).
+    pub fn event_seed(&self, id: &EventId) -> u64 {
+        self.hash(id, &[])
+    }
+
+    fn hash(&self, id: &EventId, tail: &[u8]) -> u64 {
         let mut h = Fnv::new(self.seed);
         // Length-prefixed so (thread, path) splits can't collide.
         h.write(&(id.thread.len() as u64).to_le_bytes());
@@ -86,7 +96,7 @@ impl Pos {
             None => h.write(&[0]),
         }
         h.write(&id.n.to_le_bytes());
-        h.write(&self.redraws.get(id).copied().unwrap_or(0).to_le_bytes());
+        h.write(tail);
         splitmix(h.0)
     }
 

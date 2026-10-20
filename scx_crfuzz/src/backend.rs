@@ -10,10 +10,11 @@ use std::fs::{self, File};
 use std::io::Error;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SCHED_EXT: i32 = 7;
@@ -45,6 +46,8 @@ pub struct Event {
     pub nr: i64,
     /// Best-effort: a running sibling can rewrite it after the read.
     pub path: Option<PathBuf>,
+    /// The dirfd a relative `path` resolves from; None: the cwd.
+    pub dirfd: Option<i32>,
     /// Conflict keys (D3); as best-effort as `path`.
     pub keys: Keys,
 }
@@ -300,7 +303,8 @@ impl GateBackend {
             return Ok(None);
         }
         let thread = self.names.get(&tid).map_or_else(|| format!("?{tid}"), |n| n.0.clone());
-        Ok(Some(Event { id: req.id, tid, tgid: tgid?, thread, nr, path, keys }))
+        let dirfd = path_args(nr).first().and_then(|a| a.0).map(|d| req.data.args[d] as i32).filter(|&fd| fd != libc::AT_FDCWD);
+        Ok(Some(Event { id: req.id, tid, tgid: tgid?, thread, nr, path, dirfd, keys }))
     }
 
     fn id_valid(&self, id: u64) -> bool {
@@ -346,6 +350,11 @@ impl GateBackend {
     }
 
     pub fn ungate_tree(&mut self) -> Result<()> {
+        // A clone in flight couldn't run while gated: restart its wait, or a
+        // long hold would make it look failed and leave its child unnamed (D4).
+        if let Some((_, _, at)) = &mut self.in_flight {
+            *at = Instant::now();
+        }
         for t in std::mem::take(&mut self.tree_gated) {
             self.gate.ungate_tgid(t)?;
         }
@@ -386,6 +395,142 @@ impl Drop for GateBackend {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl GateBackend {
+    /// Run the mutator `prog` on held event `ev` as its task (§3.6, D6): in the
+    /// task's user and mount namespaces, its root, its cwd (or the dirfd its
+    /// path is relative to), with its uids, gids and groups. `prog` gets the
+    /// path as issued; killed after `timeout`.
+    // ponytail: `prog` is exec'd after the chroot, so it (and a script's
+    // interpreter) must exist inside the task's root; exec it from an fd opened
+    // beforehand once a target has its own root (runc).
+    // ponytail: kill() reaches only `prog`, not processes it forked.
+    pub fn mutate(&self, ev: &Event, prog: &Path, seed: u64, timeout: Duration) -> Result<ExitStatus> {
+        let (tid, path) = (ev.tid, ev.path.as_ref().context("event has no path")?);
+        // None: already ours (setns into our own user namespace fails).
+        let ns = |n: &str| -> Result<Option<File>> {
+            let theirs = format!("/proc/{tid}/ns/{n}");
+            Ok((fs::metadata(&theirs)?.ino() != fs::metadata(format!("/proc/self/ns/{n}"))?.ino()).then(|| File::open(theirs)).transpose()?)
+        };
+        let (user, mnt) = (ns("user")?, ns("mnt")?);
+        // O_PATH: no filesystem open callback runs (one on a FUSE mount served
+        // by a gated task would block). O_DIRECTORY: a dirfd that isn't a
+        // directory (a FIFO) fails here with ENOTDIR.
+        let dir = |p: String| File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(p);
+        let root = dir(format!("/proc/{tid}/root"))?;
+        let cwd = dir(match ev.dirfd {
+            Some(fd) if path.is_relative() => format!("/proc/{tid}/fd/{fd}"),
+            _ => format!("/proc/{tid}/cwd"),
+        })?;
+        let status = fs::read_to_string(format!("/proc/{tid}/status"))?;
+        let ids = |key: &str| -> Result<Vec<u32>> {
+            let line = status.lines().find_map(|l| l.strip_prefix(key)).with_context(|| format!("no {key}"))?;
+            Ok(line.split_whitespace().map(str::parse).collect::<Result<_, _>>()?)
+        };
+        let (mut uid, mut gid, mut groups) = (ids("Uid:")?, ids("Gid:")?, ids("Groups:")?);
+        if user.is_some() {
+            // status shows the ids as our namespace sees them; map them into the
+            // task's. A map line is "<id inside> <id outside> <count>".
+            let map = |file: &str, v: &mut [u32]| -> Result<()> {
+                let m = fs::read_to_string(format!("/proc/{tid}/{file}"))?;
+                for id in v {
+                    *id = m
+                        .lines()
+                        .find_map(|l| match l.split_whitespace().filter_map(|x| x.parse().ok()).collect::<Vec<u32>>()[..] {
+                            [inside, outside, n] if (outside..outside.saturating_add(n)).contains(id) => Some(inside + (*id - outside)),
+                            _ => None,
+                        })
+                        .with_context(|| format!("id {id} unmapped in {file}"))?;
+                }
+                Ok(())
+            };
+            map("uid_map", &mut uid)?;
+            map("gid_map", &mut gid)?;
+            map("gid_map", &mut groups)?;
+        }
+        // The task may have died and its tid been reused since the trap: only a
+        // still-valid id proves the /proc reads above were the held task's.
+        if !self.id_valid(ev.id) {
+            bail!("held task gone");
+        }
+        let mut cmd = Command::new(prog);
+        cmd.arg(path)
+            .env("CRFUZZ_PATH", path)
+            .env("CRFUZZ_SYSCALL", ev.nr.to_string())
+            .env("CRFUZZ_SEED", seed.to_string())
+            .stdin(Stdio::null());
+        let fds = (user.as_ref().map(File::as_raw_fd), mnt.as_ref().map(File::as_raw_fd), root.as_raw_fd(), cwd.as_raw_fd());
+        // Between fork and exec: raw syscalls only, no allocation. User namespace
+        // first: it grants the capabilities to enter the mount namespace it owns.
+        unsafe {
+            cmd.pre_exec(move || {
+                let ok = |r: i32| if r < 0 { Err(Error::last_os_error()) } else { Ok(()) };
+                let (user, mnt, root, cwd) = fds;
+                if let Some(fd) = user {
+                    ok(libc::setns(fd, libc::CLONE_NEWUSER))?;
+                }
+                if let Some(fd) = mnt {
+                    ok(libc::setns(fd, libc::CLONE_NEWNS))?;
+                }
+                ok(libc::fchdir(root))?;
+                ok(libc::chroot(b".\0".as_ptr().cast()))?;
+                ok(libc::fchdir(cwd))?;
+                ok(libc::setgroups(groups.len(), groups.as_ptr()))?;
+                ok(libc::setresgid(gid[0], gid[1], gid[2]))?;
+                ok(libc::setresuid(uid[0], uid[1], uid[2]))
+            });
+        }
+        let end = Instant::now() + timeout;
+        // spawn() returns only once the exec is done, and the exec looks `prog`
+        // up inside the task's root, where it can block on a lock a gated task
+        // holds. So spawn on a thread and let the deadline cover it. The fds
+        // move along: pre_exec uses them until spawn returns.
+        let (tx, rx) = mpsc::channel();
+        let abandoned = Arc::new(Mutex::new(false));
+        let (flag, files) = (abandoned.clone(), (user, mnt, root, cwd));
+        std::thread::spawn(move || {
+            let r = cmd.spawn();
+            drop(files);
+            let gone = flag.lock().unwrap();
+            match r {
+                // Given up on: kill it once it exists, or it mutates after the hold.
+                Ok(mut c) if *gone => {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                r => {
+                    let _ = tx.send(r);
+                }
+            }
+        });
+        let mut child = match rx.recv_timeout(timeout) {
+            Ok(r) => r.with_context(|| format!("spawn mutator {}", prog.display()))?,
+            Err(_) => {
+                *abandoned.lock().unwrap() = true;
+                // Sent just before we gave up: kill it here.
+                if let Ok(Ok(mut c)) = rx.try_recv() {
+                    let _ = c.kill();
+                    std::thread::spawn(move || c.wait());
+                }
+                bail!("mutator not started after {timeout:?}; killed once it starts");
+            }
+        };
+        loop {
+            if let Some(st) = child.try_wait()? {
+                return Ok(st);
+            }
+            if Instant::now() >= end {
+                let _ = child.kill();
+                // Don't wait: stuck unkillable on a lock a gated task holds, it
+                // would never exit, and the tree hold would outlive sched_ext's
+                // 30 s watchdog. Reap it whenever it does exit.
+                std::thread::spawn(move || child.wait());
+                bail!("mutator still running after {timeout:?}; killed");
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
