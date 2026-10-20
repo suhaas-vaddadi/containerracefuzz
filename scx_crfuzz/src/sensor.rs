@@ -81,7 +81,7 @@ pub fn wait_frontier(
         if now.is_empty() {
             return Err(Exited.into());
         }
-        if quiescent(&prev, &now, &held.iter().map(|e| e.tid).collect()) {
+        if !be.clones_pending() && quiescent(&prev, &now, &held.iter().map(|e| e.tid).collect()) {
             return Ok(Some(round));
         }
         if Instant::now() >= deadline {
