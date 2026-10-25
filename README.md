@@ -204,9 +204,6 @@ scx_crfuzz/                engine, backend, POS, oracle, schedule, CLI
   tests/                   on-target tests and C/Go fixtures
 scx_crfuzz_gate/           sched_ext gate scheduler, daemon and GateMap client
   src/bpf/main.bpf.c
-docs/arch/
-  spec_concurrency_fuzzer.md   architecture spec and milestones
-  decisions.md                 design decisions (D1-D6)
 ```
 
 ## Testing
