@@ -1,5 +1,6 @@
 //! The schedule file, the fixed-schedule policy and finding identity (spec
-//! §3.8, M7). Pure: no I/O, so it is tested off-target.
+//! §3.8, M7); a run's partial order and the campaign's dedup key (§3.10, M8).
+//! Pure: no I/O, so it is tested off-target.
 
 use crate::pos::{EventId, Keys};
 use anyhow::{bail, ensure, Context, Result};
@@ -255,6 +256,41 @@ impl std::str::FromStr for Schedule {
     }
 }
 
+/// A run's decisions as one canonical member of their partial order (§1.3):
+/// two are ordered iff on one thread or their keys conflict (D3), earlier
+/// first; ties go to the smallest `EventId`. Equal outputs, same partial order.
+/// ponytail: O(n³) in decisions, fine for hundreds; a ready set if runs get long.
+pub fn canonical(log: &[(&EventId, &Keys)]) -> Vec<EventId> {
+    let before = |i: usize, j: usize| log[i].0.thread == log[j].0.thread || log[i].1.conflicts(log[j].1);
+    let mut done = vec![false; log.len()];
+    let mut out = Vec::with_capacity(log.len());
+    while out.len() < log.len() {
+        let ready = (0..log.len()).filter(|&j| !done[j] && (0..j).all(|i| done[i] || !before(i, j)));
+        let j = ready.min_by_key(|&j| log[j].0).expect("the first undone decision is ready");
+        done[j] = true;
+        out.push(log[j].0.clone());
+    }
+    out
+}
+
+/// A deduped finding (§3.10): the guilty hold's `(thread, nr, path)`,
+/// occurrence dropped (None: needs more than one hold), and the schedule's
+/// normalized findings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dedup {
+    pub guilty: Option<(String, i64, Option<PathBuf>)>,
+    pub findings: BTreeSet<Finding>,
+}
+
+impl Dedup {
+    /// A discovered Violation repeats this finding: the same normalized
+    /// findings, and its mutations include one at the guilty hold.
+    pub fn repeated_by(&self, findings: &BTreeSet<Finding>, steps: &[Step]) -> bool {
+        *findings == self.findings
+            && self.guilty.as_ref().map_or(true, |(t, nr, p)| steps.iter().any(|s| s.mutate && s.id.thread == *t && s.id.nr == *nr && s.id.path == *p))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +359,47 @@ mod tests {
         let ready = [(&id, &keys)];
         assert_eq!(Fixed { steps: &[], next: 0, deadline: true }.pick(&ready).unwrap(), None);
         assert_eq!(Fixed { steps: &[], next: 0, deadline: false }.pick(&ready).unwrap_err().expected, None);
+    }
+
+    fn ev(thread: &str, path: &str) -> EventId {
+        EventId { thread: thread.into(), nr: 257, path: Some(path.into()), n: 0 }
+    }
+
+    #[test]
+    fn canonical_partial_order() {
+        use crate::pos::Key;
+        let k = |r: &[u64], w: &[u64]| {
+            let s = |v: &[u64]| v.iter().map(|&i| Key::Ino(0, i)).collect::<BTreeSet<_>>();
+            Keys { reads: s(r).union(&s(w)).cloned().collect(), writes: s(w), all: false }
+        };
+        let (a, b, c, d) = (ev("0", "/a"), ev("0/1", "/b"), ev("0/2", "/a"), ev("0", "/z"));
+        let (ka, kb, kw) = (k(&[1], &[]), k(&[2], &[]), k(&[], &[1]));
+        let order = |log: &[(&EventId, &Keys)]| canonical(log);
+        // Independent: swapping them is the same partial order.
+        assert_eq!(order(&[(&b, &kb), (&a, &ka)]), order(&[(&a, &ka), (&b, &kb)]));
+        // Conflicting (c rebinds what a reads): a different one.
+        assert_ne!(order(&[(&c, &kw), (&a, &ka)]), order(&[(&a, &ka), (&c, &kw)]));
+        // Same thread, independent keys: a different one.
+        assert_ne!(order(&[(&d, &kb), (&a, &ka)]), order(&[(&a, &ka), (&d, &kb)]));
+        // `all` conflicts with everything.
+        let all = Keys { all: true, ..Keys::default() };
+        assert_ne!(order(&[(&b, &all), (&a, &ka)]), order(&[(&a, &ka), (&b, &all)]));
+    }
+
+    #[test]
+    fn repeat_needs_same_findings_and_guilty_mutated() {
+        let f: BTreeSet<Finding> = [Finding::Changed { entry: "file".into() }].into();
+        let g = ev("0", "/p");
+        let key = Dedup { guilty: Some((g.thread.clone(), g.nr, g.path.clone())), findings: f.clone() };
+        // Another occurrence of the guilty hold still matches.
+        let steps = |mutate: bool| vec![Step { id: ev("0", "/q"), mutate: true }, Step { id: EventId { n: 3, ..g.clone() }, mutate }];
+        assert!(key.repeated_by(&f, &steps(true)));
+        assert!(!key.repeated_by(&f, &steps(false)), "guilty hold not mutated");
+        assert!(!key.repeated_by(&BTreeSet::new(), &steps(true)), "other findings");
+        let other_thread = vec![Step { id: ev("0/1", "/p"), mutate: true }];
+        assert!(!key.repeated_by(&f, &other_thread), "threads count separately");
+        // Needs more than one hold: the findings alone.
+        let multi = Dedup { guilty: None, ..key };
+        assert!(multi.repeated_by(&f, &[]));
     }
 }

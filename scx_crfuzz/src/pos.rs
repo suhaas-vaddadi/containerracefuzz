@@ -30,7 +30,7 @@ pub enum Key {
 
 /// What resolving an event's path(s) touches (D3). `reads` holds every key the
 /// walk passed, `writes` (a subset) the names and objects a rebind changes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Keys {
     pub reads: BTreeSet<Key>,
     pub writes: BTreeSet<Key>,

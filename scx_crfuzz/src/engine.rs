@@ -5,7 +5,7 @@
 
 use crate::backend::{Event, GateBackend, SelfCheckFailed};
 use crate::oracle::{Alice, Canary, Finding};
-use crate::pos::{EventId, Pos};
+use crate::pos::{EventId, Keys, Pos};
 use crate::schedule::{self, Divergence, Fixed, Step};
 use crate::sensor::{wait_frontier, Exited};
 use anyhow::{bail, Result};
@@ -19,15 +19,25 @@ use std::time::{Duration, Instant};
 const MUTATOR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One POS decision, as the canonical log records it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Decision {
     pub id: EventId,
+    /// The event's conflict keys (D3), for its partial order (M8). Inode
+    /// numbers: this run only.
+    pub keys: Keys,
     /// Decided at the limit over an incomplete frontier (D2); replay and the
     /// determinism claim cover complete decisions only.
     pub partial: bool,
     /// The mutator fired at this hold: its exit status, or why it has none
     /// (a primitive failure, never a finding: §3.6).
     pub mutation: Option<Result<ExitStatus, String>>,
+}
+
+/// Without `keys`: one line per decision in the printed log.
+impl std::fmt::Debug for Decision {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Decision").field("id", &self.id).field("partial", &self.partial).field("mutation", &self.mutation).finish()
+    }
 }
 
 /// The canonical log as a schedule (§3.8): every decision, partial ones
@@ -158,7 +168,7 @@ pub fn run(
         let (ev, id) = (held.remove(i), ids.remove(i));
         let seed = pos.event_seed(&id);
         // Logged at once: every ending from here keeps it (§10.3).
-        log.push(Decision { id, partial: !complete, mutation: None });
+        log.push(Decision { id, keys: ev.keys.clone(), partial: !complete, mutation: None });
         // The whole tree stays put while the mutator runs (§3.3); answer
         // before ungating (L:Gate).
         if let Some(p) = &ev.path {
