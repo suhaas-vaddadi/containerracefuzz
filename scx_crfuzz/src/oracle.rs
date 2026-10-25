@@ -236,15 +236,7 @@ impl std::fmt::Display for Alice {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Finding {
-    /// Canary `entry` reachable as alice at `at` (a path, or a /proc handle).
-    Reached { entry: PathBuf, at: PathBuf },
-    /// The token, in a file alice can read.
-    Copy { at: PathBuf },
-    /// Canary `entry` changed, appeared or vanished.
-    Changed { entry: PathBuf },
-}
+pub use crate::schedule::Finding;
 
 /// Mount points in a mountinfo (field 5), as that task sees them, octal
 /// escapes (`\040`) undone. Bytes: a mount point need not be UTF-8.

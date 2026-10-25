@@ -7,3 +7,4 @@ pub mod engine;
 #[cfg(target_os = "linux")]
 pub mod oracle;
 pub mod pos;
+pub mod schedule;

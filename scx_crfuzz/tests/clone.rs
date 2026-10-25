@@ -27,7 +27,7 @@ fn go_clones_named_without_stall() {
         let t = Instant::now();
         let deadline = t + Duration::from_secs(60);
         let mut log = Vec::new();
-        run(&mut be, &mut Pos::new(seed), None, None, Duration::from_millis(1), Duration::from_millis(200), deadline, &mut log)
+        run(&mut be, &mut Pos::new(seed), None, None, None, Duration::from_millis(1), Duration::from_millis(200), deadline, &mut log)
             .unwrap_or_else(|e| panic!("seed {seed}: {e:#}"));
         assert!(be.child().wait().unwrap().success(), "seed {seed}: SUT failed");
         let threads: BTreeSet<&str> = log.iter().map(|d| d.id.thread.as_str()).collect();

@@ -140,6 +140,7 @@ fn splitmix(mut z: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedule::{Divergence, Fixed, Step};
 
     const OPEN: i64 = 1;
     const RENAME: i64 = 2;
@@ -159,7 +160,16 @@ mod tests {
     /// complete; a thread released runs to its next one. Events of a frontier
     /// are handed to POS in the order `arrival(k)` gives for decision `k`.
     fn run(seed: u64, threads: &[Script], arrival: impl Fn(usize, &mut Vec<usize>)) -> Vec<EventId> {
-        let mut pos = Pos::new(seed);
+        run_with(&mut Pos::new(seed), threads, arrival, |pos, r| Ok(pos.pick(r))).unwrap()
+    }
+
+    /// `run` with the pick supplied (POS, or a fixed schedule); `pos` names events.
+    fn run_with(
+        pos: &mut Pos,
+        threads: &[Script],
+        arrival: impl Fn(usize, &mut Vec<usize>),
+        mut pick: impl FnMut(&mut Pos, &[(&EventId, &Keys)]) -> Result<Option<usize>, Divergence>,
+    ) -> Result<Vec<EventId>, Divergence> {
         let mut next = vec![0; threads.len()];
         // held: (thread, id), in arrival order.
         let mut held: Vec<(usize, EventId)> = Vec::new();
@@ -174,12 +184,12 @@ mod tests {
                 held.push((t, pos.id(&t.to_string(), *nr, Some(p.into()))));
             }
             let ready: Vec<_> = held.iter().map(|(t, id)| (id, &threads[*t][next[*t]].2)).collect();
-            let Some(i) = pos.pick(&ready) else { break };
+            let Some(i) = pick(pos, &ready)? else { break };
             let (t, id) = held.remove(i);
             next[t] += 1;
             log.push(id);
         }
-        log
+        Ok(log)
     }
 
     /// Two threads open `/f` (occurrence assignment depends on arrival), one
@@ -313,5 +323,43 @@ mod tests {
         assert_eq!(pos.id("0/0", OPEN, p()).n, 0, "per thread");
         assert_eq!(pos.id("0", RENAME, p()).n, 0);
         assert_eq!(pos.id("0", OPEN, None).n, 0);
+    }
+
+    /// §3.8: the fixed-schedule pick releases the recorded order whatever
+    /// the seed and arrival order, and flags a schedule the run leaves.
+    #[test]
+    fn fixed_schedule_follows_and_diverges() {
+        let ts = threads();
+        let shuffle = |k: usize, v: &mut Vec<usize>| {
+            v.reverse();
+            if !v.is_empty() {
+                let r = k % v.len();
+                v.rotate_left(r);
+            }
+        };
+        for seed in 0..8 {
+            let log = run(seed, &ts, |_, _| {});
+            let steps: Vec<Step> = log.iter().map(|id| Step { id: id.clone(), mutate: false }).collect();
+            let replay = |steps: &[Step]| {
+                let mut f = Fixed { steps, next: 0, deadline: false };
+                // Another seed: only the naming comes from POS.
+                let r = run_with(&mut Pos::new(seed + 100), &ts, shuffle, |_, r| f.pick(r));
+                r.and_then(|got| f.finish().map(|()| got))
+            };
+            assert_eq!(replay(&steps).unwrap(), log, "seed {seed}");
+            // A step the run never offers: the frontier is complete without it.
+            let mut wrong = steps.clone();
+            wrong[3].id.n = 9;
+            let d = replay(&wrong).unwrap_err();
+            assert_eq!((d.step, d.expected.as_ref()), (3, Some(&wrong[3].id)));
+            assert!(!d.held.is_empty() && !d.held.contains(&wrong[3].id));
+            // Held after the last step; the SUT ending before it.
+            let d = replay(&steps[..5]).unwrap_err();
+            assert_eq!((d.step, d.expected), (5, None));
+            let mut long = steps.clone();
+            long.push(steps[0].clone());
+            let d = replay(&long).unwrap_err();
+            assert_eq!((d.step, d.held.len()), (9, 0));
+        }
     }
 }

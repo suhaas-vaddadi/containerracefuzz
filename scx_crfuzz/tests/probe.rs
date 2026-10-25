@@ -25,9 +25,9 @@ fn judged(canary: &Canary, script: &str) -> Vec<Finding> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(script);
     let mut be = GateBackend::spawn(cmd, WATCHED).unwrap();
-    let mut j = Judge { canary, alice: nobody(), reached: None };
+    let mut j = Judge { canary, alice: nobody(), reached: None, task: None };
     let ms = Duration::from_millis;
-    run(&mut be, &mut Pos::new(1), None, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(30), &mut Vec::new()).unwrap();
+    run(&mut be, &mut Pos::new(1), None, None, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(30), &mut Vec::new()).unwrap();
     assert!(be.child().wait().unwrap().success());
     j.reached.expect("final hold probed")
 }
@@ -130,9 +130,9 @@ fn deadline_keeps_log() {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg("cat /dev/null; sleep 10");
     let mut be = GateBackend::spawn(cmd, WATCHED).unwrap();
-    let mut j = Judge { canary: &c, alice: nobody(), reached: None };
+    let mut j = Judge { canary: &c, alice: nobody(), reached: None, task: None };
     let (ms, mut log) = (Duration::from_millis, Vec::new());
-    let e = run(&mut be, &mut Pos::new(1), None, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(2), &mut log).unwrap_err();
+    let e = run(&mut be, &mut Pos::new(1), None, None, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(2), &mut log).unwrap_err();
     assert!(e.is::<Deadline>(), "{e:#}");
     assert!(log.iter().any(|d| d.id.path.as_deref() == Some(Path::new("/dev/null"))), "{log:?}");
 }

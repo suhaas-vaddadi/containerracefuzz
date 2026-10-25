@@ -5,8 +5,8 @@ edition = "2021"
 license = "GPL-2.0-only"
 
 [dependencies]
+anyhow = "1"
 scx_crfuzz_gate = { path = "../scx_crfuzz_gate" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-anyhow = "1"
 libc = "0.2"
