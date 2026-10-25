@@ -1,3 +1,5 @@
 /target
 docs/arch/LEARNINGS.md
 docs/arch/spec.md
+/target-linux
+docs/arch/m6_oracle.md

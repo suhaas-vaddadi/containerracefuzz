@@ -1,13 +1,16 @@
 //! GateBackend: park SUT threads at watched syscalls (seccomp user-notify) and
 //! stop the whole SUT tree with the gate (spec §3.3, L:Seccomp, L:Gate).
+//! Becoming alice needs Linux 5.11 (close_range CLOEXEC) and openat2 (5.6);
+//! older kernels fail every mutation and probe, so every judged run is invalid.
 
+use crate::oracle::{self, Alice, Canary, Finding};
 use crate::pos::{Key, Keys};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use scx_crfuzz_gate::GateMap;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::ffi::{CString, OsString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File};
-use std::io::Error;
+use std::io::{Error, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
@@ -399,17 +402,72 @@ impl Drop for GateBackend {
     }
 }
 
+/// Alice's credentials got past the canary gate (§4): the setup is wrong and
+/// the run is invalid. Not a primitive failure. Check with
+/// `err.is::<SelfCheckFailed>()`.
+#[derive(Debug)]
+pub struct SelfCheckFailed;
+
+impl std::fmt::Display for SelfCheckFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("self-check: alice's credentials are not stopped by the canary gate")
+    }
+}
+
+impl std::error::Error for SelfCheckFailed {}
+
+/// The held task's root is a canary entry: the SUT put it there, so no view
+/// alice could have starts from it. A primitive failure for the mutator; for
+/// the probe, only the handle check judges it (§10.5).
+#[derive(Debug)]
+pub struct RootInCanary;
+
+impl std::fmt::Display for RootInCanary {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the held task's root is inside the canary")
+    }
+}
+
+impl std::error::Error for RootInCanary {}
+
+// No step before the self-check (setns, chroot, fchdir, setgroups, setres*id,
+// capset, prctl) returns it, so from pre_exec it names the self-check alone.
+const SELF_CHECK: i32 = libc::ENOTRECOVERABLE;
+
+/// Who a child becomes in the held task's view.
+pub enum As<'a> {
+    /// The held task's own ids (D6): the mutator.
+    Held,
+    /// Alice's, mapped into the held task's user namespace, caps set to hers,
+    /// NO_NEW_PRIVS: the judged mutator and the probes.
+    Alice(&'a Alice),
+}
+
+/// The held task's view and the ids to take in it, read from /proc before the
+/// fork; `enter` applies them in the child.
+struct View {
+    user: Option<File>,
+    mnt: Option<File>,
+    root: File,
+    cwd: File,
+    uid: Vec<u32>,
+    gid: Vec<u32>,
+    groups: Vec<u32>,
+    /// Some: alice's CapEff, set as effective and permitted, then NO_NEW_PRIVS.
+    caps: Option<u64>,
+    /// §4: the canary path, whether root can't find it in this view either,
+    /// and the gate's `(dev, ino)`.
+    gate: Option<(CString, bool, (u64, u64))>,
+    /// The canary's `(dev, ino)`s: a root or cwd among them is the held
+    /// task's way in, not alice's.
+    ids: Vec<(u64, u64)>,
+}
+
 impl GateBackend {
-    /// Run the mutator `prog` on held event `ev` as its task (§3.6, D6): in the
-    /// task's user and mount namespaces, its root, its cwd (or the dirfd its
-    /// path is relative to), with its uids, gids and groups. `prog` gets the
-    /// path as issued; killed after `timeout`.
-    // ponytail: `prog` is exec'd after the chroot, so it (and a script's
-    // interpreter) must exist inside the task's root; exec it from an fd opened
-    // beforehand once a target has its own root (runc).
-    // ponytail: kill() reaches only `prog`, not processes it forked.
-    pub fn mutate(&self, ev: &Event, prog: &Path, seed: u64, timeout: Duration) -> Result<ExitStatus> {
-        let (tid, path) = (ev.tid, ev.path.as_ref().context("event has no path")?);
+    /// The held task's user and mount namespaces, its root, its cwd (or the
+    /// dirfd its path is relative to), and the ids `who` takes there.
+    fn view(&self, ev: &Event, canary: Option<&Canary>, who: As) -> Result<View> {
+        let tid = ev.tid;
         // None: already ours (setns into our own user namespace fails).
         let ns = |n: &str| -> Result<Option<File>> {
             let theirs = format!("/proc/{tid}/ns/{n}");
@@ -422,18 +480,23 @@ impl GateBackend {
         let dir = |p: String| File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(p);
         let root = dir(format!("/proc/{tid}/root"))?;
         let cwd = dir(match ev.dirfd {
-            Some(fd) if path.is_relative() => format!("/proc/{tid}/fd/{fd}"),
+            Some(fd) if ev.path.as_ref().is_some_and(|p| p.is_relative()) => format!("/proc/{tid}/fd/{fd}"),
             _ => format!("/proc/{tid}/cwd"),
         })?;
-        let status = fs::read_to_string(format!("/proc/{tid}/status"))?;
-        let ids = |key: &str| -> Result<Vec<u32>> {
-            let line = status.lines().find_map(|l| l.strip_prefix(key)).with_context(|| format!("no {key}"))?;
-            Ok(line.split_whitespace().map(str::parse).collect::<Result<_, _>>()?)
+        let (mut uid, mut gid, mut groups, caps) = match who {
+            As::Held => {
+                let status = fs::read_to_string(format!("/proc/{tid}/status"))?;
+                let ids = |key: &str| -> Result<Vec<u32>> {
+                    let line = status.lines().find_map(|l| l.strip_prefix(key)).with_context(|| format!("no {key}"))?;
+                    Ok(line.split_whitespace().map(str::parse).collect::<Result<_, _>>()?)
+                };
+                (ids("Uid:")?, ids("Gid:")?, ids("Groups:")?, None)
+            }
+            As::Alice(a) => (vec![a.uid; 3], vec![a.gid; 3], a.groups.clone(), Some(a.cap_eff)),
         };
-        let (mut uid, mut gid, mut groups) = (ids("Uid:")?, ids("Gid:")?, ids("Groups:")?);
         if user.is_some() {
-            // status shows the ids as our namespace sees them; map them into the
-            // task's. A map line is "<id inside> <id outside> <count>".
+            // Host ids (status shows them as our namespace sees them); map them
+            // into the task's. A map line is "<id inside> <id outside> <count>".
             let map = |file: &str, v: &mut [u32]| -> Result<()> {
                 let m = fs::read_to_string(format!("/proc/{tid}/{file}"))?;
                 for id in v {
@@ -451,49 +514,66 @@ impl GateBackend {
             map("gid_map", &mut gid)?;
             map("gid_map", &mut groups)?;
         }
+        // §4: ENOENT passes only if root cannot find the canary in the task's
+        // view either.
+        let gate = match canary {
+            Some(c) => {
+                let gate = CString::new(c.dir.as_os_str().as_bytes())?;
+                let gone = absent(&root, &gate, 0);
+                Some((gate, gone, c.before[Path::new("")].id))
+            }
+            None => None,
+        };
         // The task may have died and its tid been reused since the trap: only a
         // still-valid id proves the /proc reads above were the held task's.
         if !self.id_valid(ev.id) {
             bail!("held task gone");
         }
+        let view = View { user, mnt, root, cwd, uid, gid, groups, caps, gate, ids: canary.map(|c| c.ids().into_keys().collect()).unwrap_or_default() };
+        if canary.is_some() && unsafe { view.inside(&view.root) } {
+            bail!(RootInCanary);
+        }
+        Ok(view)
+    }
+
+    /// Run the mutator `prog` on held event `ev` in its task's view (`view`).
+    /// Judged, as alice (§10.1): her ids mapped into the task's user namespace,
+    /// her caps, NO_NEW_PRIVS, self-checked against the canary at the given
+    /// path (§4); unjudged, with the task's own ids (D6). `prog` gets the path
+    /// as issued; killed after `timeout`.
+    // ponytail: `prog` is exec'd after the chroot, so it (and a script's
+    // interpreter) must exist inside the task's root; exec it from an fd opened
+    // beforehand once a target has its own root (runc).
+    // ponytail: kill() reaches only `prog`, not processes it forked.
+    pub fn mutate(&self, ev: &Event, prog: &Path, judge: Option<(&Alice, &Canary)>, seed: u64, timeout: Duration) -> Result<ExitStatus> {
+        let path = ev.path.as_ref().context("event has no path")?;
+        let view = match judge {
+            Some((alice, canary)) => self.view(ev, Some(canary), As::Alice(alice))?,
+            None => self.view(ev, None, As::Held)?,
+        };
         let mut cmd = Command::new(prog);
         cmd.arg(path)
             .env("CRFUZZ_PATH", path)
             .env("CRFUZZ_SYSCALL", ev.nr.to_string())
             .env("CRFUZZ_SEED", seed.to_string())
-            .stdin(Stdio::null());
-        let fds = (user.as_ref().map(File::as_raw_fd), mnt.as_ref().map(File::as_raw_fd), root.as_raw_fd(), cwd.as_raw_fd());
-        // Between fork and exec: raw syscalls only, no allocation. User namespace
-        // first: it grants the capabilities to enter the mount namespace it owns.
+            // Not crfuzz's own output (or root's tty): alice could forge a verdict line.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         unsafe {
-            cmd.pre_exec(move || {
-                let ok = |r: i32| if r < 0 { Err(Error::last_os_error()) } else { Ok(()) };
-                let (user, mnt, root, cwd) = fds;
-                if let Some(fd) = user {
-                    ok(libc::setns(fd, libc::CLONE_NEWUSER))?;
-                }
-                if let Some(fd) = mnt {
-                    ok(libc::setns(fd, libc::CLONE_NEWNS))?;
-                }
-                ok(libc::fchdir(root))?;
-                ok(libc::chroot(b".\0".as_ptr().cast()))?;
-                ok(libc::fchdir(cwd))?;
-                ok(libc::setgroups(groups.len(), groups.as_ptr()))?;
-                ok(libc::setresgid(gid[0], gid[1], gid[2]))?;
-                ok(libc::setresuid(uid[0], uid[1], uid[2]))
-            });
+            cmd.pre_exec(move || view.enter());
         }
         let end = Instant::now() + timeout;
         // spawn() returns only once the exec is done, and the exec looks `prog`
         // up inside the task's root, where it can block on a lock a gated task
-        // holds. So spawn on a thread and let the deadline cover it. The fds
-        // move along: pre_exec uses them until spawn returns.
+        // holds. So spawn on a thread and let the deadline cover it. The view's
+        // fds go with `cmd`: pre_exec uses them until spawn returns.
         let (tx, rx) = mpsc::channel();
         let abandoned = Arc::new(Mutex::new(false));
-        let (flag, files) = (abandoned.clone(), (user, mnt, root, cwd));
+        let flag = abandoned.clone();
         std::thread::spawn(move || {
             let r = cmd.spawn();
-            drop(files);
+            drop(cmd);
             let gone = flag.lock().unwrap();
             match r {
                 // Given up on: kill it once it exists, or it mutates after the hold.
@@ -507,6 +587,7 @@ impl GateBackend {
             }
         });
         let mut child = match rx.recv_timeout(timeout) {
+            Ok(Err(e)) if e.raw_os_error() == Some(SELF_CHECK) => return Err(SelfCheckFailed.into()),
             Ok(r) => r.with_context(|| format!("spawn mutator {}", prog.display()))?,
             Err(_) => {
                 *abandoned.lock().unwrap() = true;
@@ -533,7 +614,332 @@ impl GateBackend {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+
+    /// The read half (§5) at the final hold `ev`: as alice in its view, `stat`
+    /// the footprint and every mount point, and look for the token in each
+    /// regular file she can open; then, as root, the task's own handles if it
+    /// runs as alice. Killed after `timeout`; any failure makes the run invalid.
+    pub fn probe(&self, ev: &Event, alice: &Alice, canary: &Canary, footprint: &BTreeSet<PathBuf>, timeout: Duration) -> Result<Vec<Finding>> {
+        let mut found = 'view: {
+            let view = match self.view(ev, Some(canary), As::Alice(alice)) {
+                Err(e) if e.is::<RootInCanary>() => break 'view Vec::new(),
+                r => r?,
+            };
+            let mut paths: Vec<PathBuf> = footprint.iter().cloned().collect();
+            paths.extend(oracle::mount_points(&fs::read(format!("/proc/{}/mountinfo", ev.tid))?));
+            let cpaths = paths.iter().map(|p| CString::new(p.as_os_str().as_bytes())).collect::<Result<Vec<_>, _>>()?;
+            let token = canary.token.as_bytes();
+            let mut buf = vec![0u8; 1 << 20];
+            let mut fds = [0; 2];
+            ensure!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0, "pipe: {}", Error::last_os_error());
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // Child: async-signal-safe only (we are multithreaded); everything
+                // it touches was built before the fork. Records are 24 bytes,
+                // [kind << 63 | path index, dev, ino]; kind 1: the token.
+                unsafe {
+                    libc::close(fds[0]);
+                    if let Err(e) = view.enter() {
+                        libc::_exit(if e.raw_os_error() == Some(SELF_CHECK) { 2 } else { 1 });
+                    }
+                    // Every fd but the pipe: opened as root (the view's, and all of
+                    // crfuzz's, inherited across a fork with no exec), through
+                    // /proc/self/fd they would be alice's. Fails closed.
+                    let w = fds[1] as u32;
+                    if (w > 0 && libc::syscall(libc::SYS_close_range, 0u32, w - 1, 0u32) != 0)
+                        || libc::syscall(libc::SYS_close_range, w + 1, u32::MAX, 0u32) != 0
+                    {
+                        libc::_exit(1);
+                    }
+                    let rec = |kind: u64, i: usize, dev: u64, ino: u64| {
+                        let r = [kind << 63 | i as u64, dev, ino];
+                        libc::write(fds[1], r.as_ptr().cast(), 24);
+                    };
+                    for (i, p) in cpaths.iter().enumerate() {
+                        let mut st: libc::stat = std::mem::zeroed();
+                        if libc::stat(p.as_ptr(), &mut st) != 0 {
+                            continue;
+                        }
+                        rec(0, i, st.st_dev, st.st_ino);
+                        // Only regular files: never open a FIFO or a device.
+                        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+                            continue;
+                        }
+                        let fd = libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC);
+                        if fd >= 0 {
+                            let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+                            if n > 0 && buf[..n as usize].windows(token.len()).any(|w| w == token) {
+                                rec(1, i, 0, 0);
+                            }
+                            libc::close(fd);
+                        }
+                    }
+                    libc::_exit(0);
+                }
+            }
+            let forked = (pid > 0).then_some(()).ok_or_else(Error::last_os_error);
+            unsafe { libc::close(fds[1]) };
+            if let Err(e) = forked {
+                unsafe { libc::close(fds[0]) };
+                bail!("fork: {e}");
+            }
+            let mut rd = unsafe { File::from_raw_fd(fds[0]) };
+            // ponytail: one blocking read loop under a poll deadline; a stuck stat (FUSE served by a gated task) is killed.
+            let (mut out, end) = (Vec::new(), Instant::now() + timeout);
+            let reap = || unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            };
+            loop {
+                let mut p = libc::pollfd { fd: fds[0], events: libc::POLLIN, revents: 0 };
+                let left = end.saturating_duration_since(Instant::now()).as_millis() as i32;
+                let n = if left == 0 { 0 } else { unsafe { libc::poll(&mut p, 1, left) } };
+                if n == 0 {
+                    reap();
+                    bail!("probe still running after {timeout:?}; killed");
+                }
+                if n < 0 {
+                    continue; // EINTR
+                }
+                let mut chunk = [0u8; 4096];
+                match rd.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&chunk[..n]),
+                    Err(e) => {
+                        reap();
+                        return Err(e).context("probe pipe");
+                    }
+                }
+            }
+            let mut status = 0;
+            // A failed wait leaves status 0, which would read as a pass.
+            ensure!(unsafe { libc::waitpid(pid, &mut status, 0) } == pid, "waitpid: {}", Error::last_os_error());
+            match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+                Some(0) => {}
+                Some(2) => return Err(SelfCheckFailed.into()),
+                _ => bail!("probe could not enter the view (status {status:#x})"),
+            }
+
+            // Not the gate: alice may always stat it; only what's below it is hers to miss.
+            let mut ids = canary.ids();
+            ids.retain(|_, k| !k.as_os_str().is_empty());
+            let mut found = Vec::new();
+            for r in out.chunks_exact(24) {
+                let w = |k: usize| u64::from_ne_bytes(r[k * 8..k * 8 + 8].try_into().unwrap());
+                let (kind, i) = (w(0) >> 63, (w(0) & !(1 << 63)) as usize);
+                match kind {
+                    0 => found.extend(ids.get(&(w(1), w(2))).map(|e| Finding::Reached { entry: e.clone(), at: paths[i].clone() })),
+                    _ => found.push(Finding::Copy { at: paths[i].clone() }),
+                }
+            }
+            found
+        };
+        // The task's own handles, as root: only a task running as alice makes
+        // them hers. The gate counts here: a root or cwd at it reaches all below.
+        let ids = canary.ids();
+        if oracle::euid(ev.tid)? == alice.uid {
+            // stat follows each handle: one on a FUSE mount served by a gated
+            // task blocks, so the stats run on a thread under the deadline.
+            // ponytail: a blocked thread is leaked; the run is invalid anyway.
+            let (tid, tgid) = (ev.tid, ev.tgid);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let handles = || -> Result<Vec<(PathBuf, (u64, u64))>> {
+                    let fd_dir = fs::read_dir(format!("/proc/{tgid}/fd"))?.filter_map(|e| e.ok().map(|e| e.path()));
+                    let all = ["cwd", "root"].map(|h| PathBuf::from(format!("/proc/{tid}/{h}"))).into_iter().chain(fd_dir);
+                    Ok(all.filter_map(|at| fs::metadata(&at).ok().map(|m| (at, (m.dev(), m.ino())))).collect())
+                };
+                let _ = tx.send(handles());
+            });
+            // Its own deadline: the forked probe may have used most of the first.
+            let handles = rx.recv_timeout(timeout).map_err(|_| anyhow::anyhow!("probe: a handle still blocked after {timeout:?}"))??;
+            for (at, id) in handles {
+                if let Some(e) = ids.get(&id) {
+                    found.push(Finding::Reached { entry: e.clone(), at });
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
 }
+
+/// §4's root-side look: true iff `path` is not in the view rooted at `root`
+/// at all. RESOLVE_IN_ROOT: absolute symlinks stay inside that root, as they
+/// will for the chrooted child. Any other error counts as present, so alice
+/// must then get EACCES.
+fn absent(root: &File, path: &CStr, flags: i32) -> bool {
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_CLOEXEC | flags) as u64;
+    how.resolve = libc::RESOLVE_IN_ROOT;
+    let fd = unsafe { libc::syscall(libc::SYS_openat2, root.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<libc::open_how>()) };
+    if fd >= 0 {
+        unsafe { libc::close(fd as i32) };
+        return false;
+    }
+    Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+}
+
+/// §5 read before: before the SUT, alice must be stopped at every canary
+/// entry: EACCES, or ENOENT where root can't find it in this view either.
+/// Catches a gate she can search but not read, which §4's open passes.
+pub fn read_before(canary: &Canary, alice: &Alice) -> Result<()> {
+    let dir = |p: &str| File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(p);
+    let root = dir("/")?;
+    let entries = canary
+        .before
+        .keys()
+        .filter(|k| !k.as_os_str().is_empty()) // the gate: §4's check, in enter()
+        .map(|k| {
+            let p = CString::new(canary.dir.join(k).as_os_str().as_bytes())?;
+            // O_NOFOLLOW: a symlink entry is checked itself, not its target.
+            let gone = absent(&root, &p, libc::O_NOFOLLOW);
+            Ok((p, gone))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let gate = CString::new(canary.dir.as_os_str().as_bytes())?;
+    let gate_gone = absent(&root, &gate, 0);
+    // crfuzz's own view: nothing to setns into, ids need no mapping.
+    let view = View {
+        user: None,
+        mnt: None,
+        cwd: dir(".")?,
+        root,
+        uid: vec![alice.uid; 3],
+        gid: vec![alice.gid; 3],
+        groups: alice.groups.clone(),
+        caps: Some(alice.cap_eff),
+        gate: Some((gate, gate_gone, canary.before[Path::new("")].id)),
+        ids: canary.ids().into_keys().collect(),
+    };
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // Child: async-signal-safe only; everything it reads was built before the fork.
+        unsafe {
+            if let Err(e) = view.enter() {
+                libc::_exit(if e.raw_os_error() == Some(SELF_CHECK) { 2 } else { 1 });
+            }
+            for (p, gone) in &entries {
+                let mut st: libc::stat = std::mem::zeroed();
+                let stopped = libc::lstat(p.as_ptr(), &mut st) != 0
+                    && match Error::last_os_error().raw_os_error() {
+                        Some(libc::EACCES) => true,
+                        Some(libc::ENOENT) => *gone,
+                        _ => false,
+                    };
+                if !stopped {
+                    libc::_exit(2);
+                }
+            }
+            libc::_exit(0);
+        }
+    }
+    ensure!(pid > 0, "fork: {}", Error::last_os_error());
+    let mut status = 0;
+    // ponytail: no deadline; lstat under a local root-owned dir doesn't block. Add one if /var/lib can be NFS.
+    // A failed wait leaves status 0, which would read as a pass.
+    ensure!(unsafe { libc::waitpid(pid, &mut status, 0) } == pid, "waitpid: {}", Error::last_os_error());
+    match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+        Some(0) => Ok(()),
+        Some(2) => Err(SelfCheckFailed.into()),
+        _ => bail!("read before: could not become alice (status {status:#x})"),
+    }
+}
+
+impl View {
+    /// Between fork and exec (or _exit): raw syscalls only, no allocation.
+    /// User namespace first: it grants the capabilities to enter the mount
+    /// namespace it owns. The §4 self-check last, with the final credentials.
+    unsafe fn enter(&self) -> std::io::Result<()> {
+        let ok = |r: i32| if r < 0 { Err(Error::last_os_error()) } else { Ok(()) };
+        // An fd crfuzz inherited without CLOEXEC would reach the mutator.
+        // CLOEXEC, not close: std's spawn reports exec errors over one.
+        ok(libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) as i32)?;
+        // Groups cleared here, as root in our own namespace: a user namespace
+        // whose setgroups is "deny" refuses it after setns.
+        ok(libc::setgroups(0, std::ptr::null()))?;
+        if let Some(f) = &self.user {
+            ok(libc::setns(f.as_raw_fd(), libc::CLONE_NEWUSER))?;
+        }
+        if let Some(f) = &self.mnt {
+            ok(libc::setns(f.as_raw_fd(), libc::CLONE_NEWNS))?;
+        }
+        ok(libc::fchdir(self.root.as_raw_fd()))?;
+        ok(libc::chroot(b".\0".as_ptr().cast()))?;
+        // A cwd (or dirfd) inside the canary is the held task's: resolve from
+        // the root instead, which can only miss (§9).
+        // ponytail: fchdir runs as root, so outside the canary alice may start
+        // in a directory she could not reach by path (a 0777 dir under a 0700
+        // one): a mutator there exceeds her. Check she can reach it, falling
+        // back to the root, if false findings show up there (§9).
+        if !self.inside(&self.cwd) {
+            ok(libc::fchdir(self.cwd.as_raw_fd()))?;
+        }
+        if !self.groups.is_empty() {
+            ok(libc::setgroups(self.groups.len(), self.groups.as_ptr()))?;
+        }
+        ok(libc::setresgid(self.gid[0], self.gid[1], self.gid[2]))?;
+        if let Some(c) = self.caps {
+            // capset before setresuid would drop CAP_SETUID; without KEEPCAPS,
+            // setresuid to nonzero clears the permitted set for good.
+            ok(libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0))?;
+            ok(libc::setresuid(self.uid[0], self.uid[1], self.uid[2]))?;
+            let hdr = CapHeader { version: CAP_V3, pid: 0 };
+            let half = |v: u32| CapData { effective: v, permitted: v, inheritable: 0 };
+            let data = [half(c as u32), half((c >> 32) as u32)];
+            ok(libc::syscall(libc::SYS_capset, &hdr, data.as_ptr()) as i32)?;
+            // The mutator execs: no setuid binary may lift it past alice.
+            ok(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
+        } else {
+            ok(libc::setresuid(self.uid[0], self.uid[1], self.uid[2]))?;
+        }
+        let Some((gate, gone, id)) = &self.gate else { return Ok(()) };
+        // A root inside the canary hides the gate behind ENOENT. `view` refuses
+        // one already; this keeps read_before's hand-built view honest too.
+        if self.inside(&self.root) {
+            return Err(Error::from_raw_os_error(SELF_CHECK));
+        }
+        // §4, last: with the final credentials the gate must stop us, or
+        // nothing that runs from here is really alice.
+        let fd = libc::open(gate.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        if fd >= 0 {
+            // Something else at the gate's path (a mount in the task's view)
+            // says nothing about alice's credentials: the probe judges it.
+            let mut st: libc::stat = std::mem::zeroed();
+            let gate = libc::fstat(fd, &mut st) != 0 || (st.st_dev, st.st_ino) == *id;
+            libc::close(fd);
+            return if gate { Err(Error::from_raw_os_error(SELF_CHECK)) } else { Ok(()) };
+        }
+        match Error::last_os_error().raw_os_error() {
+            Some(libc::EACCES) => Ok(()),
+            Some(libc::ENOENT) if *gone => Ok(()),
+            _ => Err(Error::from_raw_os_error(SELF_CHECK)),
+        }
+    }
+
+    /// Async-signal-safe. Fails closed: an fd that can't be stat'd counts as inside.
+    unsafe fn inside(&self, f: &File) -> bool {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(f.as_raw_fd(), &mut st) != 0 || self.ids.contains(&(st.st_dev, st.st_ino))
+    }
+}
+
+// libc has SYS_capset but not its structs.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const CAP_V3: u32 = 0x2008_0522;
 
 fn notif_recv(fd: RawFd) -> std::io::Result<libc::seccomp_notif> {
     let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
