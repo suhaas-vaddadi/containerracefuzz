@@ -6,9 +6,12 @@
 //! the fuzzed run, each with its own canary, judged against the attacker
 //! alice (UID:GID, no groups, no caps: §1). Prints alice, the fuzzed run's
 //! decision log and its outcome class (§6). With `--mutator`, PROG (a binary
-//! or a script with a #!) runs at every hold whose event has a known path, as
+//! or a script with a #!) runs at one hold per run, as
 //! alice in the held task's view: its namespaces, root and cwd, the path as
-//! issued in argv[1] (§10.1). Exits 0 whatever the class; nonzero for an
+//! issued in argv[1] (§10.1). The hold is preselected from the baseline's
+//! events with a known path, not keys.all and not a `?tid`: the one at index
+//! (seed + seed / count) mod count, printed as `target:`; a run that never
+//! reaches it is unmutated. Exits 0 whatever the class; nonzero for an
 //! invalid run, after printing the decisions made so far. Needs root and a
 //! running scx_crfuzz_gated.
 //!
@@ -40,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     use scx_crfuzz::backend::{self, GateBackend, SelfCheckFailed};
     use scx_crfuzz::engine::{self, Deadline, Decision, Judge, Replay};
     use scx_crfuzz::oracle::{self, Alice, Canary, Finding, Outcome};
-    use scx_crfuzz::pos::Pos;
+    use scx_crfuzz::pos::{EventId, Pos};
     use scx_crfuzz::schedule::{self, Dedup, Divergence, Fixed, Schedule};
     use std::cell::Cell;
     use std::collections::{BTreeSet, HashSet};
@@ -134,7 +137,7 @@ fn main() -> anyhow::Result<()> {
     // Canary numbers, one per run of this crfuzz: a kept canary is never reused.
     let runs = Cell::new(0u32);
     // One run with its own canary; its decisions go to `log` whatever the ending.
-    let judged = |seed: u64, mutator: Option<&Path>, replay: Option<&mut Replay>, log: &mut Vec<Decision>| -> Result<Judged> {
+    let judged = |seed: u64, mutator: Option<&Path>, target: Option<&EventId>, replay: Option<&mut Replay>, log: &mut Vec<Decision>| -> Result<Judged> {
         if let Some(l) = &layout {
             let st = Command::new(l).status().with_context(|| l.display().to_string())?;
             ensure!(st.success(), "invalid: layout {} failed: {st}", l.display());
@@ -145,7 +148,7 @@ fn main() -> anyhow::Result<()> {
         sut.args(rest);
         let mut be = GateBackend::spawn(sut, WATCHED)?;
         let mut j = Judge { canary: &canary, alice: alice.clone(), reached: None, task: None };
-        let r = engine::run(&mut be, &mut Pos::new(seed), mutator, replay, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(60), log);
+        let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(60), log);
         let end = if r.is_ok() { Some(be.child().wait()?) } else { None };
         // Clears gates and cgroup, ending what is left of the SUT, before the
         // write half: a gated task may serve a mount inside the canary.
@@ -177,7 +180,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("{alice}");
     let mut log = Vec::new();
-    let base = match judged(seed, None, None, &mut log) {
+    let base = match judged(seed, None, None, None, &mut log) {
         Ok(b) if b.found.is_empty() => b,
         r => {
             println!("baseline:");
@@ -188,13 +191,19 @@ fn main() -> anyhow::Result<()> {
         }
     };
     drop(base.canary);
+    // The holds a mutator could fire at, named stably (not `?tid`); each run
+    // preselects one.
+    let targets: Vec<EventId> = log.iter().filter(|d| d.id.path.is_some() && !d.keys.all && !d.id.thread.starts_with('?')).map(|d| d.id.clone()).collect();
+    if mutator.is_some() && targets.is_empty() && loaded.is_none() {
+        println!("warning: no baseline hold to mutate at; runs are unmutated");
+    }
 
     // The run in `log` as a schedule (§3.8).
     let attacker = format!("{}:{}", alice.uid, alice.gid);
     let schedule = |seed: u64, class: &str, deadline: bool, findings: BTreeSet<Finding>, log: &[Decision]| Schedule {
         seed,
         attacker: attacker.clone(),
-        mutator: mutator.clone(),
+        mutator: mutator.clone().filter(|_| !targets.is_empty()),
         layout: layout.clone(),
         cmd: cmd.clone(),
         class: class.into(),
@@ -203,9 +212,15 @@ fn main() -> anyhow::Result<()> {
         steps: engine::project(log),
     };
     // Discovery: its class and schedule; a Violation's canary is kept (the evidence).
+    // Every len seeds cover every target, each block shifted by one so a
+    // target meets every POS seed residue: (seed + seed / len) % len, without
+    // overflow.
+    let len = targets.len() as u64;
+    let pick = |seed: u64| (len > 0).then(|| &targets[((seed % len + seed / len % len) % len) as usize]);
     let discover = |seed: u64, log: &mut Vec<Decision>| -> Result<(Outcome, Judged, Schedule)> {
         log.clear();
-        let mut run = judged(seed, mutator.as_deref(), None, log)?;
+        let target = pick(seed);
+        let mut run = judged(seed, target.and(mutator.as_deref()), target, None, log)?;
         let class = oracle::outcome(std::mem::take(&mut run.found), run.end, base.end);
         if matches!(class, Outcome::Violation(_)) {
             run.canary.keep();
@@ -222,7 +237,7 @@ fn main() -> anyhow::Result<()> {
         let fixed = || Fixed { steps: &sched.steps, next: 0, deadline: sched.deadline };
         log.clear();
         let mut r = Replay { fixed: fixed(), only: None, diverged: None };
-        let mut run = match judged(sched.seed, sched.mutator.as_deref(), Some(&mut r), log) {
+        let mut run = match judged(sched.seed, sched.mutator.as_deref(), None, Some(&mut r), log) {
             Err(e) if e.is::<Divergence>() => {
                 println!("{pre}not confirmed: {e:#}");
                 return Ok(None);
@@ -247,7 +262,7 @@ fn main() -> anyhow::Result<()> {
         for k in (0..sched.steps.len()).filter(|&k| sched.steps[k].mutate) {
             log.clear();
             let mut r = Replay { fixed: fixed(), only: Some(k), diverged: None };
-            let mut run = match judged(sched.seed, sched.mutator.as_deref(), Some(&mut r), log) {
+            let mut run = match judged(sched.seed, sched.mutator.as_deref(), None, Some(&mut r), log) {
                 Err(e) if e.is::<Divergence>() => {
                     println!("{pre}minimize step {k}: not guilty, {e:#}");
                     continue;
@@ -273,9 +288,16 @@ fn main() -> anyhow::Result<()> {
                 s
             }
             None => {
+                let target = mutator.as_ref().and(pick(seed));
+                if let Some(t) = target {
+                    println!("target: {t:?}");
+                }
                 let r = discover(seed, &mut log);
                 print(&log);
                 let (class, run, s) = r?;
+                if target.is_some() && !s.steps.iter().any(|st| st.mutate) {
+                    println!("target not reached: unmutated");
+                }
                 if let Some(why) = run.unjudged {
                     println!("read half not judged: {why}");
                 }
@@ -296,6 +318,9 @@ fn main() -> anyhow::Result<()> {
     // §3.10: the sweep. Each row is written as its seed ends: an interrupted
     // campaign keeps them.
     let n = seeds.expect("checked with --campaign");
+    if mutator.is_some() && n < targets.len() as u64 {
+        println!("warning: {n} seeds < {} mutation targets; some are never mutated", targets.len());
+    }
     std::fs::create_dir_all(dir.join("runs")).with_context(|| dir.display().to_string())?;
     let mut tsv = std::fs::File::create(dir.join("runs.tsv"))?;
     writeln!(tsv, "seed\tclass\tstatus\tfinding\tdecisions\tpartial\tsecs\tnote")?;
