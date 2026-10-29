@@ -30,6 +30,8 @@ const CLONES: &[i64] = &[libc::SYS_clone, libc::SYS_clone3, libc::SYS_fork, libc
 /// A released clone with no child in the cgroup by then failed.
 const CLONE_WAIT: Duration = Duration::from_millis(100);
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/crfuzz";
+/// A trapped clone: (parent tid, instruction pointer, args).
+type Call = (u32, u64, [u64; 6]);
 
 #[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH: u32 = 0xC000_00B7;
@@ -71,11 +73,14 @@ pub struct GateBackend {
     tree_gated: BTreeSet<u32>,
     /// tid -> (name, tasks it has created so far).
     names: HashMap<u32, (String, u32)>,
-    /// Held clones, (notification id, parent tid), released one at a time.
-    clones: VecDeque<(u64, u32)>,
-    /// The released clone: its child's name (None: unknown parent), the
-    /// cgroup's tids before, released at.
-    in_flight: Option<(Option<String>, BTreeSet<u32>, Instant)>,
+    /// Held clones, (notification id, call), released one at a time.
+    clones: VecDeque<(u64, Call)>,
+    /// The released clone: its call, its child's name (None: unknown
+    /// parent), the cgroup's tids before, released at.
+    in_flight: Option<(Call, Option<String>, BTreeSet<u32>, Instant)>,
+    /// tid -> its last released clone, until it makes a child seen or the
+    /// thread traps anything else: the same call next is that attempt again.
+    retry: HashMap<u32, Call>,
 }
 
 impl GateBackend {
@@ -170,6 +175,7 @@ impl GateBackend {
             names,
             clones: VecDeque::new(),
             in_flight: None,
+            retry: HashMap::new(),
         })
     }
 
@@ -238,12 +244,22 @@ impl GateBackend {
     /// Attribute the in-flight clone's child, then release the next held clone.
     fn advance_clones(&mut self) -> Result<()> {
         loop {
-            if let Some((name, before, at)) = &self.in_flight {
+            if let Some((call, name, before, at)) = &self.in_flight {
                 let new: Vec<u32> = self.cgroup_ids("cgroup.threads")?.difference(before).copied().collect();
+                if !new.is_empty() {
+                    self.retry.remove(&call.0);
+                }
                 match new[..] {
+                    // The parent trapped another clone, so this one returned,
+                    // without a child. Move on now: if it's a restart
+                    // (ERESTARTNOINTR), holding it for CLONE_WAIT lets the next
+                    // signal land too (Go's sysmon sends SIGURG every ~10 ms to
+                    // a thread in its raw vfork) and the parent restarts forever.
+                    [] if self.clones.iter().any(|c| c.1 .0 == call.0) => {}
                     [] if at.elapsed() < CLONE_WAIT => return Ok(()),
                     // Unknown parent: the child stays unknown too.
                     [child] => {
+                        self.retry.remove(&child);
                         if let Some(name) = name {
                             self.names.insert(child, (name.clone(), 0));
                         }
@@ -253,26 +269,38 @@ impl GateBackend {
                     // none; leave them unnamed rather than guess.
                     // ponytail: a child that shows up after CLONE_WAIT lands
                     // in the next clone's window and, if that clone's child
-                    // never shows, takes its name; track unseen clones if
-                    // parents stall that long.
+                    // never shows, takes its name; and the parent's next
+                    // identical clone reads as a redo, so its child reuses this
+                    // index. Track unseen clones if parents stall that long.
                     _ => {}
                 }
                 self.in_flight = None;
             }
-            let Some((id, parent)) = self.clones.pop_front() else { return Ok(()) };
+            let Some((id, call)) = self.clones.pop_front() else { return Ok(()) };
             let before = self.cgroup_ids("cgroup.threads")?;
             // A dead thread's tid can be reused by a new one; drop its name so
             // the newcomer never inherits it.
             self.names.retain(|t, _| before.contains(t));
+            self.retry.retain(|t, _| before.contains(t));
             match notif_continue(self.notify.as_raw_fd(), id) {
-                // The index counts clone attempts, child seen or not, so a
-                // child that exits before we look still uses its index (D4).
+                // The index counts clone attempts (D4), so a failed clone still
+                // uses its index. A childless clone redone as the parent's very
+                // next trap is the same attempt: a signal restart
+                // (ERESTARTNOINTR) or a retry (EAGAIN). That is decided by
+                // the parent's syscall order, not by when the redo traps, so
+                // names stay stable.
+                // ponytail: a child that exits before we look reads as no
+                // child, so an identical clone right after it (no watched
+                // syscall between) shares its index, e.g. a pthread_create
+                // loop of short-lived compute threads (glibc's clone3 args
+                // repeat; mmap isn't watched); watch exit to see it.
                 Ok(()) => {
-                    let name = self.names.get_mut(&parent).map(|(name, kids)| {
-                        *kids += 1;
+                    let again = self.retry.insert(call.0, call) == Some(call);
+                    let name = self.names.get_mut(&call.0).map(|(name, kids)| {
+                        *kids += !again as u32;
                         format!("{name}/{}", *kids - 1)
                     });
-                    self.in_flight = Some((name, before, Instant::now()));
+                    self.in_flight = Some((call, name, before, Instant::now()));
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {} // parent died while held
                 Err(e) => return Err(e.into()),
@@ -289,9 +317,10 @@ impl GateBackend {
         };
         let (tid, nr) = (req.pid, req.data.nr as i64);
         if CLONES.contains(&nr) {
-            self.clones.push_back((req.id, tid));
+            self.clones.push_back((req.id, (tid, req.data.instruction_pointer, req.data.args)));
             return Ok(None);
         }
+        self.retry.remove(&tid);
         // A child of the in-flight clone can trap before we've seen it appear.
         // Don't fail here: req.id exists nowhere else, so its thread would
         // stay parked for good. The error resurfaces at the next poll.
@@ -325,6 +354,7 @@ impl GateBackend {
             if let Some(n) = self.names.remove(&ev.tid) {
                 self.names.insert(ev.tgid, n);
             }
+            self.retry.remove(&ev.tgid);
         }
         match notif_continue(self.notify.as_raw_fd(), ev.id) {
             Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Err(e.into()),
@@ -355,7 +385,7 @@ impl GateBackend {
     pub fn ungate_tree(&mut self) -> Result<()> {
         // A clone in flight couldn't run while gated: restart its wait, or a
         // long hold would make it look failed and leave its child unnamed (D4).
-        if let Some((_, _, at)) = &mut self.in_flight {
+        if let Some((_, _, _, at)) = &mut self.in_flight {
             *at = Instant::now();
         }
         for t in std::mem::take(&mut self.tree_gated) {
