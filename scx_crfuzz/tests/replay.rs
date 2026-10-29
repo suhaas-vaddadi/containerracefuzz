@@ -56,7 +56,11 @@ fn discover_confirm_minimize() {
     let log = d.join("schedule");
     let (log_s, m_s, l_s, sut_s, p_s) = (log.to_str().unwrap(), m.to_str().unwrap(), layout.to_str().unwrap(), sut.to_str().unwrap(), p.to_str().unwrap());
 
-    let out = (0..8)
+    // One mutation target per seed. Each invocation's baseline runs under its
+    // own seed; the SUT is single-threaded, so the targets match and 64 seeds
+    // cover every one (16 here, more where the loader searches more paths);
+    // stops at the first hit.
+    let out = (0..64)
         .map(|seed| {
             let seed = seed.to_string();
             crfuzz(&["--attacker", "65534:65534", "--seed", &seed, "--mutator", m_s, "--layout", l_s, "--log", log_s, "--", sut_s, p_s])

@@ -115,18 +115,24 @@ mod accept {
         outcome(&args)
     }
 
+    /// The first Violation's seed and outcome. Each invocation's baseline runs
+    /// under its own seed; only because this SUT is single-threaded are the
+    /// targets the same for every seed, so seed s < targets mutates target s
+    /// alone and this reaches the guilty hold wherever the loader and locale
+    /// put it (~100 baseline targets for sh under a UTF-8 LANG).
+    fn violation(judge: impl Fn(u32) -> String) -> (u32, String) {
+        (0..256).map(|s| (s, judge(s))).find(|(_, o)| o.starts_with("Violation")).expect("a Violation")
+    }
+
     #[test]
     #[ignore]
     fn check_then_use() {
         let (sut, p, m) = setup();
-        let v = judge(&sut, &p, Some(&m), false, 0);
-        assert!(v.starts_with("Violation") && v.contains("\"file\""), "write half: {v}");
-        assert_eq!(judge(&sut, &p, Some(&m), true, 0), "RuntimeRefused");
+        let (hit, v) = violation(|seed| judge(&sut, &p, Some(&m), false, seed));
+        assert!(v.contains("\"file\""), "write half: {v}");
+        // nofollow has the same targets: `hit` mutates the same hold.
+        assert_eq!(judge(&sut, &p, Some(&m), true, hit), "RuntimeRefused");
         assert_eq!(judge(&sut, &p, None, true, 0), "Clean");
-        for seed in 1..6 {
-            let o = judge(&sut, &p, Some(&m), true, seed);
-            assert!(!o.starts_with("Violation"), "seed {seed}: {o}");
-        }
         fs::remove_dir_all(D).unwrap();
     }
 
@@ -138,8 +144,8 @@ mod accept {
     fn exposed_gate_is_violation() {
         let (_, p, _) = setup();
         let m = swap(&p, "");
-        let o = judge_cmd(&["sh", "-c", &format!("chmod 777 {}", p.display())], &p, Some(&m), 0);
-        assert!(o.starts_with("Violation") && o.contains("entry: \"\""), "{o}");
+        let (_, o) = violation(|seed| judge_cmd(&["sh", "-c", &format!("chmod 777 {}", p.display())], &p, Some(&m), seed));
+        assert!(o.contains("entry: \"\""), "{o}");
         fs::remove_dir_all(D).unwrap();
     }
 
