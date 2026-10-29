@@ -4,7 +4,8 @@
 
 use crate::pos::{EventId, Keys};
 use anyhow::{bail, ensure, Context, Result};
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
@@ -259,16 +260,49 @@ impl std::str::FromStr for Schedule {
 /// A run's decisions as one canonical member of their partial order (§1.3):
 /// two are ordered iff on one thread or their keys conflict (D3), earlier
 /// first; ties go to the smallest `EventId`. Equal outputs, same partial order.
-/// ponytail: O(n³) in decisions, fine for hundreds; a ready set if runs get long.
+/// Edges with the ordered pairs' transitive closure (so the same ready sets),
+/// O(n + keys) of them: the thread's last, the last `all` and (for an `all`)
+/// everything since, each key's last writer and (for a writer) its readers
+/// since; relies on writes ⊆ reads. Then the smallest ready one from a heap.
 pub fn canonical(log: &[(&EventId, &Keys)]) -> Vec<EventId> {
-    let before = |i: usize, j: usize| log[i].0.thread == log[j].0.thread || log[i].1.conflicts(log[j].1);
-    let mut done = vec![false; log.len()];
+    let mut after = vec![Vec::new(); log.len()];
+    let mut waits = vec![0usize; log.len()];
+    let mut threads = HashMap::new();
+    let mut last_all = None;
+    // Per key: its last writer, and its readers since (that writer included).
+    let mut keys: BTreeMap<_, (Option<usize>, Vec<usize>)> = BTreeMap::new();
+    for (j, (id, k)) in log.iter().enumerate() {
+        debug_assert!(k.writes.is_subset(&k.reads));
+        let mut pre: Vec<usize> = threads.insert(&id.thread, j).into_iter().chain(last_all).collect();
+        if k.all {
+            pre.extend(last_all.map_or(0, |a| a + 1)..j);
+            last_all = Some(j);
+        } else {
+            for key in &k.reads {
+                let (w, rs) = keys.entry(key).or_default();
+                pre.extend(*w);
+                if k.writes.contains(key) {
+                    pre.append(rs);
+                    *w = Some(j);
+                }
+                rs.push(j);
+            }
+        }
+        pre.sort_unstable();
+        pre.dedup();
+        waits[j] = pre.len();
+        pre.into_iter().for_each(|i| after[i].push(j));
+    }
+    let mut ready: BinaryHeap<_> = (0..log.len()).filter(|&j| waits[j] == 0).map(|j| Reverse((log[j].0, j))).collect();
     let mut out = Vec::with_capacity(log.len());
-    while out.len() < log.len() {
-        let ready = (0..log.len()).filter(|&j| !done[j] && (0..j).all(|i| done[i] || !before(i, j)));
-        let j = ready.min_by_key(|&j| log[j].0).expect("the first undone decision is ready");
-        done[j] = true;
-        out.push(log[j].0.clone());
+    while let Some(Reverse((id, i))) = ready.pop() {
+        out.push(id.clone());
+        for &j in &after[i] {
+            waits[j] -= 1;
+            if waits[j] == 0 {
+                ready.push(Reverse((log[j].0, j)));
+            }
+        }
     }
     out
 }
@@ -384,6 +418,50 @@ mod tests {
         // `all` conflicts with everything.
         let all = Keys { all: true, ..Keys::default() };
         assert_ne!(order(&[(&b, &all), (&a, &ka)]), order(&[(&a, &ka), (&b, &all)]));
+    }
+
+    #[test]
+    fn canonical_matches_rescan() {
+        use crate::pos::Key;
+        // The old O(n³) rescan: the smallest ready decision, each step.
+        let rescan = |log: &[(&EventId, &Keys)]| {
+            let before = |i: usize, j: usize| log[i].0.thread == log[j].0.thread || log[i].1.conflicts(log[j].1);
+            let mut done = vec![false; log.len()];
+            let mut out = Vec::new();
+            while out.len() < log.len() {
+                let j = (0..log.len()).filter(|&j| !done[j] && (0..j).all(|i| done[i] || !before(i, j))).min_by_key(|&j| log[j].0).unwrap();
+                done[j] = true;
+                out.push(log[j].0.clone());
+            }
+            out
+        };
+        // Deterministic jumbles: 1 to 4 threads, 4 inodes, some writes, some
+        // `all` (most, when skewed), and ids that often repeat (the tie-break).
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..60u64 {
+            let (threads, alls) = (case % 4 + 1, if case % 3 == 0 { 12 } else { 1 });
+            let evs: Vec<(EventId, Keys)> = (0..case * 5)
+                .map(|_| {
+                    let r = next();
+                    let id = EventId { thread: format!("0/{}", r % threads), nr: 257, path: Some(format!("/p{}", r >> 8 & 1).into()), n: (r >> 12 & 1) as u32 };
+                    let (a, b) = (Key::Ino(0, r >> 16 & 3), Key::Ino(0, r >> 20 & 3));
+                    let keys = match r >> 24 & 15 {
+                        n if n < alls => Keys { all: true, ..Keys::default() },
+                        12.. => Keys { reads: [a.clone(), b].into(), writes: [a].into(), all: false },
+                        _ => Keys { reads: [a, b].into(), ..Keys::default() },
+                    };
+                    (id, keys)
+                })
+                .collect();
+            let log: Vec<_> = evs.iter().map(|(id, k)| (id, k)).collect();
+            assert_eq!(canonical(&log), rescan(&log), "case {case}");
+        }
     }
 
     #[test]
