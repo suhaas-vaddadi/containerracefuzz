@@ -114,7 +114,7 @@ fn observer(d: &Path) -> std::path::PathBuf {
     let m = d.join("m.sh");
     let status = |k: &str| format!("$(awk '/^{k}:/ {{print $2}}' /proc/self/status)");
     let line = format!("$1 $(id -u) $(id -g) $(pwd) $(readlink /proc/self/ns/mnt) {} $CRFUZZ_SEED {} {} {} {} $(awk '/^Groups:/ {{print NF-1}}' /proc/self/status)", status("Seccomp"), status("NoNewPrivs"), status("CapPrm"), status("CapEff"), status("CapAmb"));
-    fs::write(&m, format!("#!/bin/sh\necho \"{line}\" >> {}/log\n", d.display())).unwrap();
+    fs::write(&m, format!("#!/bin/sh\necho \"{line}\" >> {0}/log\necho \"$CRFUZZ_CANARY\" > {0}/canary\n", d.display())).unwrap();
     fs::set_permissions(&m, fs::Permissions::from_mode(0o755)).unwrap();
     m
 }
@@ -156,6 +156,24 @@ fn self_check_enoent_passes() {
     judged_run(cmd, &[libc::SYS_unlinkat], &m, &c, "65534:65534").unwrap();
     let log = fs::read_to_string(d.join("log")).unwrap();
     assert!(log.lines().any(|l| l.starts_with(&format!("{}/f ", d.display()))), "mutator ran: {log:?}");
+    assert_eq!(fs::read_to_string(d.join("canary")).unwrap(), "\n", "no canary in this view to name");
+    fs::remove_dir_all(d).unwrap();
+}
+
+/// §4 passes with another directory at the canary's path in the SUT's view:
+/// the mutator runs, and CRFUZZ_CANARY doesn't name it.
+#[test]
+#[ignore]
+fn self_check_other_dir_passes() {
+    let d = Path::new("/tmp/crfuzz_mut_other");
+    let m = observer(d);
+    let c = Canary::create(304).unwrap();
+    let mut cmd = Command::new("unshare");
+    cmd.args(["-m", "sh", "-c"]).arg(format!("mount -t tmpfs none /var/lib/crfuzz && mkdir -p {} && rm {}/f", c.dir.display(), d.display()));
+    judged_run(cmd, &[libc::SYS_unlinkat], &m, &c, "65534:65534").unwrap();
+    let log = fs::read_to_string(d.join("log")).unwrap();
+    assert!(log.lines().any(|l| l.starts_with(&format!("{}/f ", d.display()))), "mutator ran: {log:?}");
+    assert_eq!(fs::read_to_string(d.join("canary")).unwrap(), "\n", "not the canary there to name");
     fs::remove_dir_all(d).unwrap();
 }
 
@@ -177,5 +195,6 @@ fn mutator_runs_as_alice() {
     assert_eq!(f[1..3], ["65534", "65534"], "{line}");
     assert_eq!(f[7..], ["1", none, none, none, "0"], "NoNewPrivs, no caps, no groups: {line}");
     assert!(log.lines().all(|l| l.split(' ').nth(1) == Some("65534") && l.ends_with(&format!(" 1 {none} {none} {none} 0"))), "{log}");
+    assert_eq!(fs::read_to_string(d.join("canary")).unwrap(), format!("{}\n", c.dir.display()));
     fs::remove_dir_all(d).unwrap();
 }
