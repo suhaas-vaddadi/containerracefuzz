@@ -486,8 +486,8 @@ struct View {
     /// Some: alice's CapEff, set as effective and permitted, then NO_NEW_PRIVS.
     caps: Option<u64>,
     /// §4: the canary path, whether root can't find it in this view either,
-    /// and the gate's `(dev, ino)`.
-    gate: Option<(CString, bool, (u64, u64))>,
+    /// whether root finds the gate itself there, and the gate's `(dev, ino)`.
+    gate: Option<(CString, bool, bool, (u64, u64))>,
     /// The canary's `(dev, ino)`s: a root or cwd among them is the held
     /// task's way in, not alice's.
     ids: Vec<(u64, u64)>,
@@ -549,8 +549,10 @@ impl GateBackend {
         let gate = match canary {
             Some(c) => {
                 let gate = CString::new(c.dir.as_os_str().as_bytes())?;
-                let gone = absent(&root, &gate, 0);
-                Some((gate, gone, c.before[Path::new("")].id))
+                let id = c.before[Path::new("")].id;
+                let at = open_in(&root, &gate, 0);
+                let gone = matches!(&at, Err(e) if e.raw_os_error() == Some(libc::ENOENT));
+                Some((gate, gone, at.is_ok_and(|f| cached_id(&f) == Some(id)), id))
             }
             None => None,
         };
@@ -570,7 +572,9 @@ impl GateBackend {
     /// Judged, as alice (§10.1): her ids mapped into the task's user namespace,
     /// her caps, NO_NEW_PRIVS, self-checked against the canary at the given
     /// path (§4); unjudged, with the task's own ids (D6). `prog` gets the path
-    /// as issued; killed after `timeout`.
+    /// as issued; killed after `timeout`. CRFUZZ_CANARY names a fresh
+    /// directory each run (and replay): choices must come from CRFUZZ_SEED,
+    /// never from that name, or replay can't fire the same mutation (D6).
     // ponytail: `prog` is exec'd after the chroot, so it (and a script's
     // interpreter) must exist inside the task's root; exec it from an fd opened
     // beforehand once a target has its own root (runc).
@@ -590,6 +594,11 @@ impl GateBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Only where that path is the canary in the task's view: its own root
+        // or mounts can hide it or put something else there.
+        if let (Some((_, canary)), Some((_, _, true, _))) = (judge, &view.gate) {
+            cmd.env("CRFUZZ_CANARY", &canary.dir);
+        }
         unsafe {
             cmd.pre_exec(move || view.enter());
         }
@@ -795,20 +804,31 @@ impl GateBackend {
     }
 }
 
-/// §4's root-side look: true iff `path` is not in the view rooted at `root`
-/// at all. RESOLVE_IN_ROOT: absolute symlinks stay inside that root, as they
-/// will for the chrooted child. Any other error counts as present, so alice
-/// must then get EACCES.
-fn absent(root: &File, path: &CStr, flags: i32) -> bool {
+/// `path` opened O_PATH as root in the view rooted at `root`. RESOLVE_IN_ROOT:
+/// absolute symlinks stay inside that root, as they will for the chrooted child.
+fn open_in(root: &File, path: &CStr, flags: i32) -> std::io::Result<File> {
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = (libc::O_PATH | libc::O_CLOEXEC | flags) as u64;
     how.resolve = libc::RESOLVE_IN_ROOT;
     let fd = unsafe { libc::syscall(libc::SYS_openat2, root.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<libc::open_how>()) };
-    if fd >= 0 {
-        unsafe { libc::close(fd as i32) };
-        return false;
+    if fd < 0 {
+        return Err(Error::last_os_error());
     }
-    Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+    Ok(unsafe { File::from_raw_fd(fd as i32) })
+}
+
+/// `f`'s `(dev, ino)` from cached attributes: no FS callback (a FUSE getattr
+/// served by a gated task would block).
+fn cached_id(f: &File) -> Option<(u64, u64)> {
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::statx(f.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC, libc::STATX_INO, &mut st) };
+    (r == 0).then(|| (libc::makedev(st.stx_dev_major, st.stx_dev_minor), st.stx_ino))
+}
+
+/// §4's root-side look: true iff `path` is not in the view rooted at `root`
+/// at all. Any other error counts as present, so alice must then get EACCES.
+fn absent(root: &File, path: &CStr, flags: i32) -> bool {
+    matches!(open_in(root, path, flags), Err(e) if e.raw_os_error() == Some(libc::ENOENT))
 }
 
 /// §5 read before: before the SUT, alice must be stopped at every canary
@@ -840,7 +860,7 @@ pub fn read_before(canary: &Canary, alice: &Alice) -> Result<()> {
         gid: vec![alice.gid; 3],
         groups: alice.groups.clone(),
         caps: Some(alice.cap_eff),
-        gate: Some((gate, gate_gone, canary.before[Path::new("")].id)),
+        gate: Some((gate, gate_gone, false, canary.before[Path::new("")].id)),
         ids: canary.ids().into_keys().collect(),
     };
     let pid = unsafe { libc::fork() };
@@ -924,7 +944,7 @@ impl View {
         } else {
             ok(libc::setresuid(self.uid[0], self.uid[1], self.uid[2]))?;
         }
-        let Some((gate, gone, id)) = &self.gate else { return Ok(()) };
+        let Some((gate, gone, _, id)) = &self.gate else { return Ok(()) };
         // A root inside the canary hides the gate behind ENOENT. `view` refuses
         // one already; this keeps read_before's hand-built view honest too.
         if self.inside(&self.root) {
