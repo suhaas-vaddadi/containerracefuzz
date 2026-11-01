@@ -37,7 +37,7 @@ fn mutator_runs_as_held_task() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let ms = Duration::from_millis;
     let mut log = Vec::new();
-    run(&mut be, &mut Pos::new(1), Some(&m), None, None, ms(1), ms(200), deadline, &mut log).unwrap();
+    run(&mut be, &mut Pos::new(1), Some(&m), None, None, None, ms(1), ms(200), deadline, &mut log).unwrap();
     assert!(be.child().wait().unwrap().success());
 
     let hold = log.iter().find(|d| d.id.path.as_deref() == Some(Path::new("f"))).expect("cat's open of f decided");
@@ -124,7 +124,7 @@ fn judged_run(cmd: Command, watched: &[i64], m: &Path, canary: &Canary, alice: &
     let mut be = GateBackend::spawn(cmd, watched).unwrap();
     let mut j = Judge { canary, alice: Alice::parse(alice).unwrap(), reached: None, task: None };
     let ms = Duration::from_millis;
-    run(&mut be, &mut Pos::new(1), Some(m), None, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(30), &mut Vec::new())
+    run(&mut be, &mut Pos::new(1), Some(m), None, None, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(30), &mut Vec::new())
 }
 
 /// §4 aborts: alice as uid 0 (no caps) owns the gate, so it doesn't stop her:

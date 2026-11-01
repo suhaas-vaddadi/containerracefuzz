@@ -94,15 +94,17 @@ impl std::error::Error for Deadline {}
 
 /// Run the SUT under POS until it exits, appending each decision to `log`
 /// (caller-owned, so it survives every ending). With a `mutator`, fire it at
-/// every hold whose event has a known path. With a `judge`, the mutator runs as
-/// alice, self-checked against the canary (§4, §10.1), and the root process's
-/// `exit_group` is probed (§5). Fails with `Deadline` at `deadline` (a hung or
-/// deadlocked SUT), with `SelfCheckFailed` if alice gets past the gate, with
-/// `Divergence` if a `replay` leaves its schedule.
+/// the `target` event's hold alone (None: every hold whose event has a known
+/// path); a replay fires where its schedule says instead. With a `judge`, the
+/// mutator runs as alice, self-checked against the canary (§4, §10.1), and
+/// the root process's `exit_group` is probed (§5). Fails with `Deadline` at
+/// `deadline` (a hung or deadlocked SUT), with `SelfCheckFailed` if alice gets
+/// past the gate, with `Divergence` if a `replay` leaves its schedule.
 pub fn run(
     be: &mut GateBackend,
     pos: &mut Pos,
     mutator: Option<&Path>,
+    target: Option<&EventId>,
     mut replay: Option<&mut Replay>,
     mut judge: Option<&mut Judge>,
     interval: Duration,
@@ -167,6 +169,7 @@ pub fn run(
         let Some(i) = pick else { continue };
         let (ev, id) = (held.remove(i), ids.remove(i));
         let seed = pos.event_seed(&id);
+        let hit = !ev.keys.all && target.map_or(true, |t| *t == id);
         // Logged at once: every ending from here keeps it (§10.3).
         log.push(Decision { id, keys: ev.keys.clone(), partial: !complete, mutation: None });
         // The whole tree stays put while the mutator runs (§3.3); answer
@@ -179,7 +182,7 @@ pub fn run(
         }
         let judged = judge.as_deref().map(|j| (&j.alice, j.canary));
         let mutation = match mutator {
-            Some(prog) if ev.path.is_some() && fire.unwrap_or(!ev.keys.all) => {
+            Some(prog) if ev.path.is_some() && fire.unwrap_or(hit) => {
                 be.gate_tree()?;
                 match be.mutate(&ev, prog, judged, seed, MUTATOR_TIMEOUT) {
                     // §4: the run ends here (main judges whether the SUT opened

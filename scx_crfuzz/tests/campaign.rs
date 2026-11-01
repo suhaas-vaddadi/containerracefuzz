@@ -1,4 +1,4 @@
-//! M8: a campaign over check_use dedups to one finding; over the corrected
+//! M8: a campaign over check_use dedups to findings on `p`; over the corrected
 //! bundle, none. Needs root, a running scx_crfuzz_gated and cc:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
@@ -9,10 +9,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const D: &str = "/tmp/crfuzz_campaign";
+/// One mutation target per seed; the baseline has 16 here (more where the loader
+/// searches more paths), so 48 hits each guilty hold on `p` at least twice:
+/// the second is a repeat. Assumes at most 24 targets (else no repeat is
+/// guaranteed) and at most 48 (else the seeds < targets warning).
+const SEEDS: usize = 48;
 
 /// A campaign's stdout; fails on a crfuzz error. Removes the canaries it kept.
 fn campaign(dir: &Path, cmd: &[&str], m: &Path, layout: &Path) -> String {
-    let mut args = vec!["--campaign", dir.to_str().unwrap(), "--seeds", "8", "--attacker", "65534:65534"];
+    let seeds = SEEDS.to_string();
+    let mut args = vec!["--campaign", dir.to_str().unwrap(), "--seeds", &seeds, "--attacker", "65534:65534"];
     args.extend(["--mutator", m.to_str().unwrap(), "--layout", layout.to_str().unwrap(), "--"]);
     args.extend(cmd);
     let child = Command::new(env!("CARGO_BIN_EXE_scx_crfuzz")).args(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -61,25 +67,32 @@ fn campaign_dedups() {
     let c = d.join("bug");
     let out = campaign(&c, &[sut_s, p_s], &m, &layout);
     assert!(line(&out, "campaign: ").contains(" 0 invalid"), "{out}");
-    assert_eq!(line(&out, "findings: "), "1", "{out}");
+    assert!(!out.contains("warning:"), "{out}");
+    let n: usize = line(&out, "findings: ").parse().unwrap();
+    assert!(n >= 1, "{out}");
+    // Every finding's guilty hold is on `p`.
+    assert_eq!(out.lines().filter(|l| l.starts_with("finding #") && l.contains(&format!(" {p_s}), "))).count(), n, "{out}");
     assert!(line(&out, "distinct partial orders: ").parse::<usize>().unwrap() >= 1, "{out}");
-    assert_eq!(fs::read_dir(c.join("runs")).unwrap().count(), 8);
+    assert_eq!(fs::read_dir(c.join("runs")).unwrap().count(), SEEDS);
     // runs.tsv: header, then seed class status finding ...
     let tsv = fs::read_to_string(c.join("runs.tsv")).unwrap();
-    assert_eq!(tsv.lines().count(), 9, "{tsv}");
+    assert_eq!(tsv.lines().count(), SEEDS + 1, "{tsv}");
     let rows: Vec<Vec<&str>> = tsv.lines().skip(1).map(|l| l.split('\t').collect()).collect();
-    let mut want: Vec<&str> = rows.iter().filter(|r| matches!(r[2], "new" | "repeat")).map(|r| r[0]).collect();
-    assert!(rows.iter().all(|r| !matches!(r[2], "new" | "repeat") || r[3] == "1"), "{tsv}");
-    let seeds = fs::read_to_string(c.join("findings/1/seeds")).unwrap();
-    let mut got: Vec<&str> = seeds.lines().collect();
-    want.sort();
-    got.sort();
-    assert_eq!(got, want, "{tsv}");
-    assert!(fs::read_to_string(c.join("findings/1/schedule")).unwrap().contains("outcome Violation"));
+    assert!(rows.iter().any(|r| r[2] == "repeat"), "{tsv}");
+    for i in 1..=n {
+        let f = c.join(format!("findings/{i}"));
+        let mut want: Vec<&str> = rows.iter().filter(|r| r[3] == i.to_string()).map(|r| r[0]).collect();
+        let seeds = fs::read_to_string(f.join("seeds")).unwrap();
+        let mut got: Vec<&str> = seeds.lines().collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "{tsv}");
+        assert!(fs::read_to_string(f.join("schedule")).unwrap().contains("outcome Violation"));
+    }
 
     let c = d.join("fixed");
     let out = campaign(&c, &[sut_s, p_s, "nofollow"], &m, &layout);
     assert_eq!(line(&out, "findings: "), "0", "{out}");
-    assert_eq!(fs::read_dir(c.join("runs")).unwrap().count(), 8);
+    assert_eq!(fs::read_dir(c.join("runs")).unwrap().count(), SEEDS);
     fs::remove_dir_all(d).unwrap();
 }
