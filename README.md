@@ -72,9 +72,9 @@ behind, `sudo scx_crfuzz_gated --reset` clears every gate.
 ### `scx_crfuzz`
 
 ```
-scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--log FILE] -- CMD [ARGS...]
+scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--scope DIR]... [--log FILE] -- CMD [ARGS...]
 scx_crfuzz --replay FILE
-scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] -- CMD [ARGS...]
+scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] [--scope DIR]... -- CMD [ARGS...]
 ```
 
 | Flag | Meaning |
@@ -83,6 +83,7 @@ scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layou
 | `--seed N` | POS seed (default 0). Same seed ⇒ same partial order of held events. A seed runs its baseline, then one run per **window**: per distinct `(syscall, path, occurrence)` hold of the baseline with a path. |
 | `--mutator PROG` | Run at one window's hold per run, as alice inside the held task's namespaces, root and cwd. Gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL` and `CRFUZZ_SEED`. Must exist inside the task's root. 15 s watchdog; a failure is logged, never a finding. |
 | `--layout PROG` | Run as root before **every** run (baseline, discovery, confirm, each minimization, each campaign seed) to restore the starting filesystem. A failure makes the run invalid. |
+| `--scope DIR` | Repeatable. Only holds whose absolute path is under one of the DIRs (where the attacker can act) become windows. Default: every hold with a path. |
 | `--log FILE` | Write each Violating window k's schedule to `FILE.k`, then confirm and minimize it. |
 | `--replay FILE` | Rerun a schedule: baseline, strict confirm, minimize. |
 | `--campaign DIR --seeds N` | Sweep seeds `0..N`, each over all its windows (see below). `DIR` must be absent or empty. |

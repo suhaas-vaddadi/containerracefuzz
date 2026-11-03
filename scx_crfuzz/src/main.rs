@@ -1,6 +1,6 @@
-//! scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--log FILE] -- CMD [ARGS...]
+//! scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--scope DIR]... [--log FILE] -- CMD [ARGS...]
 //! scx_crfuzz --replay FILE
-//! scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] -- CMD [ARGS...]
+//! scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] [--scope DIR]... -- CMD [ARGS...]
 //!
 //! A seed is exhaustive over its windows. Run CMD under POS (discovery) with
 //! a baseline under the seed, no mutator, then once per window, each run with
@@ -9,7 +9,9 @@
 //! keys.all and not a `?tid`, one per (syscall, path, occurrence): with
 //! `--mutator`, PROG (a binary or a script with a #!) runs at window k's hold
 //! alone, once, as alice in the held task's view: its namespaces, root and
-//! cwd, the path as issued in argv[1] (§10.1). Prints alice, then per window `window k/n target:`, its
+//! cwd, the path as issued in argv[1] (§10.1). `--scope DIR` (repeatable)
+//! keeps only windows whose absolute path is under one of the DIRs: where
+//! alice can act. Prints alice, then per window `window k/n target:`, its
 //! decision log and outcome class (§6); a window that never reaches its
 //! target is unmutated. Ends with the seed's verdict: `safe` (every window
 //! valid, mutated and no Violation), `unsafe` (a window's Violation),
@@ -58,7 +60,7 @@ fn main() -> anyhow::Result<()> {
 
     /// Replays a discovery gets to reproduce before it counts as unconfirmed.
     const CONFIRM_TRIES: u32 = 3;
-    const USAGE: &str = "usage: scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--log FILE] -- CMD [ARGS...]\n       scx_crfuzz --replay FILE\n       scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] -- CMD [ARGS...]";
+    const USAGE: &str = "usage: scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--scope DIR]... [--log FILE] -- CMD [ARGS...]\n       scx_crfuzz --replay FILE\n       scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] [--scope DIR]... -- CMD [ARGS...]";
     // ponytail: a fixed watch set (the path syscalls D3 decodes, minus execve,
     // which needs CMD as a path) and fixed timing; flags when a scenario needs them.
     const WATCHED: &[i64] = &[
@@ -101,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         _ => None,
     };
     let (mut seed, mut mutator, mut layout, mut attacker, mut log_file) = (0u64, None, None, None, None);
-    let (mut campaign, mut seeds) = (None, None);
+    let (mut campaign, mut seeds, mut scope) = (None, None, Vec::<PathBuf>::new());
     let cmd: Vec<String> = match &loaded {
         Some(s) => {
             (seed, mutator, layout, attacker) = (s.seed, s.mutator.clone(), s.layout.clone(), Some(Alice::parse(&s.attacker)?));
@@ -118,6 +120,7 @@ fn main() -> anyhow::Result<()> {
                     Some("--layout") => layout = Some(std::fs::canonicalize(args.next().context(USAGE)?).context("--layout")?),
                     Some("--log") => log_file = Some(PathBuf::from(args.next().context(USAGE)?)),
                     Some("--campaign") => campaign = Some(PathBuf::from(args.next().context(USAGE)?)),
+                    Some("--scope") => scope.push(std::fs::canonicalize(args.next().context(USAGE)?).context("--scope")?),
                     Some("--seeds") => seeds = Some(args.next().context(USAGE)?.parse::<u64>().context("--seeds")?),
                     Some("--") => break args.collect(),
                     _ => bail!(USAGE),
@@ -207,8 +210,10 @@ fn main() -> anyhow::Result<()> {
 
     // A seed's baseline, which must leak nothing: its exit (for the oracle),
     // its windows' targets and its time. The targets are the holds a mutator
-    // could fire at, named stably (not `?tid`), one per (syscall, path, occurrence): the engine
+    // could fire at, named stably (not `?tid`), with --scope only those under
+    // a scope directory, one per (syscall, path, occurrence): the engine
     // matches those in any thread.
+    let in_scope = |p: &Path| scope.is_empty() || scope.iter().any(|d| p.starts_with(d));
     let baseline = |seed: u64, log: &mut Vec<Decision>| -> Result<(Option<ExitStatus>, Vec<EventId>, f64)> {
         log.clear();
         let t = Instant::now();
@@ -220,7 +225,7 @@ fn main() -> anyhow::Result<()> {
         let mut seen = HashSet::new();
         let targets = log
             .iter()
-            .filter(|d| d.id.path.is_some() && !d.keys.all && !d.id.thread.starts_with('?'))
+            .filter(|d| d.id.path.as_deref().is_some_and(in_scope) && !d.keys.all && !d.id.thread.starts_with('?'))
             .filter(|d| seen.insert((d.id.nr, d.id.path.clone(), d.id.n)))
             .map(|d| d.id.clone())
             .collect();
