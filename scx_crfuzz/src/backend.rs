@@ -97,8 +97,11 @@ impl GateBackend {
         }
         let gate = GateMap::open()?;
         let cgroup = PathBuf::from(format!("{CGROUP_ROOT}/run-{}", gate.epoch));
-        fs::create_dir_all(&cgroup).with_context(|| cgroup.display().to_string())?;
-        let procs = File::options().write(true).open(cgroup.join("cgroup.procs"))?;
+        // The SUT in a leaf, `run-N/sut`: cgroup v2 forbids processes in a cgroup
+        // whose children have controllers, so a container cgroup can then sit
+        // beside it under `run-N` (runc's `--cgroup`), tracked with the tree.
+        fs::create_dir_all(cgroup.join("sut")).with_context(|| cgroup.display().to_string())?;
+        let procs = File::options().write(true).open(cgroup.join("sut/cgroup.procs"))?;
         let filter = notify_filter(&watched);
 
         let mut socks = [0; 2];
