@@ -1049,7 +1049,8 @@ fn notify_filter(watched: &[i64]) -> Vec<libc::sock_filter> {
 }
 
 /// Path arguments of syscall `nr`: (dirfd arg, path arg, whether the syscall
-/// rebinds that path). The first is the event's path.
+/// writes that path: rebinds its name, or changes the permissions a walk
+/// through it is checked against). The first is the event's path.
 fn path_args(nr: i64) -> &'static [(Option<usize>, usize, bool)] {
     match nr {
         libc::SYS_openat
@@ -1058,9 +1059,9 @@ fn path_args(nr: i64) -> &'static [(Option<usize>, usize, bool)] {
         | libc::SYS_statx
         | libc::SYS_faccessat
         | libc::SYS_faccessat2
-        | libc::SYS_readlinkat
-        | libc::SYS_fchmodat
-        | libc::SYS_fchownat => &[(Some(0), 1, false)],
+        | libc::SYS_readlinkat => &[(Some(0), 1, false)],
+        // A chmod or chown of a directory decides whether a walk through it passes.
+        libc::SYS_fchmodat | libc::SYS_fchownat => &[(Some(0), 1, true)],
         libc::SYS_unlinkat | libc::SYS_mkdirat | libc::SYS_mknodat => &[(Some(0), 1, true)],
         libc::SYS_renameat2 => &[(Some(0), 1, true), (Some(2), 3, true)],
         libc::SYS_linkat => &[(Some(0), 1, false), (Some(2), 3, true)],
@@ -1407,6 +1408,10 @@ mod tests {
         let (_, k) = observe(tid, libc::SYS_linkat, &[at, f.as_ptr() as u64, at, new.as_ptr() as u64, 0, 0]);
         assert!(k.reads.contains(&name("f")) && !k.writes.contains(&name("f")));
         assert!(k.writes.contains(&name("new")));
+
+        // fchmodat writes its target: a walk through a chmod'd directory can change.
+        let (_, k) = observe(tid, libc::SYS_fchmodat, &[at, f.as_ptr() as u64, 0o600, 0, 0, 0]);
+        assert!(!k.all && k.writes.contains(&name("f")));
         fs::remove_dir_all(&d).unwrap();
     }
 
