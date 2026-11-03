@@ -9,11 +9,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const D: &str = "/tmp/crfuzz_campaign";
-/// One mutation target per seed; the baseline has 16 here (more where the loader
-/// searches more paths), so 48 hits each guilty hold on `p` at least twice:
-/// the second is a repeat. Assumes at most 24 targets (else no repeat is
-/// guaranteed) and at most 48 (else the seeds < targets warning).
-const SEEDS: usize = 48;
+/// Each seed runs every window, so each guilty hold on `p` is hit once per
+/// seed: the second seed's are repeats.
+const SEEDS: usize = 2;
 
 /// A campaign's stdout; fails on a crfuzz error. Removes the canaries it kept.
 fn campaign(dir: &Path, cmd: &[&str], m: &Path, layout: &Path) -> String {
@@ -33,6 +31,11 @@ fn campaign(dir: &Path, cmd: &[&str], m: &Path, layout: &Path) -> String {
     }
     eprintln!("{out}");
     out
+}
+
+/// Schedules under `DIR/runs/<seed>/`.
+fn runs(dir: &Path) -> usize {
+    fs::read_dir(dir.join("runs")).unwrap().map(|s| fs::read_dir(s.unwrap().path()).unwrap().count()).sum()
 }
 
 fn line<'a>(out: &'a str, prefix: &str) -> &'a str {
@@ -67,23 +70,23 @@ fn campaign_dedups() {
     let c = d.join("bug");
     let out = campaign(&c, &[sut_s, p_s], &m, &layout);
     assert!(line(&out, "campaign: ").contains(" 0 invalid"), "{out}");
-    assert!(!out.contains("warning:"), "{out}");
     let n: usize = line(&out, "findings: ").parse().unwrap();
     assert!(n >= 1, "{out}");
     // Every finding's guilty hold is on `p`.
     assert_eq!(out.lines().filter(|l| l.starts_with("finding #") && l.contains(&format!(" {p_s}), "))).count(), n, "{out}");
     assert!(line(&out, "distinct partial orders: ").parse::<usize>().unwrap() >= 1, "{out}");
-    assert_eq!(fs::read_dir(c.join("runs")).unwrap().count(), SEEDS);
-    // runs.tsv: header, then seed class status finding ...
+    assert_eq!(line(&out, "seeds: "), format!("0 safe, {SEEDS} unsafe, 0 incomplete, 0 no windows"), "{out}");
+    // runs.tsv: header, then seed window class status finding ..., a row per
+    // window and a schedule per row.
     let tsv = fs::read_to_string(c.join("runs.tsv")).unwrap();
-    assert_eq!(tsv.lines().count(), SEEDS + 1, "{tsv}");
     let rows: Vec<Vec<&str>> = tsv.lines().skip(1).map(|l| l.split('\t').collect()).collect();
-    assert!(rows.iter().any(|r| r[2] == "repeat"), "{tsv}");
+    assert_eq!(runs(&c), rows.len(), "{tsv}");
+    assert!(rows.iter().any(|r| r[3] == "repeat"), "{tsv}");
     for i in 1..=n {
         let f = c.join(format!("findings/{i}"));
-        let mut want: Vec<&str> = rows.iter().filter(|r| r[3] == i.to_string()).map(|r| r[0]).collect();
+        let mut want: Vec<String> = rows.iter().filter(|r| r[4] == i.to_string()).map(|r| format!("{}:{}", r[0], r[1])).collect();
         let seeds = fs::read_to_string(f.join("seeds")).unwrap();
-        let mut got: Vec<&str> = seeds.lines().collect();
+        let mut got: Vec<String> = seeds.lines().map(String::from).collect();
         want.sort();
         got.sort();
         assert_eq!(got, want, "{tsv}");
@@ -93,6 +96,7 @@ fn campaign_dedups() {
     let c = d.join("fixed");
     let out = campaign(&c, &[sut_s, p_s, "nofollow"], &m, &layout);
     assert_eq!(line(&out, "findings: "), "0", "{out}");
+    assert_eq!(line(&out, "seeds: "), format!("{SEEDS} safe, 0 unsafe, 0 incomplete, 0 no windows"), "{out}");
     assert_eq!(fs::read_dir(c.join("runs")).unwrap().count(), SEEDS);
     fs::remove_dir_all(d).unwrap();
 }

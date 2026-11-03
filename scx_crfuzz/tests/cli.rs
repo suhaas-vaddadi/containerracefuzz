@@ -69,12 +69,12 @@ mod accept {
         (sut, p, m)
     }
 
-    /// A mutator that, as alice, swaps `p` for a symlink to the fuzzed run's
-    /// canary plus `rest` (the newest `-1`: the baseline's is gone by then).
+    /// A mutator that, as alice, swaps `p` for a symlink to the current run's
+    /// canary (the newest) plus `rest`.
     fn swap(p: &Path, rest: &str) -> PathBuf {
         let m = Path::new(D).join(format!("swap{}.sh", rest.replace('/', "_")));
         let script = format!(
-            "#!/bin/sh\n[ \"$1\" = {p} ] || exit 0\nc=$(ls -dt /var/lib/crfuzz/canary-*-1 | head -1)\nln -sfn \"$c{rest}\" {p}.new && mv -f {p}.new {p}\n",
+            "#!/bin/sh\n[ \"$1\" = {p} ] || exit 0\nc=$(ls -dt /var/lib/crfuzz/canary-* | head -1)\nln -sfn \"$c{rest}\" {p}.new && mv -f {p}.new {p}\n",
             p = p.display()
         );
         fs::write(&m, script).unwrap();
@@ -82,57 +82,60 @@ mod accept {
         m
     }
 
-    /// The outcome line, after removing any canary this run kept.
-    fn outcome(args: &[&str]) -> String {
+    /// The stdout, after removing any canary this run kept.
+    fn run(args: &[&str]) -> String {
         let (out, pid) = crfuzz(args);
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
         for c in left(pid) {
             fs::remove_dir_all(Path::new("/var/lib/crfuzz").join(c)).unwrap();
         }
-        stdout.lines().find_map(|l| l.strip_prefix("outcome: ")).expect("an outcome").to_string()
+        stdout
     }
 
-    fn judge(sut: &Path, p: &Path, mutator: Option<&Path>, nofollow: bool, seed: u32) -> String {
+    /// Every window's outcome, and the seed's verdict.
+    fn outcomes(out: &str) -> (Vec<&str>, &str) {
+        let v = out.lines().find_map(|l| l.strip_prefix("seed 0: ")).unwrap_or_else(|| panic!("a verdict: {out}"));
+        (out.lines().filter_map(|l| l.strip_prefix("outcome: ")).collect(), v)
+    }
+
+    fn judge(sut: &Path, p: &Path, mutator: Option<&Path>, nofollow: bool) -> String {
         let mut cmd = vec![sut.to_str().unwrap(), p.to_str().unwrap()];
         if nofollow {
             cmd.push("nofollow");
         }
-        judge_cmd(&cmd, p, mutator, seed)
+        judge_cmd(&cmd, p, mutator)
     }
 
-    fn judge_cmd(cmd: &[&str], p: &Path, mutator: Option<&Path>, seed: u32) -> String {
-        // Each run starts from a regular `p`.
-        let _ = fs::remove_file(p);
-        fs::write(p, "").unwrap();
-        let seed = seed.to_string();
-        let mut args = vec!["--attacker", "65534:65534", "--seed", &seed];
+    /// Seed 0 over all its windows.
+    fn judge_cmd(cmd: &[&str], p: &Path, mutator: Option<&Path>) -> String {
+        // Every run starts from a regular `p`.
+        let layout = Path::new(D).join("layout.sh");
+        fs::write(&layout, format!("#!/bin/sh\nrm -f {p}\n: > {p}\n", p = p.display())).unwrap();
+        fs::set_permissions(&layout, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut args = vec!["--attacker", "65534:65534", "--layout", layout.to_str().unwrap()];
         if let Some(m) = mutator {
             args.extend(["--mutator", m.to_str().unwrap()]);
         }
         args.push("--");
         args.extend(cmd);
-        outcome(&args)
-    }
-
-    /// The first Violation's seed and outcome. Each invocation's baseline runs
-    /// under its own seed; only because this SUT is single-threaded are the
-    /// targets the same for every seed, so seed s < targets mutates target s
-    /// alone and this reaches the guilty hold wherever the loader and locale
-    /// put it (~100 baseline targets for sh under a UTF-8 LANG).
-    fn violation(judge: impl Fn(u32) -> String) -> (u32, String) {
-        (0..256).map(|s| (s, judge(s))).find(|(_, o)| o.starts_with("Violation")).expect("a Violation")
+        run(&args)
     }
 
     #[test]
     #[ignore]
     fn check_then_use() {
         let (sut, p, m) = setup();
-        let (hit, v) = violation(|seed| judge(&sut, &p, Some(&m), false, seed));
-        assert!(v.contains("\"file\""), "write half: {v}");
-        // nofollow has the same targets: `hit` mutates the same hold.
-        assert_eq!(judge(&sut, &p, Some(&m), true, hit), "RuntimeRefused");
-        assert_eq!(judge(&sut, &p, None, true, 0), "Clean");
+        let out = judge(&sut, &p, Some(&m), false);
+        let (o, v) = outcomes(&out);
+        assert_eq!(v, "unsafe", "{out}");
+        assert!(o.iter().any(|o| o.starts_with("Violation") && o.contains("\"file\"")), "write half: {out}");
+        // nofollow: the same windows, the swap refused.
+        let out = judge(&sut, &p, Some(&m), true);
+        let (o, v) = outcomes(&out);
+        assert_eq!(v, "safe", "{out}");
+        assert!(o.contains(&"RuntimeRefused"), "{out}");
+        assert_eq!(outcomes(&judge(&sut, &p, None, true)), (vec!["Clean"], "no windows"));
         fs::remove_dir_all(D).unwrap();
     }
 
@@ -144,19 +147,24 @@ mod accept {
     fn exposed_gate_is_violation() {
         let (_, p, _) = setup();
         let m = swap(&p, "");
-        let (_, o) = violation(|seed| judge_cmd(&["sh", "-c", &format!("chmod 777 {}", p.display())], &p, Some(&m), seed));
-        assert!(o.contains("entry: \"\""), "{o}");
+        let out = judge_cmd(&["sh", "-c", &format!("chmod 777 {}", p.display())], &p, Some(&m));
+        let (o, v) = outcomes(&out);
+        assert_eq!(v, "unsafe", "{out}");
+        assert!(o.iter().any(|o| o.starts_with("Violation") && o.contains("entry: \"\"")), "{out}");
         fs::remove_dir_all(D).unwrap();
     }
 
     /// Alice alone points `p` at the gate; the SUT only stats it. She can
-    /// stat a 0700 gate anyway: Clean, not Reached.
+    /// stat a 0700 gate anyway: Clean, not Reached, in every window.
     #[test]
     #[ignore]
     fn gate_alone_not_reached() {
         let (_, p, _) = setup();
         let m = swap(&p, "");
-        assert_eq!(judge_cmd(&["sh", "-c", &format!("test -e {}", p.display())], &p, Some(&m), 0), "Clean");
+        let out = judge_cmd(&["sh", "-c", &format!("test -e {}", p.display())], &p, Some(&m));
+        let (o, v) = outcomes(&out);
+        assert_eq!(v, "safe", "{out}");
+        assert!(o.iter().all(|o| *o == "Clean"), "{out}");
         fs::remove_dir_all(D).unwrap();
     }
 }

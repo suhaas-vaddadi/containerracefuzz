@@ -94,7 +94,8 @@ impl std::error::Error for Deadline {}
 
 /// Run the SUT under POS until it exits, appending each decision to `log`
 /// (caller-owned, so it survives every ending). With a `mutator`, fire it at
-/// the `target` event's hold alone (None: every hold whose event has a known
+/// the first hold matching `target`'s syscall, path and occurrence, in any
+/// thread (None: every hold whose event has a known
 /// path); a replay fires where its schedule says instead. With a `judge`, the
 /// mutator runs as alice, self-checked against the canary (§4, §10.1), and
 /// the root process's `exit_group` is probed (§5). Fails with `Deadline` at
@@ -169,7 +170,10 @@ pub fn run(
         let Some(i) = pick else { continue };
         let (ev, id) = (held.remove(i), ids.remove(i));
         let seed = pos.event_seed(&id);
-        let hit = !ev.keys.all && target.map_or(true, |t| *t == id);
+        // The target by what it does, not by thread: under M:N runtimes (Go) a
+        // thread's name changes between runs. The first such hold fires, once.
+        let hit = !ev.keys.all
+            && target.map_or(true, |t| (t.nr, &t.path, t.n) == (id.nr, &id.path, id.n) && !log.iter().any(|d| d.mutation.is_some()));
         // Logged at once: every ending from here keeps it (§10.3).
         log.push(Decision { id, keys: ev.keys.clone(), partial: !complete, mutation: None });
         // The whole tree stays put while the mutator runs (§3.3); answer

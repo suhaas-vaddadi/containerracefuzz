@@ -56,27 +56,21 @@ fn discover_confirm_minimize() {
     let log = d.join("schedule");
     let (log_s, m_s, l_s, sut_s, p_s) = (log.to_str().unwrap(), m.to_str().unwrap(), layout.to_str().unwrap(), sut.to_str().unwrap(), p.to_str().unwrap());
 
-    // One mutation target per seed. Each invocation's baseline runs under its
-    // own seed; the SUT is single-threaded, so the targets match and 64 seeds
-    // cover every one (16 here, more where the loader searches more paths);
-    // stops at the first hit.
-    let out = (0..64)
-        .map(|seed| {
-            let seed = seed.to_string();
-            crfuzz(&["--attacker", "65534:65534", "--seed", &seed, "--mutator", m_s, "--layout", l_s, "--log", log_s, "--", sut_s, p_s])
-        })
-        .find(|o| line(o, "outcome: ").iter().any(|c| c.starts_with("Violation")))
-        .expect("no seed found the Violation");
+    // Seed 0 runs every window; each Violating window k is written to
+    // `schedule.k`, confirmed and minimized to its one hold.
+    let out = crfuzz(&["--attacker", "65534:65534", "--mutator", m_s, "--layout", l_s, "--log", log_s, "--", sut_s, p_s]);
     eprintln!("{out}");
-    assert_eq!(line(&out, "confirmed: "), ["Violation"], "{out}");
+    let scheds = line(&out, "schedule: ");
+    assert!(!scheds.is_empty() && line(&out, "seed 0: ") == ["unsafe"], "{out}");
+    assert_eq!(line(&out, "confirmed: "), vec!["Violation"; scheds.len()], "{out}");
     let guilty = line(&out, "guilty: step ");
-    assert_eq!(guilty.len(), 1, "exactly one hold: {out}");
+    assert_eq!(guilty.len(), scheds.len(), "one hold each: {out}");
 
     // Left as the last minimization run's SUT made it: --replay resets it.
-    let again = crfuzz(&["--replay", log_s]);
+    let again = crfuzz(&["--replay", scheds[0]]);
     eprintln!("{again}");
     assert_eq!(line(&again, "confirmed: "), ["Violation"], "{again}");
-    assert_eq!(line(&again, "guilty: step "), guilty, "{again}");
+    assert_eq!(line(&again, "guilty: step "), guilty[..1], "{again}");
     // The guilty hold is one of the SUT's own on `p`.
     assert!(guilty[0].contains(p_s), "{}", guilty[0]);
     fs::remove_dir_all(d).unwrap();
