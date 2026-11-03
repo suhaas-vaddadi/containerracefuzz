@@ -215,5 +215,11 @@ pub fn run(
         released?;
         // SelfCheckFailed or a failed probe: the run is invalid.
         probe.transpose()?;
+        // The rest still held were keyed before the mutation: re-walk them, so
+        // the next decisions order on what they will now resolve. Ungated, so a
+        // stat can't block on a gated FUSE server; as best-effort as at hold time.
+        if mutated {
+            held.iter_mut().for_each(|e| be.rekey(e));
+        }
     }
 }

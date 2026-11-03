@@ -55,6 +55,8 @@ pub struct Event {
     pub dirfd: Option<i32>,
     /// Conflict keys (D3); as best-effort as `path`.
     pub keys: Keys,
+    /// The syscall's arguments, to re-walk `keys` after a mutation.
+    pub args: [u64; 6],
 }
 
 #[derive(Debug)]
@@ -339,7 +341,17 @@ impl GateBackend {
         }
         let thread = self.names.get(&tid).map_or_else(|| format!("?{tid}"), |n| n.0.clone());
         let dirfd = path_args(nr).first().and_then(|a| a.0).map(|d| req.data.args[d] as i32).filter(|&fd| fd != libc::AT_FDCWD);
-        Ok(Some(Event { id: req.id, tid, tgid: tgid?, thread, nr, path, dirfd, keys }))
+        Ok(Some(Event { id: req.id, tid, tgid: tgid?, thread, nr, path, dirfd, keys, args: req.data.args }))
+    }
+
+    /// Re-walk a held event's keys: a mutation makes its hold-time keys stale,
+    /// and the next decisions order on them. The path is identity and stays.
+    /// Unchanged if the task is gone (its id no longer valid).
+    pub fn rekey(&self, ev: &mut Event) {
+        let keys = observe(ev.tid, ev.nr, &ev.args).1;
+        if self.id_valid(ev.id) {
+            ev.keys = keys;
+        }
     }
 
     fn id_valid(&self, id: u64) -> bool {
