@@ -1,9 +1,0 @@
-{
-  "cgroup": "/crfuzz",
-  "victim": { "comm": "runc", "comm_match": "substring" },
-  "checkpoints": [
-    { "id": "mount",     "kind": "syscall", "target": "mount" },
-    { "id": "symlinkat", "kind": "syscall", "target": "symlinkat" }
-  ],
-  "attack": { "argv": ["attacker.sh", "{path}"] }
-}
