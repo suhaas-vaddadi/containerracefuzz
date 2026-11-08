@@ -74,7 +74,7 @@ gate.
 ### `scx_crfuzz`
 
 ```
-scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S]
+scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--resume]
                [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 scx_crfuzz replay FILE [-v]
 scx_crfuzz gated | status | reset | check
@@ -89,7 +89,7 @@ per check, exit 1 on a failure; `run` and `replay` run it first and stop
 listing the failures.
 
 `run` sweeps seeds `S..S+N` (no `--seeds`: `S, S+1, ...` until `--time` or a
-stop), each over all its windows, into `DIR` (see below); `DIR` must be absent or empty. To study one seed:
+stop), each over all its windows, into `DIR` (see below); `DIR` must be absent or empty, unless `--resume`. To study one seed:
 `run DIR --seeds 1 --first-seed S -v`. `replay FILE` reruns a schedule:
 baseline, strict confirm, minimize.
 
@@ -99,6 +99,7 @@ baseline, strict confirm, minimize.
 | `--seeds N` | How many seeds to sweep (default: until `--time` or a stop). A POS seed: same seed ⇒ same partial order of held events. A seed runs its baseline, then one run per **window**: per distinct `(syscall, path, occurrence)` hold of the baseline with a path. |
 | `--time DURATION` | `90s`, `30m`, `2h` (bare: seconds). Start no run once that much time has passed; the run going finishes, the seed it was in is left incomplete, and the summary follows `time limit: <S> seeds complete`, exit 0 or 3. |
 | `--first-seed S` | The first seed (default 0). |
+| `--resume` | Continue the campaign in `DIR` (stopped, out of time, or to add seeds). The arguments must match `DIR/args` but for `--seeds`, `--time` and `--jobs`. A seed with a line in `seeds.tsv` is skipped; any other seed's `runs.tsv` rows, `runs/<seed>/` and `findings/*/seeds` lines are dropped and it runs again. Findings and the summary's totals carry on (but distinct partial orders, counted for this session only); a repeat of an earlier finding is counted against it. `--time` counts this session. |
 | `--jobs N` | Run N seeds at once (default 1), one worker each, sharing the gate scheduler. N > 1 needs `--private` (see below). Warns if N exceeds the CPUs: contention turns more decisions partial. |
 | `--private DIR` | Repeatable. Every directory the runs write (the layout's target, the SUT's state, the mutator's playground): each worker gets its own copy (see below). Recorded in the schedule; `replay` sets it up again. |
 | `--mutator PROG` | Run at one window's hold per run, as alice inside the held task's namespaces, root and cwd. Gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL`, `CRFUZZ_SEED` and `CRFUZZ_CANARY` (this run's canary directory: find it there, never by listing `/var/lib/crfuzz`, which at `--jobs` > 1 holds other workers' canaries). Must exist inside the task's root. 15 s watchdog; a failure is logged, never a finding. |
@@ -235,6 +236,8 @@ step 1 0 79 0 /tmp/q/alice/p      mutate thread syscall-nr occurrence [path]
 ### Campaign directory
 
 ```
+DIR/args                    run's arguments after DIR, one per line, escaped as in schedules
+DIR/seeds.tsv               seed verdict: one row per seed, written as it ends
 DIR/runs.tsv                one row per window, written as it ends:
                             seed window class status finding decisions partial secs note
 DIR/runs/<seed>/<k>.sched   window k's discovery schedule (replayable); k = 0:
@@ -246,6 +249,7 @@ DIR/runs/<seed>/<k>.log     window k's SUT and layout output (stdout and
 DIR/runs/<seed>/baseline.log  the same for the seed's baseline (== baseline)
 DIR/findings/<n>/schedule   the first confirmed schedule of finding n
 DIR/findings/<n>/seeds      every seed:k that hit finding n, one per line
+DIR/findings/<n>/guilty     the schedule's guilty step, or - (needs more than one hold)
 ```
 
 SUT stdin is `/dev/null`. `replay` discards SUT and layout output; with `-v`
@@ -302,5 +306,5 @@ sudo env PATH=$PATH target/debug/deps/<suite>-<hash> --include-ignored --test-th
   inside the held task's root.
 - Minimization tries single holds only; a bug that needs two mutations is
   reported as "needs more than one hold".
-- Campaigns have no resume. `--jobs` isolates only the filesystem; the
+- `--resume` reruns a seed stopped partway from its start. `--jobs` isolates only the filesystem; the
   windows within one seed still run one after another.

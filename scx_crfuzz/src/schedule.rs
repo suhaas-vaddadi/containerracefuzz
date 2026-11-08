@@ -156,8 +156,8 @@ pub struct Schedule {
 }
 
 /// Bytes outside printable ASCII, space and `%` as `%XX`; the empty string as
-/// a lone `%`.
-fn esc(b: &[u8]) -> String {
+/// a lone `%`. Also `DIR/args`, one argument per line.
+pub fn esc(b: &[u8]) -> String {
     if b.is_empty() {
         return "%".into();
     }

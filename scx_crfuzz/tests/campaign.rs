@@ -1,9 +1,10 @@
 //! M8: a campaign over check_use dedups to findings on `p`; over the corrected
-//! bundle, none; at --jobs 4 the same. Needs root, a running `scx_crfuzz gated` and cc:
+//! bundle, none; at --jobs 4 the same; interrupted and resumed, the same. Needs root, a running `scx_crfuzz gated` and cc:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::{chown, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -177,5 +178,89 @@ fn campaign_jobs() {
 
     let fixed = campaign(&d.join("fixed"), &["--seeds", "4", "--jobs", "4", "--private", a_s], &[sut_s, p_s, "nofollow"], &m, &layout, 0);
     assert_eq!(line(&fixed, "findings: "), "0", "{fixed}");
+    fs::remove_dir_all(d).unwrap();
+}
+
+/// The rows of `DIR/<name>` (header dropped), columns `cols` of each, sorted.
+fn table(dir: &Path, name: &str, cols: &[usize]) -> Vec<String> {
+    let t = fs::read_to_string(dir.join(name)).unwrap();
+    let mut v: Vec<String> = t.lines().skip(1).map(|l| l.split('\t').collect::<Vec<_>>()).map(|c| cols.iter().map(|&i| c[i]).collect::<Vec<_>>().join("\t")).collect();
+    v.sort();
+    v
+}
+
+/// Each finding as `guilty <hold>, <findings>` with its sorted seed:k lines.
+fn findings(dir: &Path, out: &str) -> Vec<(String, Vec<String>)> {
+    let f = |l: &str| {
+        let mut seeds: Vec<String> = fs::read_to_string(dir.join(format!("findings/{}/seeds", &l[..l.find(':').unwrap()]))).unwrap().lines().map(String::from).collect();
+        seeds.sort();
+        (l[l.find("guilty ").unwrap()..l.rfind(", /").unwrap()].to_string(), seeds)
+    };
+    let mut v: Vec<_> = out.lines().filter_map(|l| l.strip_prefix("finding #")).map(f).collect();
+    v.sort();
+    v
+}
+
+/// Task 10: a 3-seed campaign stopped by SIGINT once seed 0 ends, then
+/// `--resume`d, ends as the uninterrupted one: the same runs.tsv seeds,
+/// windows, classes and finding numbers, seeds.tsv, findings and totals.
+/// Other arguments, or no `--resume`, are refused.
+#[test]
+#[ignore]
+fn campaign_resume() {
+    let d = Path::new("/tmp/crfuzz_resume");
+    let _ = fs::remove_dir_all(d);
+    fs::create_dir_all(d.join("alice")).unwrap();
+    let sut = d.join("check_use");
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/check_use.c");
+    assert!(Command::new("cc").arg("-o").arg(&sut).arg(src).status().unwrap().success(), "cc failed");
+    let p = d.join("alice/p");
+    chown(d.join("alice"), Some(65534), Some(65534)).unwrap();
+    let m = d.join("swap.sh");
+    fs::write(&m, format!("#!/bin/sh\n[ \"$1\" = {p} ] || exit 0\nln -sfn \"$CRFUZZ_CANARY/file\" {p}.new && mv -f {p}.new {p}\n", p = p.display())).unwrap();
+    let layout = d.join("layout.sh");
+    fs::write(&layout, format!("#!/bin/sh\nrm -f {p}\n: > {p}\n", p = p.display())).unwrap();
+    for f in [&m, &layout] {
+        fs::set_permissions(f, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cmd = [sut.to_str().unwrap(), p.to_str().unwrap()];
+
+    let whole = d.join("whole");
+    let want = campaign(&whole, &["--seeds", "3"], &cmd, &m, &layout, 3);
+
+    // Stopped in seed 1.
+    let c = d.join("part");
+    let (ms, ls) = (m.to_str().unwrap(), layout.to_str().unwrap());
+    let args = [&["run", c.to_str().unwrap(), "--attacker", "65534:65534", "--seeds", "3", "--mutator", ms, "--layout", ls, "--"][..], &cmd].concat();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scx_crfuzz")).args(&args).stdout(Stdio::piped()).spawn().unwrap();
+    let mut so = BufReader::new(child.stdout.take().unwrap());
+    let mut out = String::new();
+    while !out.lines().any(|l| l == "[1/3] seed 0: unsafe") {
+        assert!(so.read_line(&mut out).unwrap() > 0, "{out}");
+    }
+    assert!(Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap().success());
+    so.read_to_string(&mut out).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(130), "{out}");
+    forget(child.id());
+    eprintln!("{out}");
+    assert_eq!(line(&out, "interrupted: "), "1 seeds complete", "{out}");
+    assert_eq!(table(&c, "seeds.tsv", &[0]), ["0"]);
+    assert!(c.join("runs/1").exists(), "nothing of seed 1 to drop");
+
+    // 1: other arguments, or a non-empty DIR without --resume.
+    campaign(&c, &["--resume", "--seeds", "3", "--timeout", "30"], &cmd, &m, &layout, 1);
+    campaign(&c, &["--seeds", "3"], &cmd, &m, &layout, 1);
+    let got = campaign(&c, &["--resume", "--seeds", "3"], &cmd, &m, &layout, 3);
+
+    assert_eq!(table(&c, "runs.tsv", &[0, 1, 2, 4]), table(&whole, "runs.tsv", &[0, 1, 2, 4]));
+    assert_eq!(table(&c, "seeds.tsv", &[0, 1]), table(&whole, "seeds.tsv", &[0, 1]));
+    assert_eq!(table(&c, "seeds.tsv", &[0, 1]), ["0\tunsafe", "1\tunsafe", "2\tunsafe"]);
+    assert_eq!(runs(&c), table(&c, "runs.tsv", &[0]).len());
+    assert!(!findings(&c, &got).is_empty());
+    assert_eq!(findings(&c, &got), findings(&whole, &want), "{want}\n{got}");
+    let totals = |o: &str| line(o, "campaign: ").split(", discovery").next().unwrap().to_string();
+    assert_eq!(totals(&got), totals(&want), "{want}\n{got}");
+    assert_eq!(line(&got, "seeds: "), line(&want, "seeds: "));
+    assert!(line(&got, "distinct partial orders: ").ends_with(" (this session's runs only)"), "{got}");
     fs::remove_dir_all(d).unwrap();
 }
