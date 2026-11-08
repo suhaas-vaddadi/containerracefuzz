@@ -183,12 +183,10 @@ pub fn run(
         if Instant::now() >= deadline {
             return Err(anyhow::Error::new(Deadline).context(format!("after {} decisions", log.len())));
         }
-        // Name events once, as they arrive: occurrence counts history. The
-        // canary directory differs every run, so it is named `<canary>` and a
-        // replay still matches.
+        // Name events once, as they arrive: occurrence counts history.
         let canary = judge.as_deref().map(|j| j.canary.dir.as_path());
         ids.extend(held[ids.len()..].iter().map(|e| {
-            let path = e.path.as_deref().map(|p| canary.and_then(|c| schedule::uncanary(p, c)).unwrap_or_else(|| p.into()));
+            let path = e.path.as_deref().map(|p| schedule::event_path(p, canary, be.cgroup()));
             pos.id(&e.thread, e.nr, path)
         }));
         // A tree-gated thread already blocked reads `S`, so the readout

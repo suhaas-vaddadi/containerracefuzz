@@ -6,7 +6,7 @@ use crate::pos::{EventId, Keys};
 use anyhow::{bail, ensure, Context, Result};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -23,6 +23,21 @@ pub enum Finding {
 /// `p` with the canary directory as `<canary>`: it differs every run.
 pub fn uncanary(p: &Path, canary: &Path) -> Option<PathBuf> {
     p.strip_prefix(canary).ok().map(|rest| Path::new("<canary>").join(rest))
+}
+
+/// A held path as an event names it: the canary directory as `<canary>`, the
+/// run cgroup's name (`run-<pid>-<epoch>`) as `<run>`. Both differ every run,
+/// so a replay still matches. A component, not a prefix: runc opens cgroup
+/// files relative to /sys/fs/cgroup.
+pub fn event_path(p: &Path, canary: Option<&Path>, run: &Path) -> PathBuf {
+    if let Some(p) = canary.and_then(|c| uncanary(p, c)) {
+        return p;
+    }
+    let run = run.file_name();
+    if !p.components().any(|c| Some(c.as_os_str()) == run) {
+        return p.into();
+    }
+    p.components().map(|c| if Some(c.as_os_str()) == run { OsStr::new("<run>") } else { c.as_os_str() }).collect()
 }
 
 /// A finding's identity across runs: the canary directory as `<canary>`, the
@@ -380,6 +395,19 @@ mod tests {
         assert_eq!(at(r("/var/lib/crfuzz/canary-4242-10/x")), Path::new("/var/lib/crfuzz/canary-4242-10/x"));
         let c = normalize(&Finding::Copy { at: "/var/lib/crfuzz/canary-4242-1/file".into() }, canary, None);
         assert_eq!(c, Finding::Copy { at: "<canary>/file".into() });
+    }
+
+    #[test]
+    fn event_path_names_per_run_dirs() {
+        let (canary, run) = (Path::new("/var/lib/crfuzz/canary-4242-1"), Path::new("/sys/fs/cgroup/crfuzz/run-4242-2"));
+        let e = |p: &str| event_path(Path::new(p), Some(canary), run);
+        assert_eq!(e("/var/lib/crfuzz/canary-4242-1/dir"), Path::new("<canary>/dir"));
+        assert_eq!(e("/sys/fs/cgroup/crfuzz/run-4242-2/sut/cpu.max"), Path::new("/sys/fs/cgroup/crfuzz/<run>/sut/cpu.max"));
+        assert_eq!(e("crfuzz/run-4242-2/busy/cgroup.freeze"), Path::new("crfuzz/<run>/busy/cgroup.freeze"));
+        // Another run's cgroup, or a component-prefix lookalike: as is.
+        assert_eq!(e("/sys/fs/cgroup/crfuzz/run-4242-20/sut/cpu.max"), Path::new("/sys/fs/cgroup/crfuzz/run-4242-20/sut/cpu.max"));
+        assert_eq!(e("/tmp/q"), Path::new("/tmp/q"));
+        assert_eq!(event_path(Path::new("/var/lib/crfuzz/canary-4242-1/x"), None, run), Path::new("/var/lib/crfuzz/canary-4242-1/x"));
     }
 
     #[test]
