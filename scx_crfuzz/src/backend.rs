@@ -468,14 +468,24 @@ fn stale(name: &str, prefix: &str) -> bool {
 // cgroup until that pid exits.
 pub fn sweep() {
     let names = |dir: &str| fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok());
-    let left = names(CGROUP_ROOT)
-        .filter(|n| stale(n, "run-"))
-        .filter(|n| {
-            let cg = Path::new(CGROUP_ROOT).join(n);
-            let _ = fs::write(cg.join("cgroup.kill"), "1");
-            !remove_cgroup(&cg)
-        })
-        .count();
+    let mut left = 0;
+    for n in names(CGROUP_ROOT).filter(|n| stale(n, "run-")) {
+        let cg = Path::new(CGROUP_ROOT).join(n);
+        // Ungate before killing, as Drop does: a run that died in a tree hold
+        // left its gate entries. By member tgid, not by epoch: epochs restart
+        // with the daemon, so a live run may share the name's. No daemon: no
+        // pins, nothing gated.
+        let tgids: Vec<u32> = cgroup_dirs(&cg)
+            .iter()
+            .filter_map(|d| fs::read_to_string(d.join("cgroup.procs")).ok())
+            .flat_map(|l| l.lines().filter_map(|t| t.parse().ok()).collect::<Vec<_>>())
+            .collect();
+        let _ = scx_crfuzz_gate::ungate_tgids(&tgids);
+        let _ = fs::write(cg.join("cgroup.kill"), "1");
+        if !remove_cgroup(&cg) {
+            left += 1;
+        }
+    }
     if left > 0 {
         eprintln!("{left} stale run cgroups left in {CGROUP_ROOT}");
     }

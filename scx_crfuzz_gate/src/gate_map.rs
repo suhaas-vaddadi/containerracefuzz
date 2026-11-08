@@ -131,6 +131,17 @@ fn clear_map(map: &MapHandle, epoch: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+/// Drop the gate entries of `tgids`, whatever run owns them, then kick: for a
+/// dead run's processes, which no `GateMap` will clear.
+pub fn ungate_tgids(tgids: &[u32]) -> Result<()> {
+    let map = MapHandle::from_pinned_path(pin_path("gate_tgid")).with_context(|| pin_path("gate_tgid"))?;
+    for t in tgids {
+        let _ = map.delete(&t.to_ne_bytes());
+    }
+    test_run(&open_pinned_prog("kick_all")?)?;
+    Ok(())
+}
+
 /// `--reset`: drop every gate entry of every run, then kick.
 pub fn reset_all() -> Result<()> {
     let open_map = |n| MapHandle::from_pinned_path(pin_path(n)).with_context(|| pin_path(n));
