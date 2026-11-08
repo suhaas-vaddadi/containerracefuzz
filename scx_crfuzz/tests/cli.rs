@@ -68,6 +68,29 @@ fn usage_errors_exit_2() {
     }
 }
 
+/// Preflight: as root with the gate running every check passes; as alice
+/// `check` and `run` fail on root, `run` listing only the failures. Needs setpriv.
+#[test]
+#[ignore]
+fn preflight() {
+    let (out, _) = crfuzz(&["check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.lines().count() == 6 && stdout.lines().all(|l| l.ends_with(": ok")), "{stdout}");
+    let alice = |args: &[&str]| {
+        let id = ["--reuid", "65534", "--regid", "65534", "--clear-groups", env!("CARGO_BIN_EXE_scx_crfuzz")];
+        Command::new("setpriv").args(id).args(args).output().unwrap()
+    };
+    let out = alice(&["check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.lines().any(|l| l.starts_with("root: FAIL: ")), "{stdout}");
+    let out = alice(&["run", "/tmp/crfuzz_cli_none", "--seeds", "1", "--attacker", "65534:65534", "--", "/bin/true"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("root: FAIL: ") && !err.contains(": ok"), "{err}");
+}
+
 /// §10.2: an invalid run (alice as uid 0 owns the gate: read before fails)
 /// leaves no canary behind; the seed is recorded invalid and the run goes on.
 #[test]

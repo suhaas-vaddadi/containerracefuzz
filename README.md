@@ -74,10 +74,16 @@ gate.
 scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG]
                [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 scx_crfuzz replay FILE [-v]
-scx_crfuzz gated | status | reset
+scx_crfuzz gated | status | reset | check
 scx_crfuzz --help | -h
 scx_crfuzz --version | -V
 ```
+
+`check` runs the preflight (root, kernel 6.12+, `sched_ext` disabled or
+crfuzz's gate, cgroup v2 at `/sys/fs/cgroup`, bpffs at `/sys/fs/bpf`,
+`/var/lib/crfuzz` and its parents root-only), one `ok` or `FAIL: <why>` line
+per check, exit 1 on a failure; `run` and `replay` run it first and stop
+listing the failures.
 
 `run` sweeps seeds `S..S+N`, each over all its windows, into `DIR` (see
 below); `DIR` must be absent or empty. To study one seed:

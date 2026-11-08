@@ -27,7 +27,7 @@ pub const PINS: [&str; 3] = ["gate_tgid", "kick_all", "new_epoch"];
 /// The enabled scheduler's name; ours is `crfuzz_gate_<version>_...`.
 const OPS: &str = "/sys/kernel/sched_ext/root/ops";
 
-fn ops() -> String {
+pub fn ops() -> String {
     fs::read_to_string(OPS).unwrap_or_default().trim().to_string()
 }
 
@@ -92,8 +92,7 @@ impl Scheduler {
     /// None: crfuzz's scheduler already runs (another crfuzz, or `scx_crfuzz
     /// gated`); runs use it. Any other scheduler is an error naming it.
     pub fn start() -> Result<Option<Self>> {
-        let pinned = PINS.iter().all(|p| Path::new(&pin_path(p)).exists());
-        if sched_ext_state()? == "enabled" && ops().starts_with("crfuzz_gate") && pinned {
+        if running()? {
             return Ok(None);
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -139,7 +138,14 @@ pub fn status() -> Result<()> {
 }
 
 pub fn sched_ext_state() -> Result<String> {
-    Ok(fs::read_to_string("/sys/kernel/sched_ext/state")?.trim().to_string())
+    const STATE: &str = "/sys/kernel/sched_ext/state";
+    Ok(fs::read_to_string(STATE).context(STATE)?.trim().to_string())
+}
+
+/// crfuzz's scheduler is enabled, its pins present: runs borrow it.
+pub fn running() -> Result<bool> {
+    let pinned = PINS.iter().all(|p| Path::new(&pin_path(p)).exists());
+    Ok(sched_ext_state()? == "enabled" && ops().starts_with("crfuzz_gate") && pinned)
 }
 
 pub fn enable_seq() -> Result<u64> {
