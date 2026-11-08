@@ -1,41 +1,40 @@
-//! scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--scope DIR]... [--log FILE] -- CMD [ARGS...]
-//! scx_crfuzz --replay FILE
-//! scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] [--scope DIR]... -- CMD [ARGS...]
+//! scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+//! scx_crfuzz replay FILE [-v]
 //!
-//! A seed is exhaustive over its windows. Run CMD under POS (discovery) with
-//! a baseline under the seed, no mutator, then once per window, each run with
-//! its own canary, judged against the attacker alice (UID:GID, no groups, no
-//! caps: §1). The windows are the baseline's holds with a known path, not
-//! keys.all and not a `?tid`, one per (syscall, path, occurrence): with
-//! `--mutator`, PROG (a binary or a script with a #!) runs at window k's hold
-//! alone, once, as alice in the held task's view: its namespaces, root and
-//! cwd, the path as issued in argv[1] (§10.1). `--scope DIR` (repeatable)
-//! keeps only windows whose absolute path is under one of the DIRs: where
-//! alice can act. Prints alice, then per window `window k/n target:`, its
-//! decision log and outcome class (§6); a window that never reaches its
-//! target is unmutated. Ends with the seed's verdict: `safe` (every window
-//! valid, mutated and no Violation), `unsafe` (a window's Violation),
-//! `incomplete` (else), or `no windows` (no mutator or no target: the seed is
-//! one unmutated run, window 0). Exits 0 whatever the verdict; nonzero for an
-//! invalid baseline, after printing its decisions. Needs root and a running
-//! scx_crfuzz_gated.
+//! `run` sweeps seeds S..S+N (default S 0; §3.10), each exhaustive over its
+//! windows. A seed runs CMD under POS (discovery): a baseline under the seed,
+//! no mutator, then once per window, each run with its own canary, judged
+//! against the attacker alice (UID:GID, no groups, no caps: §1). The windows
+//! are the baseline's holds with a known path, not keys.all and not a `?tid`,
+//! one per (syscall, path, occurrence): with `--mutator`, PROG (a binary or a
+//! script with a #!) runs at window k's hold alone, once, as alice in the held
+//! task's view: its namespaces, root and cwd, the path as issued in argv[1]
+//! (§10.1). `--scope DIR` (repeatable) keeps only windows whose absolute path
+//! is under one of the DIRs: where alice can act. A window that never reaches
+//! its target is unmutated. `--layout PROG` (absolute, recorded in the
+//! schedule) runs as root before every run to restore the starting
+//! filesystem, so no run sees what an earlier one's SUT or mutator left
+//! behind; a failure makes the run invalid. `--timeout SECS` (default 60,
+//! recorded) ends a run still going.
 //!
-//! `--log FILE` writes each Violating window k as a schedule (§3.8) to
-//! `FILE.k`, then confirms and minimizes it, as `--replay FILE` does: one
-//! baseline, a replay with every recorded mutation that must give the same
-//! class and normalized findings, then one replay per recorded mutation
-//! alone, in order, until one flags a finding of the schedule's: the guilty
-//! hold. `--layout PROG` (absolute, recorded in the schedule) runs as root
-//! before every run to restore the starting filesystem, so no run sees what
-//! an earlier one's SUT or mutator left behind; a failure makes the run invalid.
-//!
-//! `--campaign DIR` sweeps seeds 0..N, each its baseline and windows (§3.10):
-//! window k's schedule goes to `DIR/runs/<seed>/<k>.sched` and a row to
+//! Window k's schedule (§3.8) goes to `DIR/runs/<seed>/<k>.sched` and a row to
 //! `DIR/runs.tsv`. A Violation repeating a finding (`Dedup::repeated_by`) is
-//! only counted; a new one is confirmed and minimized as `--log` does, and if
-//! confirmed is finding n: `DIR/findings/<n>/{schedule,seeds}`, `seeds` one
+//! only counted; a new one is confirmed and minimized, as `replay` does, and
+//! if confirmed is finding n: `DIR/findings/<n>/{schedule,seeds}`, `seeds` one
 //! `seed:k` per line. An invalid run or baseline is recorded and the sweep
-//! goes on. Ends with a summary, the seeds' verdicts included.
+//! goes on. Each seed ends with its verdict: `safe` (every window valid,
+//! mutated and no Violation), `unsafe` (a window's Violation), `incomplete`
+//! (else), or `no windows` (no mutator or no target: the seed is one unmutated
+//! run, window 0); the sweep with a summary.
+//!
+//! `replay FILE`: everything comes from the file. One baseline, a replay with
+//! every recorded mutation that must give the same class and normalized
+//! findings, then one replay per recorded mutation alone, in order, until one
+//! flags a finding of the schedule's: the guilty hold.
+//!
+//! `-v` prints every run's decisions. Exit status: 0 done, 3 done with a
+//! confirmed finding (`replay`: a confirmed Violation), 2 a usage error, 1
+//! any other error. Needs root and a running scx_crfuzz_gated.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -44,7 +43,42 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-fn main() -> anyhow::Result<()> {
+const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG]
+                      [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+       scx_crfuzz replay FILE [-v]
+       scx_crfuzz --help | --version";
+
+/// A bad or missing argument: exit 2, after the usage.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct Usage(String);
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}\n{USAGE}", self.0)
+    }
+}
+#[cfg(target_os = "linux")]
+impl std::error::Error for Usage {}
+
+#[cfg(target_os = "linux")]
+fn main() {
+    std::process::exit(match crfuzz() {
+        Ok(code) => code,
+        Err(e) if e.is::<Usage>() => {
+            eprintln!("{e}");
+            2
+        }
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    });
+}
+
+/// The exit status: 0, or 3 for a confirmed finding.
+#[cfg(target_os = "linux")]
+fn crfuzz() -> anyhow::Result<i32> {
     use anyhow::{bail, ensure, Context, Result};
     use scx_crfuzz::backend::{self, GateBackend, SelfCheckFailed};
     use scx_crfuzz::engine::{self, Deadline, Decision, Judge, Replay};
@@ -60,7 +94,6 @@ fn main() -> anyhow::Result<()> {
 
     /// Replays a discovery gets to reproduce before it counts as unconfirmed.
     const CONFIRM_TRIES: u32 = 3;
-    const USAGE: &str = "usage: scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--scope DIR]... [--log FILE] -- CMD [ARGS...]\n       scx_crfuzz --replay FILE\n       scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] [--scope DIR]... -- CMD [ARGS...]";
     // ponytail: a fixed watch set (the path syscalls D3 decodes, minus execve,
     // which needs CMD as a path) and fixed timing; flags when a scenario needs them.
     const WATCHED: &[i64] = &[
@@ -94,46 +127,72 @@ fn main() -> anyhow::Result<()> {
     }
     impl std::error::Error for MutatorFailed {}
 
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    // --replay: everything comes from the file.
-    let loaded = match &argv[..] {
-        [r, f] if r == "--replay" => Some(std::fs::read_to_string(f).context(f.clone())?.parse::<Schedule>().context(f.clone())?),
-        _ => None,
-    };
-    let (mut seed, mut mutator, mut layout, mut attacker, mut log_file) = (0u64, None, None, None, None);
-    let (mut campaign, mut seeds, mut scope) = (None, None, Vec::<PathBuf>::new());
-    let cmd: Vec<String> = match &loaded {
-        Some(s) => {
-            (seed, mutator, layout, attacker) = (s.seed, s.mutator.clone(), s.layout.clone(), Some(Alice::parse(&s.attacker)?));
-            s.cmd.clone()
+    let usage = |why: String| anyhow::Error::new(Usage(why));
+    type Args = std::iter::Skip<std::env::Args>;
+    let val = |args: &mut Args, flag: &str| args.next().ok_or_else(|| usage(format!("{flag} needs a value")));
+    let num = |args: &mut Args, flag: &str| -> Result<u64> { val(args, flag)?.parse().map_err(|_| usage(format!("{flag}: not a number"))) };
+    let mut args = std::env::args().skip(1);
+    let (mut mutator, mut layout, mut attacker, mut scope) = (None, None, None, Vec::<PathBuf>::new());
+    let (mut verbose, mut timeout) = (false, schedule::TIMEOUT);
+    // campaign: DIR and the seeds; loaded: the schedule to replay.
+    let (campaign, loaded, cmd) = match args.next().as_deref() {
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            return Ok(0);
         }
-        None => {
-            let mut args = argv.into_iter();
-            loop {
-                match args.next().as_deref() {
-                    Some("--seed") => seed = args.next().context(USAGE)?.parse().context("--seed")?,
-                    // Absolute: the mutator is exec'd after a chdir into the task's cwd.
-                    Some("--mutator") => mutator = Some(std::fs::canonicalize(args.next().context(USAGE)?).context("--mutator")?),
-                    Some("--attacker") => attacker = Some(Alice::parse(&args.next().context(USAGE)?)?),
-                    Some("--layout") => layout = Some(std::fs::canonicalize(args.next().context(USAGE)?).context("--layout")?),
-                    Some("--log") => log_file = Some(PathBuf::from(args.next().context(USAGE)?)),
-                    Some("--campaign") => campaign = Some(PathBuf::from(args.next().context(USAGE)?)),
-                    Some("--scope") => scope.push(std::fs::canonicalize(args.next().context(USAGE)?).context("--scope")?),
-                    Some("--seeds") => seeds = Some(args.next().context(USAGE)?.parse::<u64>().context("--seeds")?),
-                    Some("--") => break args.collect(),
-                    _ => bail!(USAGE),
+        Some("-V" | "--version") => {
+            println!("scx_crfuzz {}", env!("CARGO_PKG_VERSION"));
+            return Ok(0);
+        }
+        // Everything comes from the file.
+        Some("replay") => {
+            let mut file = None;
+            for a in args {
+                match a.as_str() {
+                    "-v" => verbose = true,
+                    _ if file.is_none() && !a.starts_with('-') => file = Some(a),
+                    _ => return Err(usage(format!("unknown argument {a}"))),
                 }
             }
+            let f = file.ok_or_else(|| usage("replay needs a FILE".into()))?;
+            let s = std::fs::read_to_string(&f).context(f.clone())?.parse::<Schedule>().context(f)?;
+            (mutator, layout, timeout, attacker) = (s.mutator.clone(), s.layout.clone(), s.timeout, Some(Alice::parse(&s.attacker)?));
+            let cmd = s.cmd.clone();
+            (None, Some(s), cmd)
         }
+        Some("run") => {
+            let dir = args.next().filter(|d| !d.starts_with('-')).ok_or_else(|| usage("run needs a DIR".into()))?;
+            let (mut first, mut seeds) = (0, None);
+            let cmd: Vec<String> = loop {
+                match args.next().as_deref() {
+                    Some("--attacker") => attacker = Some(Alice::parse(&val(&mut args, "--attacker")?).map_err(|e| usage(format!("{e:#}")))?),
+                    Some("--seeds") => seeds = Some(num(&mut args, "--seeds")?),
+                    Some("--first-seed") => first = num(&mut args, "--first-seed")?,
+                    // Absolute: the mutator is exec'd after a chdir into the task's cwd.
+                    Some("--mutator") => mutator = Some(std::fs::canonicalize(val(&mut args, "--mutator")?).context("--mutator")?),
+                    Some("--layout") => layout = Some(std::fs::canonicalize(val(&mut args, "--layout")?).context("--layout")?),
+                    Some("--scope") => scope.push(std::fs::canonicalize(val(&mut args, "--scope")?).context("--scope")?),
+                    Some("--timeout") => timeout = num(&mut args, "--timeout")?,
+                    Some("-v") => verbose = true,
+                    Some("--") => break args.collect(),
+                    Some(a) => return Err(usage(format!("unknown argument {a}"))),
+                    None => return Err(usage("run needs -- CMD".into())),
+                }
+            };
+            let n = seeds.ok_or_else(|| usage("--seeds is required".into()))?;
+            first.checked_add(n).ok_or_else(|| usage("--first-seed + --seeds overflows".into()))?;
+            (Some((PathBuf::from(dir), first, n)), None, cmd)
+        }
+        Some(a) => return Err(usage(format!("unknown command {a}"))),
+        None => return Err(usage("a command is required".into())),
     };
     // §1: an input, never inferred; refused before anything starts.
-    let alice = attacker.with_context(|| format!("--attacker is required\n{USAGE}"))?;
-    ensure!(campaign.is_some() == seeds.is_some() && (campaign.is_none() || log_file.is_none()), USAGE);
+    let alice = attacker.ok_or_else(|| usage("--attacker is required".into()))?;
+    let (prog, rest) = cmd.split_first().ok_or_else(|| usage("run needs a CMD after --".into()))?;
     // No resume: an old campaign's runs/ and findings/ would read as this one's.
-    if let Some(d) = &campaign {
-        ensure!(std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()), "--campaign: {} is not empty", d.display());
+    if let Some((d, ..)) = &campaign {
+        ensure!(std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()), "run: {} is not empty", d.display());
     }
-    let (prog, rest) = cmd.split_first().context(USAGE)?;
 
     /// One judged run (§5, §6).
     struct Judged {
@@ -145,15 +204,14 @@ fn main() -> anyhow::Result<()> {
         deadline: bool,
         /// `found`, normalized: what replays compare (§3.8).
         norm: BTreeSet<Finding>,
-        /// Some: why only the write half was judged.
-        unjudged: Option<&'static str>,
         /// Removed on drop unless kept (§10.2).
         canary: Canary,
     }
 
     // Canary numbers, one per run of this crfuzz: a kept canary is never reused.
     let runs = Cell::new(0u32);
-    // One run with its own canary; its decisions go to `log` whatever the ending.
+    // One run with its own canary; its decisions go to `log` whatever the
+    // ending, and with -v to stdout.
     let judged = |seed: u64, mutator: Option<&Path>, target: Option<&EventId>, replay: Option<&mut Replay>, log: &mut Vec<Decision>| -> Result<Judged> {
         if let Some(l) = &layout {
             let st = Command::new(l).status().with_context(|| l.display().to_string())?;
@@ -165,22 +223,26 @@ fn main() -> anyhow::Result<()> {
         sut.args(rest);
         let mut be = GateBackend::spawn(sut, WATCHED)?;
         let mut j = Judge { canary: &canary, alice: alice.clone(), reached: None, task: None };
-        let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), Instant::now() + Duration::from_secs(60), log);
+        let until = Instant::now().checked_add(Duration::from_secs(timeout)).context("--timeout too large")?;
+        let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), until, log);
+        if verbose {
+            log.iter().for_each(|d| println!("{d:?}"));
+        }
         let end = if r.is_ok() { Some(be.child().wait()?) } else { None };
         // Clears gates and cgroup, ending what is left of the SUT, before the
         // write half: a gated task may serve a mount inside the canary.
         drop(be);
         let deadline = matches!(&r, Err(e) if e.is::<Deadline>());
-        let why = match r {
-            Ok(()) => "no final hold",
-            Err(e) if e.is::<Deadline>() => "no final hold",
+        // Ended without the final hold (no read half), or judged on the write half alone.
+        match r {
+            Ok(()) => {}
+            Err(e) if e.is::<Deadline>() => {}
             // read before passed, so alice's credentials were right: a gate
             // that stops failing her later was opened by the SUT, and the
             // write half shows it (a chmod'd gate). Judged, not invalid.
-            Err(e) if e.is::<SelfCheckFailed>() && !canary.changed().is_empty() => "the SUT opened the gate",
+            Err(e) if e.is::<SelfCheckFailed>() && !canary.changed().is_empty() => {}
             Err(e) => return Err(e), // invalid: self-check, probe, crfuzz itself
-        };
-        let unjudged = j.reached.is_none().then_some(why);
+        }
         let mut found = j.reached.unwrap_or_default();
         found.extend(canary.changed());
         // A mutator that failed (error, timeout, nonzero exit) never attacked,
@@ -195,9 +257,8 @@ fn main() -> anyhow::Result<()> {
         }
         let task = j.task.as_ref().map(|(tid, tgid, name)| (*tid, *tgid, name.as_str()));
         let norm = found.iter().map(|f| schedule::normalize(f, &canary.dir, task)).collect();
-        Ok(Judged { end, found, deadline, norm, unjudged, canary })
+        Ok(Judged { end, found, deadline, norm, canary })
     };
-    let print = |log: &[Decision]| log.iter().for_each(|d| println!("{d:?}"));
 
     // A seed's baseline, which must leak nothing: its exit (for the oracle),
     // its windows' targets and its time. The targets are the holds a mutator
@@ -253,6 +314,7 @@ fn main() -> anyhow::Result<()> {
         attacker: attacker.clone(),
         mutator: mutator.clone().filter(|_| mutated),
         layout: layout.clone(),
+        timeout,
         cmd: cmd.clone(),
         class: class.into(),
         deadline,
@@ -336,59 +398,22 @@ fn main() -> anyhow::Result<()> {
     backend::sweep();
     println!("{alice}");
     let mut log = Vec::new();
-    let Some(dir) = campaign else {
-        let (end, targets, secs) = baseline(seed, &mut log).inspect_err(|_| {
-            println!("baseline:");
-            print(&log);
-        })?;
+    let Some((dir, first, n)) = campaign else {
+        let s = loaded.expect("replay");
+        let hint = |_: &anyhow::Error| {
+            if !verbose {
+                eprintln!("(rerun with -v for the decision log)");
+            }
+        };
+        let (end, targets, secs) = baseline(s.seed, &mut log).inspect_err(hint)?;
         println!("{}", telemetry(&log, targets.len(), secs));
-        if let Some(s) = loaded {
-            println!("discovery: {}", s.class);
-            confirm(&s, end, &mut log, "").inspect_err(|_| print(&log))?;
-            return Ok(());
-        }
-        let ws = windows(&targets);
-        let (mut bad, mut gap) = (false, false);
-        for (k, t) in &ws {
-            if let Some(t) = t {
-                println!("window {k}/{} target: {t:?}", ws.len());
-            }
-            let r = discover(seed, t.as_ref(), end, &mut log);
-            print(&log);
-            let (class, run, s) = match r {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("run failed: {e:#}");
-                    gap = true;
-                    continue;
-                }
-            };
-            if t.is_some() && !s.steps.iter().any(|st| st.mutate) {
-                println!("target not reached: unmutated");
-                gap = true;
-            }
-            if let Some(why) = run.unjudged {
-                println!("read half not judged: {why}");
-            }
-            println!("outcome: {class:?}");
-            if !matches!(class, Outcome::Violation(_)) {
-                continue;
-            }
-            bad = true;
-            let Some(file) = &log_file else { continue };
-            let mut file = file.clone().into_os_string();
-            file.push(format!(".{k}"));
-            std::fs::write(&file, s.to_string()).with_context(|| file.to_string_lossy().into_owned())?;
-            println!("schedule: {}", file.to_string_lossy());
-            confirm(&s, end, &mut log, "").inspect_err(|_| print(&log))?;
-        }
-        println!("seed {seed}: {}", VERDICTS[verdict(&ws, bad, gap)]);
-        return Ok(());
+        println!("discovery: {}", s.class);
+        let confirmed = confirm(&s, end, &mut log, "").inspect_err(hint)?;
+        return Ok(if confirmed.is_some() && s.class == "Violation" { 3 } else { 0 });
     };
 
     // §3.10: the sweep. Each row is written as its run ends: an interrupted
     // campaign keeps them.
-    let n = seeds.expect("checked with --campaign");
     std::fs::create_dir_all(dir.join("runs")).with_context(|| dir.display().to_string())?;
     let mut tsv = std::fs::File::create(dir.join("runs.tsv"))?;
     writeln!(tsv, "seed\twindow\tclass\tstatus\tfinding\tdecisions\tpartial\tsecs\tnote")?;
@@ -401,9 +426,9 @@ fn main() -> anyhow::Result<()> {
         let s = s.round() as u64;
         if s >= 3600 { format!("{}h{:02}m", s / 3600, s / 60 % 60) } else if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
     };
-    // On a terminal, a progress line over seeds on stderr below the per-run
-    // lines; cleared before anything prints to stdout.
-    let tty = std::io::stderr().is_terminal();
+    // On a terminal and without -v, a progress line over seeds on stderr below
+    // the per-run lines; cleared before anything prints to stdout.
+    let tty = !verbose && std::io::stderr().is_terminal();
     let started = Instant::now();
     let clear = || if tty { eprint!("\r\x1b[K") };
     let bar = |done: u64, classes: &BTreeMap<&str, u64>| {
@@ -417,7 +442,8 @@ fn main() -> anyhow::Result<()> {
         let counts: Vec<String> = classes.iter().map(|(c, k)| format!("{c} {k}")).collect();
         eprint!("\r[{}{}] {done}/{n} seeds  ETA {eta}  {}\x1b[K", "#".repeat(fill), ".".repeat(w as usize - fill), counts.join("  "));
     };
-    for seed in 0..n {
+    for idx in 0..n {
+        let seed = first + idx;
         let t = Instant::now();
         let b = baseline(seed, &mut log);
         clear();
@@ -430,20 +456,20 @@ fn main() -> anyhow::Result<()> {
                 let note = format!("baseline: {e:#}").replace(['\t', '\n'], " ");
                 let part = log.iter().filter(|d| d.partial).count();
                 writeln!(tsv, "{seed}\t-\tinvalid\t-\t-\t{}\t{part}\t{:.3}\t{note}", log.len(), t.elapsed().as_secs_f64())?;
-                println!("[{}/{n}] seed {seed}: incomplete, {note}", seed + 1);
-                bar(seed + 1, &classes);
+                println!("[{}/{n}] seed {seed}: incomplete, {note}", idx + 1);
+                bar(idx + 1, &classes);
                 continue;
             }
         };
         let ws = windows(&targets);
         // The plan, sized by the first baseline: a discovery costs about one
         // baseline, plus a confirm and minimization per new Violation.
-        if seed == 0 {
+        if idx == 0 {
             let per = ws.len() as u64 + 1;
-            println!("plan: {n} seeds, {} windows in seed 0, ~{} runs, est. {} (+ confirms)", ws.len(), n * per, hms((n * per) as f64 * secs));
+            println!("plan: {n} seeds, {} windows in seed {seed}, ~{} runs, est. {} (+ confirms)", ws.len(), n * per, hms((n * per) as f64 * secs));
         }
-        println!("[{}/{n}] seed {seed}: {}", seed + 1, telemetry(&log, targets.len(), secs));
-        bar(seed, &classes);
+        println!("[{}/{n}] seed {seed}: {}", idx + 1, telemetry(&log, targets.len(), secs));
+        bar(idx, &classes);
         std::fs::create_dir_all(dir.join(format!("runs/{seed}")))?;
         let (mut bad, mut gap) = (false, false);
         for (k, target) in &ws {
@@ -476,7 +502,7 @@ fn main() -> anyhow::Result<()> {
                         ("Violation", "repeat", Some(i + 1), String::new())
                     } else {
                         clear();
-                        println!("[{}/{n}] seed {seed} window {k}: Violation, confirming", seed + 1);
+                        println!("[{}/{n}] seed {seed} window {k}: Violation, confirming", idx + 1);
                         match confirm(&s, end, &mut log, "  ") {
                             Err(e) => {
                                 invalid += 1;
@@ -523,14 +549,14 @@ fn main() -> anyhow::Result<()> {
                 _ => class.into(),
             };
             clear();
-            println!("[{}/{n}] seed {seed} window {k}/{}: {what}{}  {:.1}s", seed + 1, ws.len(), if unmut { " (unmutated)" } else { "" }, secs.as_secs_f64());
-            bar(seed, &classes);
+            println!("[{}/{n}] seed {seed} window {k}/{}: {what}{}  {:.1}s", idx + 1, ws.len(), if unmut { " (unmutated)" } else { "" }, secs.as_secs_f64());
+            bar(idx, &classes);
         }
         let v = verdict(&ws, bad, gap);
         verdicts[v] += 1;
         clear();
-        println!("[{}/{n}] seed {seed}: {}", seed + 1, VERDICTS[v]);
-        bar(seed + 1, &classes);
+        println!("[{}/{n}] seed {seed}: {}", idx + 1, VERDICTS[v]);
+        bar(idx + 1, &classes);
     }
     clear();
 
@@ -547,5 +573,5 @@ fn main() -> anyhow::Result<()> {
         let guilty = d.guilty.as_ref().map_or("needs more than one hold".into(), |(t, nr, p)| hold(t, *nr, p));
         println!("finding #{}: {} runs, guilty {guilty}, {:?}, {}", i + 1, runs.len(), d.findings, dir.join(format!("findings/{}", i + 1)).display());
     }
-    Ok(())
+    Ok(if found.is_empty() { 0 } else { 3 })
 }

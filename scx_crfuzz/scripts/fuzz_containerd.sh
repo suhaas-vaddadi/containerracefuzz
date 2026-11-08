@@ -19,7 +19,8 @@
 #
 # Logs, under $CRFUZZ_DIR/logs/: scx_crfuzz.log (campaign output), mutator.log
 # and containerd.log (appended, one "==" header per SUT run). Results are in
-# $CRFUZZ_DIR/campaign (runs.tsv, runs/, findings/).
+# $CRFUZZ_DIR/campaign (runs.tsv, runs/, findings/). Exits as scx_crfuzz run
+# does: 3 if there is a finding.
 #
 # The container's cgroup is placed under the run cgroup (ctr --cgroup), so runc
 # init and the container are tracked. Known limit (spec L:Engine): a hold inside
@@ -125,7 +126,7 @@ echo | tee -a "$log"
 # The SUT inherits this cwd: keep relative paths out of the repo.
 cd "$CRFUZZ_DIR"
 set +e
-"$CRFUZZ_BIN" --campaign "$CRFUZZ_DIR/campaign" --seeds "$SEEDS" \
+"$CRFUZZ_BIN" run "$CRFUZZ_DIR/campaign" --seeds "$SEEDS" \
 	--attacker "$CRFUZZ_ATTACKER" \
 	--mutator "$CRFUZZ_DIR/mut/mutator_all" \
 	--layout "$CRFUZZ_DIR/layout.sh" \
