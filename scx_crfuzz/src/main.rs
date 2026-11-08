@@ -537,6 +537,8 @@ fn crfuzz() -> anyhow::Result<i32> {
                     ("invalid", "-", None, format!("{e:#}"))
                 }
                 Ok((class, run, s)) => {
+                    // A Violation's canary, kept by discover: removed if the stop discards the window.
+                    let kept = run.canary.dir.clone();
                     drop(run);
                     // Before confirm reuses `log`.
                     let order = schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>());
@@ -549,7 +551,10 @@ fn crfuzz() -> anyhow::Result<i32> {
                         clear();
                         println!("[{}/{n}] seed {seed} window {k}: Violation, confirming", idx + 1);
                         match confirm(&s, end, Some(&out), &mut log, "  ") {
-                            Err(e) if e.is::<Interrupted>() => break 'seeds,
+                            Err(e) if e.is::<Interrupted>() => {
+                                let _ = std::fs::remove_dir_all(&kept);
+                                break 'seeds;
+                            }
                             Err(e) => {
                                 invalid += 1;
                                 ("Violation", "invalid", None, format!("{e:#}"))
