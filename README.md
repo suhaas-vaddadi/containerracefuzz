@@ -71,8 +71,8 @@ gate.
 ### `scx_crfuzz`
 
 ```
-scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG]
-               [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S]
+               [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 scx_crfuzz replay FILE [-v]
 scx_crfuzz gated | status | reset | check
 scx_crfuzz --help | -h
@@ -85,15 +85,16 @@ crfuzz's gate, cgroup v2 at `/sys/fs/cgroup`, bpffs at `/sys/fs/bpf`,
 per check, exit 1 on a failure; `run` and `replay` run it first and stop
 listing the failures.
 
-`run` sweeps seeds `S..S+N`, each over all its windows, into `DIR` (see
-below); `DIR` must be absent or empty. To study one seed:
+`run` sweeps seeds `S..S+N` (no `--seeds`: `S, S+1, ...` until `--time` or a
+stop), each over all its windows, into `DIR` (see below); `DIR` must be absent or empty. To study one seed:
 `run DIR --seeds 1 --first-seed S -v`. `replay FILE` reruns a schedule:
 baseline, strict confirm, minimize.
 
 | Flag | Meaning |
 |---|---|
 | `--attacker UID:GID` | The attacker identity ("alice"): no groups, no capabilities. Required; never inferred. |
-| `--seeds N` | Required. How many seeds to sweep. A POS seed: same seed ⇒ same partial order of held events. A seed runs its baseline, then one run per **window**: per distinct `(syscall, path, occurrence)` hold of the baseline with a path. |
+| `--seeds N` | How many seeds to sweep (default: until `--time` or a stop). A POS seed: same seed ⇒ same partial order of held events. A seed runs its baseline, then one run per **window**: per distinct `(syscall, path, occurrence)` hold of the baseline with a path. |
+| `--time DURATION` | `90s`, `30m`, `2h` (bare: seconds). Start no run once that much time has passed; the run going finishes, the seed it was in is left incomplete, and the summary follows `time limit: <S> seeds complete`, exit 0 or 3. |
 | `--first-seed S` | The first seed (default 0). |
 | `--mutator PROG` | Run at one window's hold per run, as alice inside the held task's namespaces, root and cwd. Gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL` and `CRFUZZ_SEED`. Must exist inside the task's root. 15 s watchdog; a failure is logged, never a finding. |
 | `--layout PROG` | Run as root before **every** run (baseline, discovery, confirm, each minimization, each campaign seed) to restore the starting filesystem. A failure makes the run invalid. |
@@ -275,4 +276,4 @@ sudo env PATH=$PATH target/debug/deps/<suite>-<hash> --include-ignored --test-th
   inside the held task's root.
 - Minimization tries single holds only; a bug that needs two mutations is
   reported as "needs more than one hold".
-- Campaigns run seeds sequentially, with no time budget and no resume.
+- Campaigns run seeds sequentially, with no resume.

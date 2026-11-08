@@ -1,10 +1,13 @@
-//! scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+//! scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 //! scx_crfuzz replay FILE [-v]
 //! scx_crfuzz gated | status | reset | check
 //!
 //! `run` sweeps seeds S..S+N (default S 0; §3.10), each exhaustive over its
-//! windows. A seed runs CMD under POS (discovery): a baseline under the seed,
-//! no mutator, then once per window, each run with its own canary, judged
+//! windows; with no `--seeds`, S, S+1, ... until stopped. `--time DURATION`
+//! (`90s`, `30m`, `2h`; bare: seconds) starts no run once that much time has
+//! passed: the stop below, but with a `time limit:` line and exit 0 or 3.
+//! A seed runs CMD under POS (discovery): a baseline under the seed, no
+//! mutator, then once per window, each run with its own canary, judged
 //! against the attacker alice (UID:GID, no groups, no caps: §1). The windows
 //! are the baseline's holds with a known path, not keys.all and not a `?tid`,
 //! one per (syscall, path, occurrence): with `--mutator`, PROG (a binary or a
@@ -61,8 +64,8 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG]
-                      [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S]
+                      [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
        scx_crfuzz replay FILE [-v]
        scx_crfuzz gated     hold the gate scheduler until SIGINT/SIGTERM
        scx_crfuzz status    sched_ext state and pins
@@ -82,6 +85,26 @@ impl std::fmt::Display for Usage {
 }
 #[cfg(target_os = "linux")]
 impl std::error::Error for Usage {}
+
+/// `90`, `90s`, `30m`, `2h`: digits, then at most one unit.
+#[cfg(any(target_os = "linux", test))]
+fn duration(s: &str) -> Option<std::time::Duration> {
+    let (n, mul) = [("s", 1), ("m", 60), ("h", 3600)].into_iter().find_map(|(u, m)| Some((s.strip_suffix(u)?, m))).unwrap_or((s, 1));
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse::<u64>().ok()?.checked_mul(mul).map(std::time::Duration::from_secs)
+}
+
+#[cfg(test)]
+#[test]
+fn durations() {
+    let secs = |s| duration(s).map(|d| d.as_secs());
+    assert_eq!([secs("90"), secs("90s"), secs("30m"), secs("2h"), secs("0")], [Some(90), Some(90), Some(1800), Some(7200), Some(0)]);
+    for bad in ["", "s", "1d", "1.5h", "+1", "-1", "1 h", "1hs", "2H"] {
+        assert_eq!(secs(bad), None, "{bad}");
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -202,9 +225,10 @@ fn crfuzz() -> anyhow::Result<i32> {
     type Args = std::iter::Skip<std::env::Args>;
     let val = |args: &mut Args, flag: &str| args.next().ok_or_else(|| usage(format!("{flag} needs a value")));
     let num = |args: &mut Args, flag: &str| -> Result<u64> { val(args, flag)?.parse().map_err(|_| usage(format!("{flag}: not a number"))) };
+    let nonzero = |args: &mut Args, flag: &str| -> Result<u64> { Some(num(args, flag)?).filter(|&v| v > 0).ok_or_else(|| usage(format!("{flag}: must be at least 1"))) };
     let mut args = std::env::args().skip(1);
     let (mut mutator, mut layout, mut attacker, mut scope) = (None, None, None, Vec::<PathBuf>::new());
-    let (mut verbose, mut timeout) = (false, 30);
+    let (mut verbose, mut timeout, mut limit) = (false, 30, None);
     // campaign: DIR and the seeds; loaded: the schedule to replay.
     let (campaign, loaded, cmd) = match args.next().as_deref() {
         Some("-h" | "--help") => {
@@ -258,7 +282,11 @@ fn crfuzz() -> anyhow::Result<i32> {
             let cmd: Vec<String> = loop {
                 match args.next().as_deref() {
                     Some("--attacker") => attacker = Some(Alice::parse(&val(&mut args, "--attacker")?).map_err(|e| usage(format!("{e:#}")))?),
-                    Some("--seeds") => seeds = Some(num(&mut args, "--seeds")?),
+                    Some("--seeds") => seeds = Some(nonzero(&mut args, "--seeds")?),
+                    Some("--time") => {
+                        let d = duration(&val(&mut args, "--time")?).filter(|d| !d.is_zero());
+                        limit = Some(d.ok_or_else(|| usage("--time: not a nonzero N, Ns, Nm or Nh".into()))?);
+                    }
                     Some("--first-seed") => first = num(&mut args, "--first-seed")?,
                     // Absolute: the mutator is exec'd after a chdir into the task's cwd.
                     Some("--mutator") => mutator = Some(std::fs::canonicalize(val(&mut args, "--mutator")?).context("--mutator")?),
@@ -271,9 +299,10 @@ fn crfuzz() -> anyhow::Result<i32> {
                     None => return Err(usage("run needs -- CMD".into())),
                 }
             };
-            let n = seeds.ok_or_else(|| usage("--seeds is required".into()))?;
-            first.checked_add(n).ok_or_else(|| usage("--first-seed + --seeds overflows".into()))?;
-            (Some((PathBuf::from(dir), first, n)), None, cmd)
+            if seeds.is_some_and(|n| first.checked_add(n).is_none()) {
+                return Err(usage("--first-seed + --seeds overflows".into()));
+            }
+            (Some((PathBuf::from(dir), first, seeds)), None, cmd)
         }
         Some(a) => return Err(usage(format!("unknown command {a}"))),
         None => return Err(usage("a command is required".into())),
@@ -300,15 +329,18 @@ fn crfuzz() -> anyhow::Result<i32> {
         canary: Canary,
     }
 
+    // --time counts from here; checked before each run, like a stop.
+    let started = Instant::now();
+    let over = || limit.is_some_and(|l| started.elapsed() >= l);
     // Canary numbers, one per run of this crfuzz: a kept canary is never reused.
     let runs = Cell::new(0u32);
     // One run with its own canary; its decisions go to `log` whatever the
     // ending, and with -v to stdout. Its output and the layout's go to `out`
     // after a `== <name>` line; with no `out`, nowhere, or with -v to stderr.
     // Stdin is /dev/null. Interrupted if it ends once stopped (a terminal ^C
-    // also reaches the SUT), so nothing records it.
+    // also reaches the SUT), so nothing records it, or starts past --time.
     let judged = |seed: u64, mutator: Option<&Path>, target: Option<&EventId>, replay: Option<&mut Replay>, out: Option<&Path>, name: &str, log: &mut Vec<Decision>| -> Result<Judged> {
-        ensure!(!engine::stopped(), Interrupted);
+        ensure!(!engine::stopped() && !over(), Interrupted);
         let r = (|| -> Result<Judged> {
             let file = out
                 .map(|p| -> Result<std::fs::File> {
@@ -557,20 +589,31 @@ fn crfuzz() -> anyhow::Result<i32> {
     // On a terminal and without -v, a progress line over seeds on stderr below
     // the per-run lines; cleared before anything prints to stdout.
     let tty = !verbose && std::io::stderr().is_terminal();
-    let started = Instant::now();
     let clear = || if tty { eprint!("\r\x1b[K") };
     let bar = |done: u64, classes: &BTreeMap<&str, u64>| {
         if !tty {
             return;
         }
-        let w = 24;
-        let fill = (done * w / n.max(1)) as usize;
-        // From the seeds so far (confirms included); the plan line has the first guess.
-        let eta = if done == 0 { "?".into() } else { hms(started.elapsed().as_secs_f64() / done as f64 * (n - done) as f64) };
+        let elapsed = started.elapsed();
+        let head = match n {
+            Some(n) => {
+                let w = 24;
+                let fill = (done * w / n) as usize;
+                // From the seeds so far (confirms included); the plan line has the first guess.
+                let eta = if done == 0 { "?".into() } else { hms(elapsed.as_secs_f64() / done as f64 * (n - done) as f64) };
+                format!("[{}{}] {done}/{n} seeds  ETA {eta}", "#".repeat(fill), ".".repeat(w as usize - fill))
+            }
+            None => {
+                let left = limit.map(|l| format!("  {} left", hms(l.saturating_sub(elapsed).as_secs_f64()))).unwrap_or_default();
+                format!("{done} seeds  {} elapsed{left}", hms(elapsed.as_secs_f64()))
+            }
+        };
         let counts: Vec<String> = classes.iter().map(|(c, k)| format!("{c} {k}")).collect();
-        eprint!("\r[{}{}] {done}/{n} seeds  ETA {eta}  {}\x1b[K", "#".repeat(fill), ".".repeat(w as usize - fill), counts.join("  "));
+        eprint!("\r{head}  {}\x1b[K", counts.join("  "));
     };
-    'seeds: for idx in 0..n {
+    // The `[i/N]` of each line; `[i]` open-ended.
+    let of = n.map_or(String::new(), |n| format!("/{n}"));
+    'seeds: for idx in 0..n.unwrap_or(u64::MAX) {
         let seed = first + idx;
         let t = Instant::now();
         let rd = dir.join(format!("runs/{seed}"));
@@ -587,7 +630,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                 let note = format!("baseline: {e:#}").replace(['\t', '\n'], " ");
                 let part = log.iter().filter(|d| d.partial).count();
                 writeln!(tsv, "{seed}\t-\tinvalid\t-\t-\t{}\t{part}\t{:.3}\t{note}", log.len(), t.elapsed().as_secs_f64())?;
-                println!("[{}/{n}] seed {seed}: incomplete, {note}", idx + 1);
+                println!("[{}{of}] seed {seed}: incomplete, {note}", idx + 1);
                 bar(idx + 1, &classes);
                 continue;
             }
@@ -597,9 +640,12 @@ fn crfuzz() -> anyhow::Result<i32> {
         // baseline, plus a confirm and minimization per new Violation.
         if idx == 0 {
             let per = ws.len() as u64 + 1;
-            println!("plan: {n} seeds, {} windows in seed {seed}, ~{} runs, est. {} (+ confirms)", ws.len(), n * per, hms((n * per) as f64 * secs));
+            match n {
+                Some(n) => println!("plan: {n} seeds, {} windows in seed {seed}, ~{} runs, est. {} (+ confirms)", ws.len(), n.saturating_mul(per), hms(n as f64 * per as f64 * secs)),
+                None => println!("plan: open-ended, {} windows in seed {seed}, ~{per} runs a seed, est. {} a seed (+ confirms)", ws.len(), hms(per as f64 * secs)),
+            }
         }
-        println!("[{}/{n}] seed {seed}: {}", idx + 1, telemetry(&log, targets.len(), secs));
+        println!("[{}{of}] seed {seed}: {}", idx + 1, telemetry(&log, targets.len(), secs));
         bar(idx, &classes);
         let (mut bad, mut gap) = (false, false);
         for (k, target) in &ws {
@@ -633,7 +679,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                         ("Violation", "repeat", Some(i + 1), String::new())
                     } else {
                         clear();
-                        println!("[{}/{n}] seed {seed} window {k}: Violation, confirming", idx + 1);
+                        println!("[{}{of}] seed {seed} window {k}: Violation, confirming", idx + 1);
                         match confirm(&s, end, Some(&out), &mut log, "  ") {
                             Err(e) if e.is::<Interrupted>() => {
                                 let _ = std::fs::remove_dir_all(&kept);
@@ -691,22 +737,26 @@ fn crfuzz() -> anyhow::Result<i32> {
                 _ => class.into(),
             };
             clear();
-            println!("[{}/{n}] seed {seed} window {k}/{}: {what}{}  {:.1}s", idx + 1, ws.len(), if unmut { " (unmutated)" } else { "" }, secs.as_secs_f64());
+            println!("[{}{of}] seed {seed} window {k}/{}: {what}{}  {:.1}s", idx + 1, ws.len(), if unmut { " (unmutated)" } else { "" }, secs.as_secs_f64());
             bar(idx, &classes);
         }
         let v = verdict(&ws, bad, gap);
         verdicts[v] += 1;
         clear();
-        println!("[{}/{n}] seed {seed}: {}", idx + 1, VERDICTS[v]);
+        println!("[{}{of}] seed {seed}: {}", idx + 1, VERDICTS[v]);
         bar(idx + 1, &classes);
     }
     clear();
 
     let stopped = engine::stopped();
+    let done = verdicts.iter().sum::<u64>();
     if stopped {
-        println!("interrupted: {} seeds complete", verdicts.iter().sum::<u64>());
+        println!("interrupted: {done} seeds complete");
+    } else if n.is_none_or(|n| done < n) {
+        // Only a stop or --time ends the loop early.
+        println!("time limit: {done} seeds complete");
     }
-    println!("campaign: {n} seeds, {total} runs, {invalid} invalid, discovery {:.1}s", time.as_secs_f64());
+    println!("campaign: {} seeds, {total} runs, {invalid} invalid, discovery {:.1}s", n.unwrap_or(done), time.as_secs_f64());
     let v: Vec<String> = VERDICTS.iter().zip(verdicts).map(|(name, c)| format!("{c} {name}")).collect();
     println!("seeds: {}", v.join(", "));
     println!("distinct partial orders: {}", orders.len());
