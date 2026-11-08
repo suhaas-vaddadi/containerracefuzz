@@ -13,6 +13,7 @@
 #   CRFUZZ_DIR       scratch directory      [/tmp/crfuzz-containerd]
 #   CRFUZZ_IMAGE     static busybox to use  [/usr/bin/busybox]
 #   CRFUZZ_CC        C compiler             [cc]
+#   CRFUZZ_JOBS      seeds at once (--jobs) [1]
 # CRFUZZ_SCOPE defaults to the rootfs. Other CRFUZZ_* are inherited by the
 # mutator; crfuzz sets CRFUZZ_CANARY itself.
 #
@@ -20,6 +21,12 @@
 # and containerd.log (appended, one "==" header per SUT run). Results are in
 # $CRFUZZ_DIR/campaign (runs.tsv, runs/, findings/). Exits as scx_crfuzz run
 # does: 3 if there is a finding.
+#
+# Each worker gets private copies (--private, at any CRFUZZ_JOBS) of the rootfs,
+# the daemon's state ($CRFUZZ_DIR/run), the shims' ttrpc sockets
+# (/run/containerd/s: their names hash the same in every worker) and the
+# daemon's fixed NRI socket (/run/nri); the layout and sut.sh restore the
+# contents of these mount points in place.
 #
 # The container's cgroup is placed under the run cgroup (ctr --cgroup), so runc
 # init and the container are tracked. Known limit (spec L:Engine): a hold inside
@@ -40,6 +47,7 @@ CRFUZZ_ATTACKER=${CRFUZZ_ATTACKER:-65534:65534}
 CRFUZZ_DIR=${CRFUZZ_DIR:-/tmp/crfuzz-containerd}
 CRFUZZ_IMAGE=${CRFUZZ_IMAGE:-/usr/bin/busybox}
 CRFUZZ_CC=${CRFUZZ_CC:-cc}
+CRFUZZ_JOBS=${CRFUZZ_JOBS:-1}
 
 [ "$(id -u)" -eq 0 ] || { echo "$0: needs root" >&2; exit 1; }
 [ -x "$CRFUZZ_BIN" ] || { echo "$0: no scx_crfuzz at $CRFUZZ_BIN (build it in the VM)" >&2; exit 1; }
@@ -56,7 +64,7 @@ CTR=$(command -v ctr) || { echo "$0: ctr not on PATH" >&2; exit 1; }
 case "$CRFUZZ_DIR" in ""|/) echo "$0: bad CRFUZZ_DIR" >&2; exit 1 ;; esac
 rm -rf "$CRFUZZ_DIR"
 mkdir -p "$CRFUZZ_DIR/rootfs/bin" "$CRFUZZ_DIR/rootfs/proc" "$CRFUZZ_DIR/rootfs/dev" \
-	"$CRFUZZ_DIR/rootfs/tmp" "$CRFUZZ_DIR/mut" "$CRFUZZ_DIR/logs"
+	"$CRFUZZ_DIR/rootfs/tmp" "$CRFUZZ_DIR/mut" "$CRFUZZ_DIR/logs" "$CRFUZZ_DIR/run" /run/containerd/s /run/nri
 # The mutator runs as the attacker, so her log file is writable by her. The
 # directory stays root-only: otherwise the SUT's own log path would be
 # attacker-writable and the mutator would redirect the SUT's log into the canary.
@@ -77,7 +85,7 @@ cat > "$CRFUZZ_DIR/sut.sh" <<'EOF'
 #!/bin/sh
 set -eu
 d="$CRFUZZ_DIR/run"
-rm -rf "$d"
+find "$d" -mindepth 1 -delete  # a mount point: emptied, never removed
 mkdir -p "$d/root" "$d/state"
 echo "== $(date)" >>"$CRFUZZ_DIR/logs/containerd.log"
 "$CRFUZZ_CONTAINERD" --root "$d/root" --state "$d/state" --address "$d/sock" \
@@ -96,11 +104,13 @@ cg=$(cut -d: -f3 /proc/self/cgroup)
 	/bin/busybox sh -c '/bin/busybox echo busy; /bin/busybox sleep 0.5'
 EOF
 
-# Reset between runs: daemon state and the rootfs the mutator rearranged.
+# Reset between runs: daemon state and the rootfs the mutator rearranged, in
+# place (mount points). `cp -a orig/.` restores the rootfs directory's own mode too.
 cat > "$CRFUZZ_DIR/layout.sh" <<'EOF'
 #!/bin/sh
-rm -rf "$CRFUZZ_DIR/run"
-rm -rf "$CRFUZZ_DIR/rootfs" && cp -a "$CRFUZZ_DIR/rootfs.orig" "$CRFUZZ_DIR/rootfs"
+set -e
+find "$CRFUZZ_DIR/run" "$CRFUZZ_DIR/rootfs" -mindepth 1 -delete
+cp -a "$CRFUZZ_DIR/rootfs.orig/." "$CRFUZZ_DIR/rootfs/"
 EOF
 chmod +x "$CRFUZZ_DIR/sut.sh" "$CRFUZZ_DIR/layout.sh"
 
@@ -113,14 +123,15 @@ export CRFUZZ_DIR CRFUZZ_ROOTFS="$CRFUZZ_DIR/rootfs" CRFUZZ_SCOPE \
 
 log="$CRFUZZ_DIR/logs/scx_crfuzz.log"
 echo "scenario: containerd -> shim -> runc startup; busy busybox rootfs owned by $CRFUZZ_ATTACKER" | tee "$log"
-echo "campaign: $CRFUZZ_DIR/campaign ($SEEDS seeds)" | tee -a "$log"
+echo "campaign: $CRFUZZ_DIR/campaign ($SEEDS seeds, $CRFUZZ_JOBS at once)" | tee -a "$log"
 echo | tee -a "$log"
 
 # The SUT inherits this cwd: keep relative paths out of the repo.
 cd "$CRFUZZ_DIR"
 set +e
 "$CRFUZZ_BIN" run "$CRFUZZ_DIR/campaign" --seeds "$SEEDS" \
-	--attacker "$CRFUZZ_ATTACKER" \
+	--attacker "$CRFUZZ_ATTACKER" --jobs "$CRFUZZ_JOBS" \
+	--private "$CRFUZZ_DIR/rootfs" --private "$CRFUZZ_DIR/run" --private /run/containerd/s --private /run/nri \
 	--mutator "$CRFUZZ_DIR/mut/mutator_all" \
 	--layout "$CRFUZZ_DIR/layout.sh" \
 	--scope "$CRFUZZ_SCOPE" \

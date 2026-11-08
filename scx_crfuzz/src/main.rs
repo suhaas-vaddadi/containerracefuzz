@@ -1,4 +1,4 @@
-//! scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+//! scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 //! scx_crfuzz replay FILE [-v]
 //! scx_crfuzz gated | status | reset | check
 //!
@@ -20,6 +20,15 @@
 //! filesystem, so no run sees what an earlier one's SUT or mutator left
 //! behind; a failure makes the run invalid. `--timeout SECS` (1 to 30,
 //! default 30, recorded) ends a run still going.
+//!
+//! `--jobs N` (default 1) runs N seeds at once, one worker thread each, all
+//! sharing the gate scheduler. `--private DIR` (repeatable, recorded, so
+//! `replay` too) gives each worker its own copy of DIR: its own mount
+//! namespace, `/` rslave, a `cp -a` of DIR under /var/lib/crfuzz/work
+//! bind-mounted over DIR, inherited by the layout, the SUT and the mutator.
+//! N > 1 needs one; neither the canaries nor DIR may be in one. At N > 1 a
+//! seed's lines print as one block when it ends, rows and finding numbers go
+//! by completion.
 //!
 //! Window k's schedule (§3.8) goes to `DIR/runs/<seed>/<k>.sched` and a row to
 //! `DIR/runs.tsv`; its runs' output (SUT and layout: discovery, confirm,
@@ -65,7 +74,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S]
-                      [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+                      [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
        scx_crfuzz replay FILE [-v]
        scx_crfuzz gated     hold the gate scheduler until SIGINT/SIGTERM
        scx_crfuzz status    sched_ext state and pins
@@ -179,11 +188,13 @@ fn crfuzz() -> anyhow::Result<i32> {
     use scx_crfuzz::oracle::{self, Alice, Canary, Finding, Outcome};
     use scx_crfuzz::pos::{EventId, Pos};
     use scx_crfuzz::schedule::{self, Dedup, Divergence, Fixed, Schedule};
-    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::io::{IsTerminal, Write};
+    use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     /// Replays a discovery gets to reproduce before it counts as unconfirmed.
@@ -221,6 +232,58 @@ fn crfuzz() -> anyhow::Result<i32> {
     }
     impl std::error::Error for MutatorFailed {}
 
+    /// This thread in its own mount namespace, `/` rslave (host mounts still
+    /// show, nothing leaks out), each of `dirs` covered by a bind mount of its
+    /// copy under `work` (`cp -a` of DIR itself: its owner and mode too).
+    /// What the thread forks inherits it. Then the cwd again: one inside a DIR
+    /// still points at the original.
+    fn isolate(dirs: &[PathBuf], work: &Path) -> Result<()> {
+        let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).context("NUL in path");
+        let ok = |r: i32, what: &dyn std::fmt::Display| -> Result<()> {
+            ensure!(r == 0, "{what}: {}", std::io::Error::last_os_error());
+            Ok(())
+        };
+        let cwd = std::env::current_dir()?;
+        ok(unsafe { libc::unshare(libc::CLONE_NEWNS) }, &"unshare(CLONE_NEWNS)")?;
+        ok(unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_SLAVE, std::ptr::null()) }, &"make / rslave")?;
+        // work/<pid>/<w> root-only: alice must not reach another worker's copies.
+        // Ours go through the bind mount, whose root is the copy itself.
+        let base = work.parent().and_then(Path::parent).context("work dir")?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o755).create(base).with_context(|| base.display().to_string())?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(work).with_context(|| work.display().to_string())?;
+        for (i, d) in dirs.iter().enumerate() {
+            let copy = work.join(i.to_string());
+            let st = Command::new("cp").arg("-a").arg("--").arg(d).arg(&copy).status().context("cp")?;
+            ensure!(st.success(), "cp -a {} {}: {st}", d.display(), copy.display());
+            let r = unsafe { libc::mount(c(&copy)?.as_ptr(), c(d)?.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) };
+            ok(r, &format_args!("bind {} over {}", copy.display(), d.display()))?;
+        }
+        std::env::set_current_dir(&cwd).with_context(|| cwd.display().to_string())
+    }
+    /// The private copies, removed once every run is done.
+    struct Work(PathBuf);
+    impl Drop for Work {
+        fn drop(&mut self) {
+            match std::fs::remove_dir_all(&self.0) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => eprintln!("left {}: {e}", self.0.display()),
+                _ => {}
+            }
+        }
+    }
+    /// A worker's stdout: at --jobs 1 straight through, else kept in `buf`.
+    struct Out {
+        live: bool,
+        buf: Vec<u8>,
+    }
+    impl Write for Out {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.live { std::io::stdout().write(b) } else { self.buf.write(b) }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::stdout().flush()
+        }
+    }
+
     let usage = |why: String| anyhow::Error::new(Usage(why));
     type Args = std::iter::Skip<std::env::Args>;
     let val = |args: &mut Args, flag: &str| args.next().ok_or_else(|| usage(format!("{flag} needs a value")));
@@ -228,7 +291,7 @@ fn crfuzz() -> anyhow::Result<i32> {
     let nonzero = |args: &mut Args, flag: &str| -> Result<u64> { Some(num(args, flag)?).filter(|&v| v > 0).ok_or_else(|| usage(format!("{flag}: must be at least 1"))) };
     let mut args = std::env::args().skip(1);
     let (mut mutator, mut layout, mut attacker, mut scope) = (None, None, None, Vec::<PathBuf>::new());
-    let (mut verbose, mut timeout, mut limit) = (false, 30, None);
+    let (mut verbose, mut timeout, mut limit, mut jobs, mut private) = (false, 30, None, 1, Vec::new());
     // campaign: DIR and the seeds; loaded: the schedule to replay.
     let (campaign, loaded, cmd) = match args.next().as_deref() {
         Some("-h" | "--help") => {
@@ -272,7 +335,7 @@ fn crfuzz() -> anyhow::Result<i32> {
             }
             let f = file.ok_or_else(|| usage("replay needs a FILE".into()))?;
             let s = std::fs::read_to_string(&f).context(f.clone())?.parse::<Schedule>().context(f)?;
-            (mutator, layout, timeout, attacker) = (s.mutator.clone(), s.layout.clone(), s.timeout, Some(Alice::parse(&s.attacker)?));
+            (mutator, layout, timeout, private, attacker) = (s.mutator.clone(), s.layout.clone(), s.timeout, s.private.clone(), Some(Alice::parse(&s.attacker)?));
             let cmd = s.cmd.clone();
             (None, Some(s), cmd)
         }
@@ -288,6 +351,8 @@ fn crfuzz() -> anyhow::Result<i32> {
                         limit = Some(d.ok_or_else(|| usage("--time: not a nonzero N, Ns, Nm or Nh".into()))?);
                     }
                     Some("--first-seed") => first = num(&mut args, "--first-seed")?,
+                    Some("--jobs") => jobs = nonzero(&mut args, "--jobs")? as usize,
+                    Some("--private") => private.push(std::fs::canonicalize(val(&mut args, "--private")?).context("--private")?),
                     // Absolute: the mutator is exec'd after a chdir into the task's cwd.
                     Some("--mutator") => mutator = Some(std::fs::canonicalize(val(&mut args, "--mutator")?).context("--mutator")?),
                     Some("--layout") => layout = Some(std::fs::canonicalize(val(&mut args, "--layout")?).context("--layout")?),
@@ -302,6 +367,9 @@ fn crfuzz() -> anyhow::Result<i32> {
             if seeds.is_some_and(|n| first.checked_add(n).is_none()) {
                 return Err(usage("--first-seed + --seeds overflows".into()));
             }
+            if jobs > 1 && private.is_empty() {
+                return Err(usage("--jobs N > 1 needs --private DIR: the workers share one filesystem, so their layouts, SUTs and mutators would meet in what the runs write".into()));
+            }
             (Some((PathBuf::from(dir), first, seeds)), None, cmd)
         }
         Some(a) => return Err(usage(format!("unknown command {a}"))),
@@ -313,6 +381,19 @@ fn crfuzz() -> anyhow::Result<i32> {
     // No resume: an old campaign's runs/ and findings/ would read as this one's.
     if let Some((d, ..)) = &campaign {
         ensure!(std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()), "run: {} is not empty", d.display());
+    }
+    // The canaries stay shared (unique names), the campaign's output too.
+    let canaries = std::fs::canonicalize(oracle::ROOT).unwrap_or_else(|_| oracle::ROOT.into());
+    let output = campaign.as_ref().map(|(d, ..)| std::fs::canonicalize(d).or_else(|_| std::path::absolute(d))).transpose()?;
+    for d in &private {
+        ensure!(d.is_dir(), "--private {}: not a directory", d.display());
+        ensure!(!canaries.starts_with(d) && !d.starts_with(&canaries), "--private {}: overlaps {}, where the canaries must stay shared", d.display(), canaries.display());
+        ensure!(!output.as_ref().is_some_and(|o| o.starts_with(d)), "--private {}: holds DIR, whose output would land in a private copy", d.display());
+    }
+    if let Ok(cpus) = std::thread::available_parallelism() {
+        if jobs > cpus.get() {
+            eprintln!("warning: --jobs {jobs} > {cpus} CPUs: runs compete for them, and more decisions turn partial");
+        }
     }
 
     /// One judged run (§5, §6).
@@ -331,9 +412,11 @@ fn crfuzz() -> anyhow::Result<i32> {
 
     // --time counts from here; checked before each run, like a stop.
     let started = Instant::now();
-    let over = || limit.is_some_and(|l| started.elapsed() >= l);
+    // A worker's fatal error stops the others the same way.
+    let fatal = AtomicBool::new(false);
+    let over = || limit.is_some_and(|l| started.elapsed() >= l) || fatal.load(Relaxed);
     // Canary numbers, one per run of this crfuzz: a kept canary is never reused.
-    let runs = Cell::new(0u32);
+    let runs = AtomicU32::new(0);
     // One run with its own canary; its decisions go to `log` whatever the
     // ending, and with -v to stdout. Its output and the layout's go to `out`
     // after a `== <name>` line; with no `out`, nowhere, or with -v to stderr.
@@ -364,7 +447,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                 let st = c.status().with_context(|| l.display().to_string())?;
                 ensure!(st.success(), "invalid: layout {} failed: {st}", l.display());
             }
-            let canary = Canary::create(runs.replace(runs.get() + 1))?;
+            let canary = Canary::create(runs.fetch_add(1, Relaxed))?;
             backend::read_before(&canary, &alice)?;
             let mut sut = Command::new(prog);
             sut.args(rest);
@@ -374,7 +457,9 @@ fn crfuzz() -> anyhow::Result<i32> {
             let until = Instant::now().checked_add(Duration::from_secs(timeout)).context("--timeout too large")?;
             let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), until, log);
             if verbose {
-                log.iter().for_each(|d| println!("{d:?}"));
+                // One block per run, whatever other workers print.
+                let mut so = std::io::stdout().lock();
+                log.iter().try_for_each(|d| writeln!(so, "{d:?}"))?;
             }
             let end = if r.is_ok() { Some(be.child().wait()?) } else { None };
             // Clears gates and cgroup, ending what is left of the SUT, before the
@@ -468,6 +553,7 @@ fn crfuzz() -> anyhow::Result<i32> {
         mutator: mutator.clone().filter(|_| mutated),
         layout: layout.clone(),
         timeout,
+        private: private.clone(),
         cmd: cmd.clone(),
         class: class.into(),
         deadline,
@@ -487,11 +573,11 @@ fn crfuzz() -> anyhow::Result<i32> {
         Ok((class, run, s))
     };
 
-    // Confirm, then on a Violation minimize, each line after `pre`, the runs'
-    // output to `out`. None: not
+    // Confirm, then on a Violation minimize, each line to `w` after `pre`, the
+    // runs' output to `out`. None: not
     // confirmed; Some(Some(k)): guilty step k; Some(None): no single guilty
     // hold, or a confirmed non-Violation.
-    let confirm = |sched: &Schedule, end: Option<ExitStatus>, out: Option<&Path>, log: &mut Vec<Decision>, pre: &str| -> Result<Option<Option<usize>>> {
+    let confirm = |sched: &Schedule, end: Option<ExitStatus>, out: Option<&Path>, log: &mut Vec<Decision>, pre: &str, w: &mut dyn Write| -> Result<Option<Option<usize>>> {
         // Confirm: every recorded mutation, any divergence fails it.
         let fixed = || Fixed { steps: &sched.steps, next: 0, deadline: sched.deadline };
         // Code between holds may not be deterministic (M:N runtimes): one
@@ -503,21 +589,21 @@ fn crfuzz() -> anyhow::Result<i32> {
             let mut r = Replay { fixed: fixed(), only: None, diverged: None };
             let mut run = match judged(sched.seed, sched.mutator.as_deref(), None, Some(&mut r), out, &format!("confirm {t}/{CONFIRM_TRIES}"), log) {
                 Err(e) if e.is::<Divergence>() || e.is::<MutatorFailed>() => {
-                    println!("{pre}not confirmed ({t}/{CONFIRM_TRIES}): {e:#}");
+                    writeln!(w, "{pre}not confirmed ({t}/{CONFIRM_TRIES}): {e:#}")?;
                     continue;
                 }
                 r => r?,
             };
             let class = oracle::outcome(std::mem::take(&mut run.found), run.end, end);
             if class.name() != sched.class || run.norm != sched.findings {
-                println!("{pre}not confirmed ({t}/{CONFIRM_TRIES}): {class:?}, normalized {:?}", run.norm);
+                writeln!(w, "{pre}not confirmed ({t}/{CONFIRM_TRIES}): {class:?}, normalized {:?}", run.norm)?;
                 continue;
             }
             confirmed = Some((class, run));
             break;
         }
         let Some((class, mut run)) = confirmed else { return Ok(None) };
-        println!("{pre}confirmed: {}", sched.class);
+        writeln!(w, "{pre}confirmed: {}", sched.class)?;
         if !matches!(class, Outcome::Violation(_)) {
             return Ok(Some(None));
         }
@@ -532,20 +618,20 @@ fn crfuzz() -> anyhow::Result<i32> {
             let mut r = Replay { fixed: fixed(), only: Some(k), diverged: None };
             let mut run = match judged(sched.seed, sched.mutator.as_deref(), None, Some(&mut r), out, &format!("minimize step {k}"), log) {
                 Err(e) if e.is::<Divergence>() || e.is::<MutatorFailed>() => {
-                    println!("{pre}minimize step {k}: not guilty, {e:#}");
+                    writeln!(w, "{pre}minimize step {k}: not guilty, {e:#}")?;
                     continue;
                 }
                 res => res?,
             };
             let class = oracle::outcome(std::mem::take(&mut run.found), run.end, end);
             let tail = r.diverged.map(|d| format!(" (then POS: {d})")).unwrap_or_default();
-            println!("{pre}minimize step {k}: {class:?}{tail}");
+            writeln!(w, "{pre}minimize step {k}: {class:?}{tail}")?;
             if matches!(class, Outcome::Violation(_)) && !run.norm.is_disjoint(&sched.findings) {
-                println!("{pre}guilty: step {k} {:?}", sched.steps[k].id);
+                writeln!(w, "{pre}guilty: step {k} {:?}", sched.steps[k].id)?;
                 return Ok(Some(Some(k)));
             }
         }
-        println!("{pre}guilty: needs more than one hold");
+        writeln!(w, "{pre}guilty: needs more than one hold")?;
         Ok(Some(None))
     };
 
@@ -555,10 +641,16 @@ fn crfuzz() -> anyhow::Result<i32> {
     // Ours for this process's life unless crfuzz's already runs.
     let _sched = gate::Scheduler::start()?;
     backend::sweep();
+    // Worker w's private copies: work/<w>/<i>.
+    let work = Path::new(oracle::ROOT).join(format!("work/{}", std::process::id()));
+    let _work = (!private.is_empty()).then(|| Work(work.clone()));
     println!("{alice}");
-    let mut log = Vec::new();
     let Some((dir, first, n)) = campaign else {
         let s = loaded.expect("replay");
+        if !private.is_empty() {
+            isolate(&private, &work.join("0"))?;
+        }
+        let mut log = Vec::new();
         let hint = |_: &anyhow::Error| {
             if !verbose && !engine::stopped() {
                 eprintln!("(rerun with -v for the decision log)");
@@ -568,7 +660,7 @@ fn crfuzz() -> anyhow::Result<i32> {
         println!("{}", telemetry(&log, targets.len(), secs));
         println!("discovery: {}", s.class);
         // Not reproduced in CONFIRM_TRIES: an error, never a clean exit.
-        confirm(&s, end, None, &mut log, "").and_then(|c| c.with_context(|| format!("not reproduced in {CONFIRM_TRIES} tries: {}", s.class))).inspect_err(hint)?;
+        confirm(&s, end, None, &mut log, "", &mut std::io::stdout()).and_then(|c| c.with_context(|| format!("not reproduced in {CONFIRM_TRIES} tries: {}", s.class))).inspect_err(hint)?;
         return Ok(if s.class == "Violation" { 3 } else { 0 });
     };
 
@@ -577,11 +669,41 @@ fn crfuzz() -> anyhow::Result<i32> {
     std::fs::create_dir_all(dir.join("runs")).with_context(|| dir.display().to_string())?;
     let mut tsv = std::fs::File::create(dir.join("runs.tsv"))?;
     writeln!(tsv, "seed\twindow\tclass\tstatus\tfinding\tdecisions\tpartial\tsecs\tnote")?;
+    /// The campaign's totals, behind one lock for every worker.
+    struct Tally {
+        tsv: std::fs::File,
+        total: u64,
+        invalid: u64,
+        decisions: usize,
+        partial: usize,
+        time: Duration,
+        orders: HashSet<Vec<EventId>>,
+        unmutated: u64,
+        classes: BTreeMap<&'static str, u64>,
+        verdicts: [u64; 4],
+        /// Seeds ended, for the progress line.
+        done: u64,
+        /// A baseline has ended: the plan line is out.
+        planned: bool,
+    }
+    let tally = Mutex::new(Tally {
+        tsv,
+        total: 0,
+        invalid: 0,
+        decisions: 0,
+        partial: 0,
+        time: Duration::ZERO,
+        orders: HashSet::new(),
+        unmutated: 0,
+        classes: BTreeMap::new(),
+        verdicts: [0; 4],
+        done: 0,
+        planned: false,
+    });
+    // Dedup, confirm and push under one lock: two workers on one new bug give
+    // a finding and a repeat, never two findings.
+    let found: Mutex<Vec<(Dedup, Vec<String>)>> = Mutex::new(Vec::new());
     let hold = |t: &str, nr: i64, p: &Option<PathBuf>| format!("({t} {nr} {})", p.as_deref().map_or("-".into(), |p| p.display().to_string()));
-    let mut found: Vec<(Dedup, Vec<String>)> = Vec::new();
-    let (mut total, mut invalid, mut decisions, mut partial, mut time) = (0, 0, 0, 0, Duration::ZERO);
-    let mut orders = HashSet::new();
-    let (mut unmutated, mut classes, mut verdicts) = (0, BTreeMap::<&str, u64>::new(), [0u64; 4]);
     let hms = |s: f64| {
         let s = s.round() as u64;
         if s >= 3600 { format!("{}h{:02}m", s / 3600, s / 60 % 60) } else if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
@@ -590,11 +712,11 @@ fn crfuzz() -> anyhow::Result<i32> {
     // the per-run lines; cleared before anything prints to stdout.
     let tty = !verbose && std::io::stderr().is_terminal();
     let clear = || if tty { eprint!("\r\x1b[K") };
-    let bar = |done: u64, classes: &BTreeMap<&str, u64>| {
+    let bar = |t: &Tally| {
         if !tty {
             return;
         }
-        let elapsed = started.elapsed();
+        let (done, elapsed) = (t.done, started.elapsed());
         let head = match n {
             Some(n) => {
                 let w = 24;
@@ -608,145 +730,209 @@ fn crfuzz() -> anyhow::Result<i32> {
                 format!("{done} seeds  {} elapsed{left}", hms(elapsed.as_secs_f64()))
             }
         };
-        let counts: Vec<String> = classes.iter().map(|(c, k)| format!("{c} {k}")).collect();
+        let counts: Vec<String> = t.classes.iter().map(|(c, k)| format!("{c} {k}")).collect();
         eprint!("\r{head}  {}\x1b[K", counts.join("  "));
+    };
+    // A line of a seed's, and then (`show`) the progress line: at --jobs 1 as
+    // they come; else the seed's lines print as one block when it ends (`end`).
+    let say = |w: &mut Out, line: String| -> Result<()> {
+        if w.live {
+            clear();
+        }
+        Ok(writeln!(w, "{line}")?)
+    };
+    let show = |w: &mut Out, t: &Tally, end: bool| -> Result<()> {
+        if !w.live && end {
+            clear();
+            std::io::stdout().write_all(&std::mem::take(&mut w.buf))?;
+        }
+        if w.live || end {
+            bar(t);
+        }
+        Ok(())
     };
     // The `[i/N]` of each line; `[i]` open-ended.
     let of = n.map_or(String::new(), |n| format!("/{n}"));
-    'seeds: for idx in 0..n.unwrap_or(u64::MAX) {
-        let seed = first + idx;
-        let t = Instant::now();
-        let rd = dir.join(format!("runs/{seed}"));
-        std::fs::create_dir_all(&rd)?;
-        let b = baseline(seed, Some(&rd.join("baseline.log")), &mut log);
-        clear();
-        let (end, targets, secs) = match b {
-            Ok(b) => b,
-            Err(e) if e.is::<Interrupted>() => break,
-            Err(e) => {
-                invalid += 1;
-                verdicts[2] += 1;
-                *classes.entry("invalid").or_default() += 1;
-                let note = format!("baseline: {e:#}").replace(['\t', '\n'], " ");
-                let part = log.iter().filter(|d| d.partial).count();
-                writeln!(tsv, "{seed}\t-\tinvalid\t-\t-\t{}\t{part}\t{:.3}\t{note}", log.len(), t.elapsed().as_secs_f64())?;
-                println!("[{}{of}] seed {seed}: incomplete, {note}", idx + 1);
-                bar(idx + 1, &classes);
-                continue;
-            }
-        };
-        let ws = windows(&targets);
-        // The plan, sized by the first baseline: a discovery costs about one
-        // baseline, plus a confirm and minimization per new Violation.
-        if idx == 0 {
-            let per = ws.len() as u64 + 1;
-            match n {
-                Some(n) => println!("plan: {n} seeds, {} windows in seed {seed}, ~{} runs, est. {} (+ confirms)", ws.len(), n.saturating_mul(per), hms(n as f64 * per as f64 * secs)),
-                None => println!("plan: open-ended, {} windows in seed {seed}, ~{per} runs a seed, est. {} a seed (+ confirms)", ws.len(), hms(per as f64 * secs)),
-            }
+    // No worker (or private copy) without a seed.
+    let jobs = n.map_or(jobs, |n| n.min(jobs as u64) as usize);
+    let next = AtomicU64::new(0);
+    // Worker w: seeds from `next` until they run out or a run is refused.
+    let worker = |wk: usize| -> Result<()> {
+        if !private.is_empty() {
+            isolate(&private, &work.join(wk.to_string()))?;
         }
-        println!("[{}{of}] seed {seed}: {}", idx + 1, telemetry(&log, targets.len(), secs));
-        bar(idx, &classes);
-        let (mut bad, mut gap) = (false, false);
-        for (k, target) in &ws {
+        let mut log = Vec::new();
+        let mut w = Out { live: jobs == 1, buf: Vec::new() };
+        'seeds: loop {
+            let idx = next.fetch_add(1, Relaxed);
+            if n.is_some_and(|n| idx >= n) {
+                break;
+            }
+            let seed = first + idx;
             let t = Instant::now();
-            let out = rd.join(format!("{k}.log"));
-            let r = discover(seed, target.as_ref(), end, &out, &mut log);
-            let secs = t.elapsed();
-            // Its target never came up: the run says nothing about the mutator.
-            let unmut = r.is_ok() && target.is_some() && !log.iter().any(|d| d.mutation.is_some());
-            let (len, part) = (log.len(), log.iter().filter(|d| d.partial).count());
-            let file = rd.join(format!("{k}.sched"));
-            // status: new, repeat, unconfirmed or invalid on a Violation, else "-".
-            // Interrupted, here or confirming: the window leaves no trace.
-            let (class, status, finding, note) = match r {
-                Err(e) if e.is::<Interrupted>() => break 'seeds,
+            let rd = dir.join(format!("runs/{seed}"));
+            std::fs::create_dir_all(&rd)?;
+            let b = baseline(seed, Some(&rd.join("baseline.log")), &mut log);
+            let (end, targets, secs) = match b {
+                Ok(b) => b,
+                Err(e) if e.is::<Interrupted>() => break,
                 Err(e) => {
-                    invalid += 1;
-                    std::fs::write(&file, schedule(seed, target.is_some(), "invalid", false, BTreeSet::new(), &log).to_string())?;
-                    ("invalid", "-", None, format!("{e:#}"))
-                }
-                Ok((class, run, s)) => {
-                    // A Violation's canary, kept by discover: removed if the stop discards the window.
-                    let kept = run.canary.dir.clone();
-                    drop(run);
-                    // Before confirm reuses `log`.
-                    let order = schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>());
-                    let row = if !matches!(class, Outcome::Violation(_)) {
-                        (class.name(), "-", None, String::new())
-                    } else if let Some(i) = found.iter().position(|(d, _)| d.repeated_by(&s.findings, &s.steps)) {
-                        found[i].1.push(format!("{seed}:{k}"));
-                        ("Violation", "repeat", Some(i + 1), String::new())
-                    } else {
-                        clear();
-                        println!("[{}{of}] seed {seed} window {k}: Violation, confirming", idx + 1);
-                        match confirm(&s, end, Some(&out), &mut log, "  ") {
-                            Err(e) if e.is::<Interrupted>() => {
-                                let _ = std::fs::remove_dir_all(&kept);
-                                break 'seeds;
-                            }
-                            Err(e) => {
-                                invalid += 1;
-                                ("Violation", "invalid", None, format!("{e:#}"))
-                            }
-                            Ok(None) => ("Violation", "unconfirmed", None, String::new()),
-                            Ok(Some(g)) => {
-                                let id = g.map(|g| &s.steps[g].id);
-                                let note = match (g, id) {
-                                    (Some(g), Some(id)) => format!("guilty step {g} {}", hold(&id.thread, id.nr, &id.path)),
-                                    _ => "needs more than one hold".into(),
-                                };
-                                let guilty = id.map(|id| (id.thread.clone(), id.nr, id.path.clone()));
-                                found.push((Dedup { guilty, findings: s.findings.clone() }, vec![format!("{seed}:{k}")]));
-                                let f = dir.join(format!("findings/{}", found.len()));
-                                std::fs::create_dir_all(&f)?;
-                                std::fs::write(f.join("schedule"), s.to_string())?;
-                                ("Violation", "new", Some(found.len()), note)
-                            }
-                        }
-                    };
-                    std::fs::write(&file, s.to_string())?;
-                    orders.insert(order);
-                    row
+                    let mut g = tally.lock().unwrap();
+                    g.planned = true;
+                    g.invalid += 1;
+                    g.verdicts[2] += 1;
+                    g.done += 1;
+                    *g.classes.entry("invalid").or_default() += 1;
+                    let note = format!("baseline: {e:#}").replace(['\t', '\n'], " ");
+                    let part = log.iter().filter(|d| d.partial).count();
+                    writeln!(g.tsv, "{seed}\t-\tinvalid\t-\t-\t{}\t{part}\t{:.3}\t{note}", log.len(), t.elapsed().as_secs_f64())?;
+                    say(&mut w, format!("[{}{of}] seed {seed}: incomplete, {note}", idx + 1))?;
+                    show(&mut w, &g, true)?;
+                    continue;
                 }
             };
-            unmutated += unmut as u64;
-            gap |= unmut || class == "invalid";
-            (total, time) = (total + 1, time + secs);
-            (decisions, partial) = (decisions + len, partial + part);
-            bad |= class == "Violation";
-            if let Some(i) = finding {
-                let list: String = found[i - 1].1.iter().map(|s| format!("{s}\n")).collect();
-                std::fs::write(dir.join(format!("findings/{i}/seeds")), list)?;
+            let ws = windows(&targets);
+            let mut g = tally.lock().unwrap();
+            // The plan, sized by the first baseline to end: a discovery costs
+            // about one baseline, plus a confirm and minimization per new
+            // Violation, the seeds `jobs` at a time.
+            if !std::mem::replace(&mut g.planned, true) {
+                let per = ws.len() as u64 + 1;
+                clear();
+                match n {
+                    Some(n) => println!("plan: {n} seeds, {} windows in seed {seed}, ~{} runs, est. {} (+ confirms)", ws.len(), n.saturating_mul(per), hms(n as f64 * per as f64 * secs / jobs as f64)),
+                    None => println!("plan: open-ended, {} windows in seed {seed}, ~{per} runs a seed, est. {} a seed (+ confirms)", ws.len(), hms(per as f64 * secs)),
+                }
             }
-            *classes.entry(class).or_default() += 1;
-            let note = match (unmut, note.is_empty()) {
-                (false, _) => note,
-                (true, true) => "unmutated".into(),
-                (true, false) => format!("unmutated; {note}"),
-            };
-            let note = note.replace(['\t', '\n'], " ");
-            let f = finding.map_or("-".into(), |i| i.to_string());
-            writeln!(tsv, "{seed}\t{k}\t{class}\t{status}\t{f}\t{len}\t{part}\t{:.3}\t{note}", secs.as_secs_f64())?;
-            let what = match status {
-                "new" => format!("Violation → confirmed, {note} → finding #{f} (new)"),
-                "repeat" => format!("Violation → repeat of finding #{f}"),
-                "unconfirmed" => "Violation → not confirmed".into(),
-                "invalid" => format!("Violation → invalid: {note}"),
-                _ if class == "invalid" => format!("invalid: {note}"),
-                _ => class.into(),
-            };
-            clear();
-            println!("[{}{of}] seed {seed} window {k}/{}: {what}{}  {:.1}s", idx + 1, ws.len(), if unmut { " (unmutated)" } else { "" }, secs.as_secs_f64());
-            bar(idx, &classes);
+            say(&mut w, format!("[{}{of}] seed {seed}: {}", idx + 1, telemetry(&log, targets.len(), secs)))?;
+            show(&mut w, &g, false)?;
+            drop(g);
+            let (mut bad, mut gap) = (false, false);
+            for (k, target) in &ws {
+                let t = Instant::now();
+                let out = rd.join(format!("{k}.log"));
+                let r = discover(seed, target.as_ref(), end, &out, &mut log);
+                let secs = t.elapsed();
+                // Its target never came up: the run says nothing about the mutator.
+                let unmut = r.is_ok() && target.is_some() && !log.iter().any(|d| d.mutation.is_some());
+                let (len, part) = (log.len(), log.iter().filter(|d| d.partial).count());
+                let file = rd.join(format!("{k}.sched"));
+                let mut order = None;
+                // status: new, repeat, unconfirmed or invalid on a Violation, else "-".
+                // Interrupted, here or confirming: the window leaves no trace.
+                let (class, status, finding, note) = match r {
+                    Err(e) if e.is::<Interrupted>() => break 'seeds,
+                    Err(e) => {
+                        std::fs::write(&file, schedule(seed, target.is_some(), "invalid", false, BTreeSet::new(), &log).to_string())?;
+                        ("invalid", "-", None, format!("{e:#}"))
+                    }
+                    Ok((class, run, s)) => {
+                        // A Violation's canary, kept by discover: removed if the stop discards the window.
+                        let kept = run.canary.dir.clone();
+                        drop(run);
+                        // Before confirm reuses `log`.
+                        order = Some(schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>()));
+                        let row = if !matches!(class, Outcome::Violation(_)) {
+                            (class.name(), "-", None, String::new())
+                        } else {
+                            let mut found = found.lock().unwrap();
+                            let row = if let Some(i) = found.iter().position(|(d, _)| d.repeated_by(&s.findings, &s.steps)) {
+                                found[i].1.push(format!("{seed}:{k}"));
+                                ("Violation", "repeat", Some(i + 1), String::new())
+                            } else {
+                                say(&mut w, format!("[{}{of}] seed {seed} window {k}: Violation, confirming", idx + 1))?;
+                                match confirm(&s, end, Some(&out), &mut log, "  ", &mut w) {
+                                    Err(e) if e.is::<Interrupted>() => {
+                                        let _ = std::fs::remove_dir_all(&kept);
+                                        break 'seeds;
+                                    }
+                                    Err(e) => ("Violation", "invalid", None, format!("{e:#}")),
+                                    Ok(None) => ("Violation", "unconfirmed", None, String::new()),
+                                    Ok(Some(g)) => {
+                                        let id = g.map(|g| &s.steps[g].id);
+                                        let note = match (g, id) {
+                                            (Some(g), Some(id)) => format!("guilty step {g} {}", hold(&id.thread, id.nr, &id.path)),
+                                            _ => "needs more than one hold".into(),
+                                        };
+                                        let guilty = id.map(|id| (id.thread.clone(), id.nr, id.path.clone()));
+                                        found.push((Dedup { guilty, findings: s.findings.clone() }, vec![format!("{seed}:{k}")]));
+                                        let f = dir.join(format!("findings/{}", found.len()));
+                                        std::fs::create_dir_all(&f)?;
+                                        std::fs::write(f.join("schedule"), s.to_string())?;
+                                        ("Violation", "new", Some(found.len()), note)
+                                    }
+                                }
+                            };
+                            if let Some(i) = row.2 {
+                                let list: String = found[i - 1].1.iter().map(|s| format!("{s}\n")).collect();
+                                std::fs::write(dir.join(format!("findings/{i}/seeds")), list)?;
+                            }
+                            row
+                        };
+                        std::fs::write(&file, s.to_string())?;
+                        row
+                    }
+                };
+                let mut g = tally.lock().unwrap();
+                g.orders.extend(order);
+                g.unmutated += unmut as u64;
+                gap |= unmut || class == "invalid";
+                g.invalid += (class == "invalid" || status == "invalid") as u64;
+                (g.total, g.time) = (g.total + 1, g.time + secs);
+                (g.decisions, g.partial) = (g.decisions + len, g.partial + part);
+                bad |= class == "Violation";
+                *g.classes.entry(class).or_default() += 1;
+                let note = match (unmut, note.is_empty()) {
+                    (false, _) => note,
+                    (true, true) => "unmutated".into(),
+                    (true, false) => format!("unmutated; {note}"),
+                };
+                let note = note.replace(['\t', '\n'], " ");
+                let f = finding.map_or("-".into(), |i| i.to_string());
+                writeln!(g.tsv, "{seed}\t{k}\t{class}\t{status}\t{f}\t{len}\t{part}\t{:.3}\t{note}", secs.as_secs_f64())?;
+                let what = match status {
+                    "new" => format!("Violation → confirmed, {note} → finding #{f} (new)"),
+                    "repeat" => format!("Violation → repeat of finding #{f}"),
+                    "unconfirmed" => "Violation → not confirmed".into(),
+                    "invalid" => format!("Violation → invalid: {note}"),
+                    _ if class == "invalid" => format!("invalid: {note}"),
+                    _ => class.into(),
+                };
+                say(&mut w, format!("[{}{of}] seed {seed} window {k}/{}: {what}{}  {:.1}s", idx + 1, ws.len(), if unmut { " (unmutated)" } else { "" }, secs.as_secs_f64()))?;
+                show(&mut w, &g, false)?;
+            }
+            let v = verdict(&ws, bad, gap);
+            let mut g = tally.lock().unwrap();
+            g.verdicts[v] += 1;
+            g.done += 1;
+            say(&mut w, format!("[{}{of}] seed {seed}: {}", idx + 1, VERDICTS[v]))?;
+            show(&mut w, &g, true)?;
         }
-        let v = verdict(&ws, bad, gap);
-        verdicts[v] += 1;
-        clear();
-        println!("[{}{of}] seed {seed}: {}", idx + 1, VERDICTS[v]);
-        bar(idx + 1, &classes);
-    }
+        // An interrupted seed's lines so far.
+        if !w.buf.is_empty() {
+            show(&mut w, &tally.lock().unwrap(), true)?;
+        }
+        Ok(())
+    };
+    let (worker, fatal) = (&worker, &fatal);
+    std::thread::scope(|s| {
+        let ws: Vec<_> = (0..jobs)
+            .map(|wk| {
+                s.spawn(move || {
+                    // An error or a panic stops the other workers alike.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(wk)));
+                    if !matches!(r, Ok(Ok(()))) {
+                        fatal.store(true, Relaxed);
+                    }
+                    r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+                })
+            })
+            .collect();
+        ws.into_iter().map(|h| h.join().expect("worker panicked")).collect::<Result<Vec<()>>>()
+    })?;
     clear();
+    let Tally { total, invalid, decisions, partial, time, orders, unmutated, verdicts, .. } = tally.into_inner().unwrap();
+    let found = found.into_inner().unwrap();
 
     let stopped = engine::stopped();
     let done = verdicts.iter().sum::<u64>();

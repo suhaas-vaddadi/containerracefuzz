@@ -489,6 +489,11 @@ pub fn sweep() {
     if left > 0 {
         eprintln!("{left} stale run cgroups left in {CGROUP_ROOT}");
     }
+    // A dead crfuzz's `--private` copies (main.rs: work/<pid>): no evidence there.
+    let work = format!("{}/work", oracle::ROOT);
+    for n in names(&work).filter(|n| n.parse::<u32>().is_ok_and(|p| !Path::new(&format!("/proc/{p}")).exists())) {
+        let _ = fs::remove_dir_all(Path::new(&work).join(n));
+    }
     let canaries = names(oracle::ROOT).filter(|n| stale(n, "canary-")).count();
     if canaries > 0 {
         eprintln!("{canaries} canaries from earlier runs in {}", oracle::ROOT);

@@ -33,12 +33,11 @@ cc -o /tmp/q/check_use scx_crfuzz/tests/fixtures/check_use.c
 
 # layout: restores the starting filesystem before every run (as root).
 printf '#!/bin/sh\nrm -f /tmp/q/alice/p\n: > /tmp/q/alice/p\n' > /tmp/q/layout.sh
-# mutator: runs at every hold as alice; swaps p for a symlink into the canary.
+# mutator: runs at every hold as alice; swaps p for a symlink into this run's canary.
 cat > /tmp/q/swap.sh <<'EOF'
 #!/bin/sh
 [ "$1" = /tmp/q/alice/p ] || exit 0
-c=$(ls -dt /var/lib/crfuzz/canary-* | head -1)
-ln -sfn "$c/file" /tmp/q/alice/p.new && mv -f /tmp/q/alice/p.new /tmp/q/alice/p
+ln -sfn "$CRFUZZ_CANARY/file" /tmp/q/alice/p.new && mv -f /tmp/q/alice/p.new /tmp/q/alice/p
 EOF
 chmod +x /tmp/q/layout.sh /tmp/q/swap.sh
 
@@ -63,6 +62,10 @@ sudo target/release/scx_crfuzz run /tmp/q/camp --seeds 8 --attacker 65534:65534 
   --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh -- /tmp/q/check_use /tmp/q/alice/p
 sudo target/release/scx_crfuzz run /tmp/q/camp-fixed --seeds 8 --attacker 65534:65534 \
   --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh -- /tmp/q/check_use /tmp/q/alice/p nofollow
+
+# The same 8 seeds 4 at a time, each worker with its own copy of alice's directory.
+sudo target/release/scx_crfuzz run /tmp/q/camp4 --seeds 8 --jobs 4 --private /tmp/q/alice --attacker 65534:65534 \
+  --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh -- /tmp/q/check_use /tmp/q/alice/p
 ```
 
 If a crash leaves gated tasks behind, `sudo scx_crfuzz reset` clears every
@@ -72,7 +75,7 @@ gate.
 
 ```
 scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S]
-               [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+               [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 scx_crfuzz replay FILE [-v]
 scx_crfuzz gated | status | reset | check
 scx_crfuzz --help | -h
@@ -96,7 +99,9 @@ baseline, strict confirm, minimize.
 | `--seeds N` | How many seeds to sweep (default: until `--time` or a stop). A POS seed: same seed ⇒ same partial order of held events. A seed runs its baseline, then one run per **window**: per distinct `(syscall, path, occurrence)` hold of the baseline with a path. |
 | `--time DURATION` | `90s`, `30m`, `2h` (bare: seconds). Start no run once that much time has passed; the run going finishes, the seed it was in is left incomplete, and the summary follows `time limit: <S> seeds complete`, exit 0 or 3. |
 | `--first-seed S` | The first seed (default 0). |
-| `--mutator PROG` | Run at one window's hold per run, as alice inside the held task's namespaces, root and cwd. Gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL` and `CRFUZZ_SEED`. Must exist inside the task's root. 15 s watchdog; a failure is logged, never a finding. |
+| `--jobs N` | Run N seeds at once (default 1), one worker each, sharing the gate scheduler. N > 1 needs `--private` (see below). Warns if N exceeds the CPUs: contention turns more decisions partial. |
+| `--private DIR` | Repeatable. Every directory the runs write (the layout's target, the SUT's state, the mutator's playground): each worker gets its own copy (see below). Recorded in the schedule; `replay` sets it up again. |
+| `--mutator PROG` | Run at one window's hold per run, as alice inside the held task's namespaces, root and cwd. Gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL`, `CRFUZZ_SEED` and `CRFUZZ_CANARY` (this run's canary directory: find it there, never by listing `/var/lib/crfuzz`, which at `--jobs` > 1 holds other workers' canaries). Must exist inside the task's root. 15 s watchdog; a failure is logged, never a finding. |
 | `--layout PROG` | Run as root before **every** run (baseline, discovery, confirm, each minimization, each campaign seed) to restore the starting filesystem. A failure makes the run invalid. |
 | `--scope DIR` | Repeatable. Only holds whose absolute path is under one of the DIRs (where the attacker can act) become windows. Default: every hold with a path. |
 | `--timeout SECS` | End a run still going after SECS (1 to 30, default 30): `RuntimeError`. Recorded in the schedule; `replay` uses it. |
@@ -109,6 +114,25 @@ Violation), `unsafe` (some window a Violation), `incomplete` (else: a window
 invalid or its target never reached), or `no windows` (no mutator or no
 target: one unmutated run). An invalid run or baseline is recorded and the
 sweep goes on. Needs root.
+
+**Parallel seeds.** With `--private DIR`, each worker (at any `--jobs`,
+`replay` included, so a scenario behaves the same at any N) runs in its own
+mount namespace, `/` made `rslave` (host mounts still show, nothing it
+mounts leaks out), with a `cp -a` of DIR (DIR's own owner and mode too) under
+`/var/lib/crfuzz/work/<pid>/` bind-mounted over DIR, once per worker; the
+layout, the SUT and the mutator inherit it. The copies are removed at exit.
+Only the filesystem is isolated: a scenario that collides on network ports,
+abstract sockets or SysV IPC runs at `--jobs 1`. A private DIR is a mount
+point in its worker, so a layout restores its *contents*
+(`rm -rf DIR/* && cp -a orig/. DIR/`), never removes and recreates DIR
+(`EBUSY`), and a `rename` or `link` across DIR's boundary fails (`EXDEV`):
+choose DIR so that what the SUT and mutator rename between lives in one.
+Refused before any run: `--jobs` > 1 without `--private`, a DIR that
+overlaps `/var/lib/crfuzz` (the canaries stay shared), a DIR that holds the
+campaign `DIR`. At `--jobs` > 1 each seed's lines print as one block when it
+ends, `runs.tsv` rows go by completion (the seed and window columns say
+which), and so do finding numbers (`findings/<n>/seeds` says where each came
+from); the files and the summary are as at 1.
 
 **Exit status**: 0 finished, no findings; 3 finished with a confirmed finding
 (`replay`: a confirmed Violation); 2 a usage error (the usage on stderr); 1
@@ -175,7 +199,8 @@ across processes (the on-target tests need it). If another `sched_ext` scheduler
    fd numbers stripped). Minimization replays once per mutated step with only
    that mutation on and reports the **first** step whose run still flags one
    of the findings: the guilty hold.
-7. **Campaign** (`main.rs`). Seeds `S..S+N`, each its baseline and windows. A Violation
+7. **Campaign** (`main.rs`). Seeds `S..S+N`, each its baseline and windows,
+   `--jobs` of them at once. A Violation
    whose findings and guilty `(thread, syscall, path)` match a known finding
    is counted against it without re-confirming; a new one is confirmed and
    minimized.
@@ -199,6 +224,7 @@ attacker 65534:65534
 mutator /tmp/q/swap.sh            optional
 layout /tmp/q/layout.sh           optional
 timeout 30                        optional: --timeout, only if not 60
+private /tmp/q/alice              optional, one per --private
 deadline                          only if discovery ended at the deadline
 cmd /tmp/q/check_use /tmp/q/alice/p
 outcome Violation
@@ -276,4 +302,5 @@ sudo env PATH=$PATH target/debug/deps/<suite>-<hash> --include-ignored --test-th
   inside the held task's root.
 - Minimization tries single holds only; a bug that needs two mutations is
   reported as "needs more than one hold".
-- Campaigns run seeds sequentially, with no resume.
+- Campaigns have no resume. `--jobs` isolates only the filesystem; the
+  windows within one seed still run one after another.
