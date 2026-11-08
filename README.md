@@ -106,7 +106,10 @@ sweep goes on. Needs root and a running `scx_crfuzz_gated`.
 
 **Exit status**: 0 finished, no findings; 3 finished with a confirmed finding
 (`replay`: a confirmed Violation); 2 a usage error (the usage on stderr); 1
-any other error, including a `replay` that does not reproduce its schedule.
+any other error, including a `replay` that does not reproduce its schedule;
+130 stopped by Ctrl-C or SIGTERM. A stop discards the runs then ending, cleans
+up (gates, run cgroup, canary) and prints the summary after `interrupted: <S>
+seeds complete`; a second signal kills at once.
 
 **Outcome classes** (one per run): `Violation` (alice can reach, or has
 changed, the canary) / `RuntimeRefused` (the SUT exited nonzero: it noticed) /

@@ -82,6 +82,38 @@ fn invalid_run_leaves_no_canary() {
     fs::remove_dir_all(d).unwrap();
 }
 
+/// SIGINT mid-window: the window is discarded, every Drop runs (run cgroup,
+/// gate entries, canary), the summary prints after `interrupted:`, exit 130.
+/// Needs bpftool.
+#[test]
+#[ignore]
+fn sigint_stops_cleanly() {
+    use std::io::{BufRead, BufReader};
+    let d = "/tmp/crfuzz_cli_sigint";
+    let _ = fs::remove_dir_all(d);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scx_crfuzz"))
+        .args(["run", d, "--seeds", "2", "--attacker", "65534:65534", "--", "sh", "-c", "sleep 2"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map(Result::unwrap);
+    // After the baseline: window 0 is next.
+    lines.by_ref().find(|l| l.contains("telemetry:")).expect("a baseline");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    unsafe { libc::kill(pid as i32, libc::SIGINT) };
+    let rest: Vec<String> = lines.collect();
+    assert_eq!(child.wait().unwrap().code(), Some(130), "{rest:?}");
+    assert!(rest.iter().any(|l| l == "interrupted: 0 seeds complete"), "{rest:?}");
+    assert_eq!(fs::read_to_string(format!("{d}/runs.tsv")).unwrap().lines().count(), 1, "header only");
+    let cgroups: Vec<_> = fs::read_dir("/sys/fs/cgroup/crfuzz").unwrap().filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| n.starts_with(&format!("run-{pid}-"))).collect();
+    assert!(cgroups.is_empty(), "{cgroups:?}");
+    assert!(left(pid).is_empty(), "{:?}", left(pid));
+    let gates = Command::new("bpftool").args(["-j", "map", "dump", "pinned", "/sys/fs/bpf/scx_crfuzz/gate_tgid"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&gates.stdout).trim(), "[]");
+    fs::remove_dir_all(d).unwrap();
+}
+
 /// §8 acceptance. A root SUT checks `p` (alice's) then writes it; alice's
 /// mutator swaps `p` for a symlink into the fuzzed run's canary.
 mod accept {
