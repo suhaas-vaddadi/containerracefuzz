@@ -837,6 +837,7 @@ name = "scx_crfuzz"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "libbpf-rs",
  "libc",
  "scx_cargo",

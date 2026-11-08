@@ -14,7 +14,10 @@ one hold that causes it.
 
 - Linux with `sched_ext` (6.12+, `CONFIG_SCHED_CLASS_EXT`), cgroup v2, and
   seccomp `WAIT_KILLABLE_RECV` (5.19+). Root.
-- Rust, plus `clang` and libelf/zlib headers for the BPF build.
+- Rust, plus `clang` and libelf/zlib headers for the BPF build, and `gcc`
+  with a static libc: the build links the containerd target's mutator
+  statically. Fedora:
+  `dnf install clang elfutils-libelf-devel zlib-devel gcc glibc-static`.
 - On macOS, the workspace builds and the pure tests run, but nothing executes:
   use a Linux VM (development uses a Lima VM named `sched-ext`).
 
