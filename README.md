@@ -200,9 +200,17 @@ DIR/runs.tsv                one row per window, written as it ends:
                             seed window class status finding decisions partial secs note
 DIR/runs/<seed>/<k>.sched   window k's discovery schedule (replayable); k = 0:
                             the unmutated run of a seed with no windows
+DIR/runs/<seed>/<k>.log     window k's SUT and layout output (stdout and
+                            stderr): its discovery, then any confirm and
+                            minimize runs, each after a header line
+                            (== discovery, == confirm 2/3, == minimize step 12)
+DIR/runs/<seed>/baseline.log  the same for the seed's baseline (== baseline)
 DIR/findings/<n>/schedule   the first confirmed schedule of finding n
 DIR/findings/<n>/seeds      every seed:k that hit finding n, one per line
 ```
+
+SUT stdin is `/dev/null`. `replay` discards SUT and layout output; with `-v`
+it goes to stderr.
 
 `status` is `new`, `repeat`, `unconfirmed` or `invalid` for a Violation, `-`
 otherwise. Findings are deduped by `(guilty thread, syscall, path, normalized

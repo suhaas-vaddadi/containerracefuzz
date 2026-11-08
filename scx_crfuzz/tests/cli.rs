@@ -212,16 +212,20 @@ mod accept {
     }
 
     /// Alice alone points `p` at the gate; the SUT only stats it. She can
-    /// stat a 0700 gate anyway: Clean, not Reached, in every window.
+    /// stat a 0700 gate anyway: Clean, not Reached, in every window. The SUT's
+    /// stdout goes to its window's log, not crfuzz's.
     #[test]
     #[ignore]
     fn gate_alone_not_reached() {
         let (_, p, _) = setup();
         let m = swap(&p, "");
-        let out = judge_cmd(&["sh", "-c", &format!("test -e {}", p.display())], &p, Some(&m));
+        let out = judge_cmd(&["sh", "-c", &format!("echo sut-says-hi; test -e {}", p.display())], &p, Some(&m));
         let (o, v) = outcomes(&out);
         assert_eq!(v, "safe", "{out}");
         assert!(o.iter().all(|o| *o == "Clean"), "{out}");
+        assert!(!out.contains("sut-says-hi"), "{out}");
+        let log = fs::read_to_string(Path::new(D).join("out/runs/0/1.log")).unwrap();
+        assert_eq!(log, "== discovery\nsut-says-hi\n");
         fs::remove_dir_all(D).unwrap();
     }
 }
