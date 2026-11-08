@@ -12,6 +12,7 @@ use anyhow::{bail, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// A mutator still running then is killed: a tree hold must end well before
@@ -95,6 +96,48 @@ impl std::fmt::Display for Deadline {
 
 impl std::error::Error for Deadline {}
 
+/// SIGINT or SIGTERM arrived (`stop_on_signals`): the run was cut short.
+/// Check with `err.is::<Interrupted>()`.
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// A SIGINT or SIGTERM has arrived since `stop_on_signals`.
+pub fn stopped() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
+/// The first SIGINT or SIGTERM sets `stopped()`, so loops end at their next
+/// check and every Drop runs; the handler restores the default disposition,
+/// so a second one kills at once.
+pub fn stop_on_signals() {
+    extern "C" fn stop(_: libc::c_int) {
+        STOP.store(true, Ordering::Relaxed);
+        // Async-signal-safe.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
+    }
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        sa.sa_flags = libc::SA_RESTART;
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Run the SUT under POS until it exits, appending each decision to `log`
 /// (caller-owned, so it survives every ending). With a `mutator`, fire it at
 /// the first hold matching `target`'s syscall, path and occurrence, in any
@@ -103,7 +146,8 @@ impl std::error::Error for Deadline {}
 /// mutator runs as alice, self-checked against the canary (§4, §10.1), and
 /// the root process's `exit_group` is probed (§5). Fails with `Deadline` at
 /// `deadline` (a hung or deadlocked SUT), with `SelfCheckFailed` if alice gets
-/// past the gate, with `Divergence` if a `replay` leaves its schedule.
+/// past the gate, with `Divergence` if a `replay` leaves its schedule, with
+/// `Interrupted` once `stopped()`.
 pub fn run(
     be: &mut GateBackend,
     pos: &mut Pos,
@@ -119,6 +163,10 @@ pub fn run(
     let mut held: Vec<Event> = Vec::new();
     let mut ids: Vec<EventId> = Vec::new();
     loop {
+        // Never under a tree hold: each iteration ungates before the next.
+        if stopped() {
+            return Err(anyhow::Error::new(Interrupted).context(format!("after {} decisions", log.len())));
+        }
         let complete = match wait_frontier(be, &mut held, deadline.min(Instant::now() + LIMIT)) {
             Ok(r) => r.is_some(),
             Err(e) if e.is::<Exited>() => {

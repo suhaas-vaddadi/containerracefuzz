@@ -38,8 +38,10 @@
 //! `replay` discards SUT and layout output; `-v` passes it to stderr and
 //! prints every run's decisions. Exit status: 0 done, 3 done with a
 //! confirmed finding (`replay`: a confirmed Violation), 2 a usage error, 1
-//! any other error (`replay`: the schedule not reproduced). Needs root and a
-//! running scx_crfuzz_gated.
+//! any other error (`replay`: the schedule not reproduced), 130 stopped by
+//! SIGINT or SIGTERM: the runs then ending are discarded, the campaign's
+//! summary printed after an `interrupted:` line; a second signal kills at
+//! once. Needs root and a running scx_crfuzz_gated.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -74,6 +76,11 @@ fn main() {
             eprintln!("{e}");
             2
         }
+        // `replay` stopped by SIGINT/SIGTERM, every Drop run.
+        Err(e) if e.is::<scx_crfuzz::engine::Interrupted>() => {
+            eprintln!("{e}");
+            130
+        }
         Err(e) => {
             eprintln!("Error: {e:?}");
             1
@@ -81,12 +88,12 @@ fn main() {
     });
 }
 
-/// The exit status: 0, or 3 for a confirmed finding.
+/// The exit status: 0, 3 for a confirmed finding, or 130 interrupted.
 #[cfg(target_os = "linux")]
 fn crfuzz() -> anyhow::Result<i32> {
     use anyhow::{bail, ensure, Context, Result};
     use scx_crfuzz::backend::{self, GateBackend, SelfCheckFailed};
-    use scx_crfuzz::engine::{self, Deadline, Decision, Judge, Replay};
+    use scx_crfuzz::engine::{self, Deadline, Decision, Interrupted, Judge, Replay};
     use scx_crfuzz::oracle::{self, Alice, Canary, Finding, Outcome};
     use scx_crfuzz::pos::{EventId, Pos};
     use scx_crfuzz::schedule::{self, Dedup, Divergence, Fixed, Schedule};
@@ -218,72 +225,80 @@ fn crfuzz() -> anyhow::Result<i32> {
     // One run with its own canary; its decisions go to `log` whatever the
     // ending, and with -v to stdout. Its output and the layout's go to `out`
     // after a `== <name>` line; with no `out`, nowhere, or with -v to stderr.
-    // Stdin is /dev/null.
+    // Stdin is /dev/null. Interrupted if it ends once stopped (a terminal ^C
+    // also reaches the SUT), so nothing records it.
     let judged = |seed: u64, mutator: Option<&Path>, target: Option<&EventId>, replay: Option<&mut Replay>, out: Option<&Path>, name: &str, log: &mut Vec<Decision>| -> Result<Judged> {
-        let file = out
-            .map(|p| -> Result<std::fs::File> {
-                let mut f = std::fs::File::options().create(true).append(true).open(p).with_context(|| p.display().to_string())?;
-                writeln!(f, "== {name}")?;
-                Ok(f)
-            })
-            .transpose()?;
-        let stdio = |c: &mut Command| -> Result<()> {
-            let (o, e): (Stdio, Stdio) = match &file {
-                Some(f) => (f.try_clone()?.into(), f.try_clone()?.into()),
-                None if verbose => (std::io::stderr().into(), std::io::stderr().into()),
-                None => (Stdio::null(), Stdio::null()),
+        ensure!(!engine::stopped(), Interrupted);
+        let r = (|| -> Result<Judged> {
+            let file = out
+                .map(|p| -> Result<std::fs::File> {
+                    let mut f = std::fs::File::options().create(true).append(true).open(p).with_context(|| p.display().to_string())?;
+                    writeln!(f, "== {name}")?;
+                    Ok(f)
+                })
+                .transpose()?;
+            let stdio = |c: &mut Command| -> Result<()> {
+                let (o, e): (Stdio, Stdio) = match &file {
+                    Some(f) => (f.try_clone()?.into(), f.try_clone()?.into()),
+                    None if verbose => (std::io::stderr().into(), std::io::stderr().into()),
+                    None => (Stdio::null(), Stdio::null()),
+                };
+                c.stdin(Stdio::null()).stdout(o).stderr(e);
+                Ok(())
             };
-            c.stdin(Stdio::null()).stdout(o).stderr(e);
-            Ok(())
-        };
-        if let Some(l) = &layout {
-            let mut c = Command::new(l);
-            stdio(&mut c)?;
-            let st = c.status().with_context(|| l.display().to_string())?;
-            ensure!(st.success(), "invalid: layout {} failed: {st}", l.display());
+            if let Some(l) = &layout {
+                let mut c = Command::new(l);
+                stdio(&mut c)?;
+                let st = c.status().with_context(|| l.display().to_string())?;
+                ensure!(st.success(), "invalid: layout {} failed: {st}", l.display());
+            }
+            let canary = Canary::create(runs.replace(runs.get() + 1))?;
+            backend::read_before(&canary, &alice)?;
+            let mut sut = Command::new(prog);
+            sut.args(rest);
+            stdio(&mut sut)?;
+            let mut be = GateBackend::spawn(sut, WATCHED)?;
+            let mut j = Judge { canary: &canary, alice: alice.clone(), reached: None, task: None };
+            let until = Instant::now().checked_add(Duration::from_secs(timeout)).context("--timeout too large")?;
+            let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), until, log);
+            if verbose {
+                log.iter().for_each(|d| println!("{d:?}"));
+            }
+            let end = if r.is_ok() { Some(be.child().wait()?) } else { None };
+            // Clears gates and cgroup, ending what is left of the SUT, before the
+            // write half: a gated task may serve a mount inside the canary.
+            drop(be);
+            let deadline = matches!(&r, Err(e) if e.is::<Deadline>());
+            // Ended without the final hold (no read half), or judged on the write half alone.
+            match r {
+                Ok(()) => {}
+                Err(e) if e.is::<Deadline>() => {}
+                // read before passed, so alice's credentials were right: a gate
+                // that stops failing her later was opened by the SUT, and the
+                // write half shows it (a chmod'd gate). Judged, not invalid.
+                Err(e) if e.is::<SelfCheckFailed>() && !canary.changed().is_empty() => {}
+                Err(e) => return Err(e), // invalid: self-check, probe, crfuzz itself
+            }
+            let mut found = j.reached.unwrap_or_default();
+            found.extend(canary.changed());
+            // A mutator that failed (error, timeout, nonzero exit) never attacked,
+            // so an unflagged run would pass as Clean: invalid, unless it flagged.
+            let failed = log.iter().find_map(|d| match &d.mutation {
+                Some(Err(e)) => Some(e.clone()),
+                Some(Ok(st)) if !st.success() => Some(st.to_string()),
+                _ => None,
+            });
+            if let (true, Some(e)) = (found.is_empty(), failed) {
+                return Err(anyhow::Error::new(MutatorFailed(e)));
+            }
+            let task = j.task.as_ref().map(|(tid, tgid, name)| (*tid, *tgid, name.as_str()));
+            let norm = found.iter().map(|f| schedule::normalize(f, &canary.dir, task)).collect();
+            Ok(Judged { end, found, deadline, norm, canary })
+        })();
+        if engine::stopped() {
+            return Err(Interrupted.into());
         }
-        let canary = Canary::create(runs.replace(runs.get() + 1))?;
-        backend::read_before(&canary, &alice)?;
-        let mut sut = Command::new(prog);
-        sut.args(rest);
-        stdio(&mut sut)?;
-        let mut be = GateBackend::spawn(sut, WATCHED)?;
-        let mut j = Judge { canary: &canary, alice: alice.clone(), reached: None, task: None };
-        let until = Instant::now().checked_add(Duration::from_secs(timeout)).context("--timeout too large")?;
-        let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), until, log);
-        if verbose {
-            log.iter().for_each(|d| println!("{d:?}"));
-        }
-        let end = if r.is_ok() { Some(be.child().wait()?) } else { None };
-        // Clears gates and cgroup, ending what is left of the SUT, before the
-        // write half: a gated task may serve a mount inside the canary.
-        drop(be);
-        let deadline = matches!(&r, Err(e) if e.is::<Deadline>());
-        // Ended without the final hold (no read half), or judged on the write half alone.
-        match r {
-            Ok(()) => {}
-            Err(e) if e.is::<Deadline>() => {}
-            // read before passed, so alice's credentials were right: a gate
-            // that stops failing her later was opened by the SUT, and the
-            // write half shows it (a chmod'd gate). Judged, not invalid.
-            Err(e) if e.is::<SelfCheckFailed>() && !canary.changed().is_empty() => {}
-            Err(e) => return Err(e), // invalid: self-check, probe, crfuzz itself
-        }
-        let mut found = j.reached.unwrap_or_default();
-        found.extend(canary.changed());
-        // A mutator that failed (error, timeout, nonzero exit) never attacked,
-        // so an unflagged run would pass as Clean: invalid, unless it flagged.
-        let failed = log.iter().find_map(|d| match &d.mutation {
-            Some(Err(e)) => Some(e.clone()),
-            Some(Ok(st)) if !st.success() => Some(st.to_string()),
-            _ => None,
-        });
-        if let (true, Some(e)) = (found.is_empty(), failed) {
-            return Err(anyhow::Error::new(MutatorFailed(e)));
-        }
-        let task = j.task.as_ref().map(|(tid, tgid, name)| (*tid, *tgid, name.as_str()));
-        let norm = found.iter().map(|f| schedule::normalize(f, &canary.dir, task)).collect();
-        Ok(Judged { end, found, deadline, norm, canary })
+        r
     };
 
     // A seed's baseline, which must leak nothing: its exit (for the oracle),
@@ -422,13 +437,14 @@ fn crfuzz() -> anyhow::Result<i32> {
         Ok(Some(None))
     };
 
+    engine::stop_on_signals();
     backend::sweep();
     println!("{alice}");
     let mut log = Vec::new();
     let Some((dir, first, n)) = campaign else {
         let s = loaded.expect("replay");
         let hint = |_: &anyhow::Error| {
-            if !verbose {
+            if !verbose && !engine::stopped() {
                 eprintln!("(rerun with -v for the decision log)");
             }
         };
@@ -470,7 +486,7 @@ fn crfuzz() -> anyhow::Result<i32> {
         let counts: Vec<String> = classes.iter().map(|(c, k)| format!("{c} {k}")).collect();
         eprint!("\r[{}{}] {done}/{n} seeds  ETA {eta}  {}\x1b[K", "#".repeat(fill), ".".repeat(w as usize - fill), counts.join("  "));
     };
-    for idx in 0..n {
+    'seeds: for idx in 0..n {
         let seed = first + idx;
         let t = Instant::now();
         let rd = dir.join(format!("runs/{seed}"));
@@ -479,6 +495,7 @@ fn crfuzz() -> anyhow::Result<i32> {
         clear();
         let (end, targets, secs) = match b {
             Ok(b) => b,
+            Err(e) if e.is::<Interrupted>() => break,
             Err(e) => {
                 invalid += 1;
                 verdicts[2] += 1;
@@ -508,14 +525,12 @@ fn crfuzz() -> anyhow::Result<i32> {
             let secs = t.elapsed();
             // Its target never came up: the run says nothing about the mutator.
             let unmut = r.is_ok() && target.is_some() && !log.iter().any(|d| d.mutation.is_some());
-            unmutated += unmut as u64;
-            gap |= unmut || r.is_err();
-            (total, time) = (total + 1, time + secs);
             let (len, part) = (log.len(), log.iter().filter(|d| d.partial).count());
-            (decisions, partial) = (decisions + len, partial + part);
             let file = rd.join(format!("{k}.sched"));
             // status: new, repeat, unconfirmed or invalid on a Violation, else "-".
+            // Interrupted, here or confirming: the window leaves no trace.
             let (class, status, finding, note) = match r {
+                Err(e) if e.is::<Interrupted>() => break 'seeds,
                 Err(e) => {
                     invalid += 1;
                     std::fs::write(&file, schedule(seed, target.is_some(), "invalid", false, BTreeSet::new(), &log).to_string())?;
@@ -523,9 +538,9 @@ fn crfuzz() -> anyhow::Result<i32> {
                 }
                 Ok((class, run, s)) => {
                     drop(run);
-                    std::fs::write(&file, s.to_string())?;
-                    orders.insert(schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>()));
-                    if !matches!(class, Outcome::Violation(_)) {
+                    // Before confirm reuses `log`.
+                    let order = schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>());
+                    let row = if !matches!(class, Outcome::Violation(_)) {
                         (class.name(), "-", None, String::new())
                     } else if let Some(i) = found.iter().position(|(d, _)| d.repeated_by(&s.findings, &s.steps)) {
                         found[i].1.push(format!("{seed}:{k}"));
@@ -534,6 +549,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                         clear();
                         println!("[{}/{n}] seed {seed} window {k}: Violation, confirming", idx + 1);
                         match confirm(&s, end, Some(&out), &mut log, "  ") {
+                            Err(e) if e.is::<Interrupted>() => break 'seeds,
                             Err(e) => {
                                 invalid += 1;
                                 ("Violation", "invalid", None, format!("{e:#}"))
@@ -553,9 +569,16 @@ fn crfuzz() -> anyhow::Result<i32> {
                                 ("Violation", "new", Some(found.len()), note)
                             }
                         }
-                    }
+                    };
+                    std::fs::write(&file, s.to_string())?;
+                    orders.insert(order);
+                    row
                 }
             };
+            unmutated += unmut as u64;
+            gap |= unmut || class == "invalid";
+            (total, time) = (total + 1, time + secs);
+            (decisions, partial) = (decisions + len, partial + part);
             bad |= class == "Violation";
             if let Some(i) = finding {
                 let list: String = found[i - 1].1.iter().map(|s| format!("{s}\n")).collect();
@@ -590,6 +613,10 @@ fn crfuzz() -> anyhow::Result<i32> {
     }
     clear();
 
+    let stopped = engine::stopped();
+    if stopped {
+        println!("interrupted: {} seeds complete", verdicts.iter().sum::<u64>());
+    }
     println!("campaign: {n} seeds, {total} runs, {invalid} invalid, discovery {:.1}s", time.as_secs_f64());
     let v: Vec<String> = VERDICTS.iter().zip(verdicts).map(|(name, c)| format!("{c} {name}")).collect();
     println!("seeds: {}", v.join(", "));
@@ -603,5 +630,5 @@ fn crfuzz() -> anyhow::Result<i32> {
         let guilty = d.guilty.as_ref().map_or("needs more than one hold".into(), |(t, nr, p)| hold(t, *nr, p));
         println!("finding #{}: {} runs, guilty {guilty}, {:?}, {}", i + 1, runs.len(), d.findings, dir.join(format!("findings/{}", i + 1)).display());
     }
-    Ok(if found.is_empty() { 0 } else { 3 })
+    Ok(if stopped { 130 } else if found.is_empty() { 0 } else { 3 })
 }
