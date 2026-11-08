@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 /// sched_ext's 30 s watchdog ejects the scheduler (L:Gate).
 const MUTATOR_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a frontier may stay incomplete before POS decides anyway (D2).
+const LIMIT: Duration = Duration::from_millis(200);
+
 /// One POS decision, as the canonical log records it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Decision {
@@ -108,8 +111,6 @@ pub fn run(
     target: Option<&EventId>,
     mut replay: Option<&mut Replay>,
     mut judge: Option<&mut Judge>,
-    interval: Duration,
-    limit: Duration,
     deadline: Instant,
     log: &mut Vec<Decision>,
 ) -> Result<()> {
@@ -118,7 +119,7 @@ pub fn run(
     let mut held: Vec<Event> = Vec::new();
     let mut ids: Vec<EventId> = Vec::new();
     loop {
-        let complete = match wait_frontier(be, &mut held, interval, deadline.min(Instant::now() + limit)) {
+        let complete = match wait_frontier(be, &mut held, deadline.min(Instant::now() + LIMIT)) {
             Ok(r) => r.is_some(),
             Err(e) if e.is::<Exited>() => {
                 return match replay.filter(|r| r.diverged.is_none()) {

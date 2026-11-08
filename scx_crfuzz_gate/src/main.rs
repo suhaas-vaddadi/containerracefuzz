@@ -3,7 +3,6 @@
 //!
 //!   scx_crfuzz_gated            run the daemon
 //!   scx_crfuzz_gated --status   sched_ext state + pins
-//!   scx_crfuzz_gated --kick     open a GateMap and kick every CPU
 //!   scx_crfuzz_gated --reset    delete every gate entry of every run
 
 #[cfg(not(target_os = "linux"))]
@@ -17,11 +16,6 @@ fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         None => daemon::run(),
         Some("--status") => daemon::status(),
-        Some("--kick") => {
-            let n = scx_crfuzz_gate::GateMap::open()?.kick()?;
-            println!("kicked {n} cpus");
-            Ok(())
-        }
         Some("--reset") => scx_crfuzz_gate::reset_all(),
         Some(a) => anyhow::bail!("unknown argument {a}"),
     }
@@ -76,7 +70,6 @@ mod daemon {
 
         fs::create_dir_all(PIN_DIR)?;
         skel.maps.gate_tgid.pin(format!("{PIN_DIR}/gate_tgid"))?;
-        skel.maps.gate_tid.pin(format!("{PIN_DIR}/gate_tid"))?;
         skel.progs.kick_all.pin(format!("{PIN_DIR}/kick_all"))?;
         skel.progs.new_epoch.pin(format!("{PIN_DIR}/new_epoch"))?;
         println!("scx_crfuzz_gated: attached, enable_seq={}", enable_seq()?);

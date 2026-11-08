@@ -83,8 +83,6 @@ fn main() -> anyhow::Result<()> {
         // The final hold (§5): its keys are `all`, so no mutator fires there.
         libc::SYS_exit_group,
     ];
-    /// Caps the telemetry's O(n²) racing-pair count.
-    const RACING_MAX: usize = 4096;
 
     /// A run's mutator failed: invalid, but one minimize step or confirm try only.
     #[derive(Debug)]
@@ -136,7 +134,6 @@ fn main() -> anyhow::Result<()> {
         ensure!(std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()), "--campaign: {} is not empty", d.display());
     }
     let (prog, rest) = cmd.split_first().context(USAGE)?;
-    let ms = Duration::from_millis;
 
     /// One judged run (§5, §6).
     struct Judged {
@@ -168,7 +165,7 @@ fn main() -> anyhow::Result<()> {
         sut.args(rest);
         let mut be = GateBackend::spawn(sut, WATCHED)?;
         let mut j = Judge { canary: &canary, alice: alice.clone(), reached: None, task: None };
-        let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), ms(1), ms(200), Instant::now() + Duration::from_secs(60), log);
+        let r = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), Instant::now() + Duration::from_secs(60), log);
         let end = if r.is_ok() { Some(be.child().wait()?) } else { None };
         // Clears gates and cgroup, ending what is left of the SUT, before the
         // write half: a gated task may serve a mount inside the canary.
@@ -199,12 +196,6 @@ fn main() -> anyhow::Result<()> {
         let task = j.task.as_ref().map(|(tid, tgid, name)| (*tid, *tgid, name.as_str()));
         let norm = found.iter().map(|f| schedule::normalize(f, &canary.dir, task)).collect();
         Ok(Judged { end, found, deadline, norm, unjudged, canary })
-    };
-    let name = |o: &Outcome| match o {
-        Outcome::Violation(_) => "Violation",
-        Outcome::RuntimeRefused => "RuntimeRefused",
-        Outcome::RuntimeError => "RuntimeError",
-        Outcome::Clean => "Clean",
     };
     let print = |log: &[Decision]| log.iter().for_each(|d| println!("{d:?}"));
 
@@ -243,26 +234,12 @@ fn main() -> anyhow::Result<()> {
     const VERDICTS: [&str; 4] = ["safe", "unsafe", "incomplete", "no windows"];
     // bad: a window's Violation; gap: a window invalid or unmutated.
     let verdict = |ws: &[(usize, Option<EventId>)], bad: bool, gap: bool| if bad { 1 } else if ws[0].0 == 0 { 3 } else if gap { 2 } else { 0 };
-    // Telemetry from a baseline: the size of one run, and how much there is
-    // for seeds to reorder (pairs of holds in different threads whose keys
-    // conflict) and for the mutator to hit. It sizes the campaign's estimate.
+    // Telemetry from a baseline: the size of one run and how much there is
+    // for the mutator to hit. It sizes the campaign's estimate.
     let telemetry = |log: &[Decision], targets: usize, secs: f64| {
         let threads: BTreeSet<&str> = log.iter().map(|d| d.id.thread.as_str()).collect();
-        // ponytail: O(n²) pair scan, skipped past RACING_MAX; index holds by key if it is needed there.
-        let racing = if log.len() > RACING_MAX {
-            "-".to_string()
-        } else {
-            (0..log.len())
-                .flat_map(|i| (i + 1..log.len()).map(move |j| (i, j)))
-                .filter(|&(i, j)| {
-                    let (a, b) = (&log[i], &log[j]);
-                    a.id.thread != b.id.thread && !a.keys.all && !b.keys.all && a.keys.conflicts(&b.keys)
-                })
-                .count()
-                .to_string()
-        };
         format!(
-            "telemetry: {} decisions ({} partial), {} threads, {racing} racing pairs, {targets} mutation targets, {secs:.1}s",
+            "telemetry: {} decisions ({} partial), {} threads, {targets} mutation targets, {secs:.1}s",
             log.len(),
             log.iter().filter(|d| d.partial).count(),
             threads.len(),
@@ -291,7 +268,7 @@ fn main() -> anyhow::Result<()> {
         if matches!(class, Outcome::Violation(_)) {
             run.canary.keep();
         }
-        let s = schedule(seed, target.is_some(), name(&class), run.deadline, std::mem::take(&mut run.norm), log);
+        let s = schedule(seed, target.is_some(), class.name(), run.deadline, std::mem::take(&mut run.norm), log);
         Ok((class, run, s))
     };
 
@@ -316,7 +293,7 @@ fn main() -> anyhow::Result<()> {
                 r => r?,
             };
             let class = oracle::outcome(std::mem::take(&mut run.found), run.end, end);
-            if name(&class) != sched.class || run.norm != sched.findings {
+            if class.name() != sched.class || run.norm != sched.findings {
                 println!("{pre}not confirmed ({t}/{CONFIRM_TRIES}): {class:?}, normalized {:?}", run.norm);
                 continue;
             }
@@ -356,6 +333,7 @@ fn main() -> anyhow::Result<()> {
         Ok(Some(None))
     };
 
+    backend::sweep();
     println!("{alice}");
     let mut log = Vec::new();
     let Some(dir) = campaign else {
@@ -492,7 +470,7 @@ fn main() -> anyhow::Result<()> {
                     std::fs::write(&file, s.to_string())?;
                     orders.insert(schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>()));
                     if !matches!(class, Outcome::Violation(_)) {
-                        (name(&class), "-", None, String::new())
+                        (class.name(), "-", None, String::new())
                     } else if let Some(i) = found.iter().position(|(d, _)| d.repeated_by(&s.findings, &s.steps)) {
                         found[i].1.push(format!("{seed}:{k}"));
                         ("Violation", "repeat", Some(i + 1), String::new())

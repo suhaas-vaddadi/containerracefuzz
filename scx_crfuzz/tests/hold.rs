@@ -196,3 +196,28 @@ fn tree_hold_stops_child_cgroup() {
     drop(be);
     assert!(!run.exists(), "run cgroup left behind");
 }
+
+/// At startup a dead crfuzz's run cgroup is killed and removed; one whose
+/// owner is alive (here, us) is left alone.
+#[test]
+#[ignore]
+fn sweep_removes_only_dead_owners_runs() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    let root = Path::new("/sys/fs/cgroup/crfuzz");
+    let stale = root.join(format!("run-{dead}-1"));
+    let live = root.join(format!("run-{}-{}", std::process::id(), u32::MAX));
+    for cg in [&stale, &live] {
+        std::fs::create_dir_all(cg.join("sut")).unwrap();
+    }
+    let mut sleeper = Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::write(stale.join("sut/cgroup.procs"), sleeper.id().to_string()).unwrap();
+    scx_crfuzz::backend::sweep();
+    let (stale_left, live_left) = (stale.exists(), live.exists());
+    let _ = (std::fs::remove_dir(live.join("sut")), std::fs::remove_dir(&live));
+    assert!(!stale_left, "stale run cgroup left behind");
+    assert_eq!(sleeper.wait().unwrap().signal(), Some(libc::SIGKILL), "stale run's process not killed");
+    assert!(live_left, "a live owner's run cgroup was swept");
+}
