@@ -35,6 +35,9 @@ pub fn ops() -> String {
 /// with its enable_seq, and hold it until `stop()` or ejection, unpinning on
 /// every way out. Ejection is reported to stderr and returned as an error.
 pub fn serve(stop: &dyn Fn() -> bool, ready: impl FnOnce(u64)) -> Result<()> {
+    // Warnings and failures only: libbpf's info lines ("member ... not found
+    // in kernel, skipping it") read as errors.
+    libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Warn, |_, m: String| eprint!("{m}"))));
     // flock before the state check: two starting together both pass it
     // (state isn't `enabled` until attach) and the second would delete the
     // first's pins.

@@ -163,8 +163,10 @@ architecture's.
 
 Every Violation's canary, repeats included, is kept under `/var/lib/crfuzz`
 as evidence (`left ...: changed`). Each run reports how many are there
-(`N canaries from earlier runs`); remove them yourself when you no longer
-need them.
+(`N canaries from earlier runs`). One is kept per Violation, repeats
+included, so they accumulate over long campaigns; remove them yourself when
+you no longer need them. A SUT can leave a mount inside a canary, so first
+check that `findmnt | grep /var/lib/crfuzz` shows nothing.
 
 If a crash leaves gated tasks behind, `sudo scx_crfuzz reset` clears every
 gate.
@@ -250,7 +252,9 @@ other users:
   `D/.crfuzz-containerd`. Anything else is refused, and nothing is deleted.
 
 `--resume` keeps `D/campaign/` and `D/logs/`, recreates the rest, and resumes
-the campaign. Pass the same `--attacker` as before. A different `--image` is
+the campaign. Without `--resume`, a D whose `campaign/` is not empty is
+refused, so an earlier campaign and its findings are never deleted: resume
+it, pass another `--dir`, or remove `D/campaign` yourself. Pass the same `--attacker` as before. A different `--image` is
 not detected: the image is not part of the campaign's arguments, so the
 resumed seeds run on the new image.
 
@@ -272,8 +276,9 @@ resumed seeds run on the new image.
   `--jobs` > 1 works. The layout and `sut.sh` therefore empty and refill
   these directories in place, where the script removed and recreated them.
 
-From a Mac, `scx_crfuzz/scripts/vm_containerd.sh <seeds>` builds a release
-binary in the Lima VM and runs the target there.
+From a Mac, `scx_crfuzz/scripts/vm_containerd.sh <seeds> [args...]` builds a
+release binary in the Lima VM and runs the target there, passing the args
+(`--resume`, `--dir D`, ...) to `containerd`.
 
 ## Commands
 
@@ -342,8 +347,8 @@ ends with a verdict:
 #### Resuming
 
 `--resume` continues the campaign in `DIR`. Its arguments must match
-`DIR/args`, except `--seeds`, `--time` and `--jobs`, which may change, and
-`--resume` itself.
+`DIR/args`, except `--seeds`, `--time`, `--jobs` and `-v`, which may change,
+and `--resume` itself.
 
 - A seed with a line in `seeds.tsv` is complete and is skipped.
 - Every other seed's `runs.tsv` rows, `runs/<seed>/` and `findings/*/seeds`
@@ -354,8 +359,7 @@ ends with a verdict:
 - `--time` counts this session only.
 
 The match is textual. `--mutator ./swap.sh` and `--mutator /tmp/q/swap.sh`
-differ, even when they name the same file. Adding or dropping `-v` also
-makes the arguments differ. A file whose contents changed since the first
+differ, even when they name the same file. A file whose contents changed since the first
 session still matches, so keep the mutator, the layout and the SUT unchanged
 across a resume.
 
@@ -400,7 +404,9 @@ At `--jobs` > 1:
 ### `replay`
 
 `replay FILE` reruns a schedule. Everything comes from the file: the
-command, attacker, mutator, layout, timeout and private directories. It does
+command, attacker, mutator, layout, timeout, private directories and the
+`CRFUZZ_*` environment of the `run` that wrote it, which `replay` sets
+again (so a `containerd` finding replays as is; its D must still be there). It does
 three things:
 
 1. Runs a baseline.
@@ -432,8 +438,12 @@ If another `sched_ext` scheduler is enabled, crfuzz refuses to start and
 names that scheduler (from `/sys/kernel/sched_ext/root/ops`).
 
 A gated task held past 30 s trips the `sched_ext` watchdog. The watchdog
-ejects the scheduler and releases every run. `scx_crfuzz` reports this and
-fails the run.
+ejects the scheduler and releases every run. The scheduler is also gone when
+the crfuzz process that loaded it exits while others borrow it (start
+`gated` to avoid that). A `replay` then fails the run. A campaign stops: the
+runs then ending are discarded, it prints `scheduler lost: <S> seeds
+complete` before the summary and exits 1, and `--resume` reruns the
+unfinished seeds.
 
 ### Exit status
 
@@ -442,7 +452,7 @@ fails the run.
 | 0 | Finished with no findings. |
 | 3 | Finished with a confirmed finding. For `replay`, a confirmed Violation. |
 | 2 | A usage error. The usage is printed on stderr. |
-| 1 | Any other error, including a failed preflight or a `replay` that does not reproduce its schedule. |
+| 1 | Any other error, including a failed preflight, a lost gate scheduler, or a `replay` that does not reproduce its schedule. |
 | 130 | Stopped by Ctrl-C or SIGTERM. |
 
 On a stop, the runs then ending are discarded. crfuzz cleans up the gates,
@@ -501,6 +511,7 @@ mutator /tmp/q/swap.sh            optional
 layout /tmp/q/layout.sh           optional
 timeout 30                        optional: --timeout, only if not 60
 private /tmp/q/alice              optional, one per --private
+env CRFUZZ_PRIMITIVE swap         optional, one per CRFUZZ_* variable at run time
 deadline                          only if discovery ended at the deadline
 cmd /tmp/q/check_use /tmp/q/alice/p
 outcome Violation

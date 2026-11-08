@@ -147,6 +147,9 @@ pub struct Schedule {
     pub timeout: u64,
     /// `--private` directories, absolute: each run sees its own copy.
     pub private: Vec<PathBuf>,
+    /// The `CRFUZZ_*` environment at `run` time (the layout's, SUT's and
+    /// mutator's inputs): `replay` sets it again.
+    pub env: BTreeMap<OsString, OsString>,
     pub cmd: Vec<String>,
     /// The discovery outcome class, `Outcome`'s variant name.
     pub class: String,
@@ -211,6 +214,9 @@ impl std::fmt::Display for Schedule {
         for p in &self.private {
             writeln!(f, "private {}", esc_path(p))?;
         }
+        for (k, v) in &self.env {
+            writeln!(f, "env {} {}", esc(k.as_bytes()), esc(v.as_bytes()))?;
+        }
         writeln!(f, "cmd {}", self.cmd.iter().map(|a| esc(a.as_bytes())).collect::<Vec<_>>().join(" "))?;
         writeln!(f, "outcome {}", self.class)?;
         if self.deadline {
@@ -241,7 +247,7 @@ impl std::str::FromStr for Schedule {
     fn from_str(text: &str) -> Result<Self> {
         let mut lines = text.lines();
         ensure!(lines.next() == Some("crfuzz-schedule 1"), "not a crfuzz schedule (version 1)");
-        let mut s = Schedule { seed: 0, attacker: String::new(), mutator: None, layout: None, timeout: TIMEOUT, private: vec![], cmd: vec![], class: String::new(), deadline: false, findings: BTreeSet::new(), steps: vec![] };
+        let mut s = Schedule { seed: 0, attacker: String::new(), mutator: None, layout: None, timeout: TIMEOUT, private: vec![], env: BTreeMap::new(), cmd: vec![], class: String::new(), deadline: false, findings: BTreeSet::new(), steps: vec![] };
         for (i, line) in lines.enumerate() {
             let w: Vec<&str> = line.split(' ').collect();
             let bad = || format!("line {}: {line:?}", i + 2);
@@ -252,6 +258,12 @@ impl std::str::FromStr for Schedule {
                 ["layout", l] => s.layout = Some(unesc_path(l)?),
                 ["timeout", t] => s.timeout = t.parse().with_context(bad)?,
                 ["private", p] => s.private.push(unesc_path(p)?),
+                // `replay` sets these: CRFUZZ_* only, and nothing set_var panics on.
+                ["env", k, v] => {
+                    let (k, v) = (unesc(k)?, unesc(v)?);
+                    ensure!(k.starts_with(b"CRFUZZ_") && !k.contains(&b'=') && !k.contains(&0) && !v.contains(&0), "{}: not a CRFUZZ_* variable", bad());
+                    s.env.insert(OsString::from_vec(k), OsString::from_vec(v));
+                }
                 ["cmd", ref args @ ..] => s.cmd = args.iter().map(|a| unesc_str(a)).collect::<Result<_>>()?,
                 ["outcome", c] => s.class = c.into(),
                 ["deadline"] => s.deadline = true,
@@ -380,6 +392,7 @@ mod tests {
             layout: Some("/tmp/layout.sh".into()),
             timeout: 5,
             private: vec!["/tmp/a".into(), "/run/x y".into()],
+            env: [("CRFUZZ_DIR".into(), "/tmp/d d".into()), ("CRFUZZ_EMPTY".into(), "".into()), ("CRFUZZ_X".into(), OsString::from_vec(b"a%\xff\n".to_vec()))].into(),
             cmd: vec!["/bin/sh".into(), "-c".into(), "echo a%b".into(), "".into()],
             class: "Violation".into(),
             deadline: true,
@@ -395,14 +408,19 @@ mod tests {
                 Step { id: id("0", None, 0), mutate: false },
             ],
         };
+        assert!(s.to_string().contains("\nenv CRFUZZ_DIR /tmp/d%20d\nenv CRFUZZ_EMPTY %\nenv CRFUZZ_X a%25%ff%0a\n"));
         assert_eq!(s.to_string().parse::<Schedule>().unwrap(), s);
+        for bad in ["LD_PRELOAD /x.so", "CRFUZZ_A=B c", "CRFUZZ_N%00 v", "CRFUZZ_V a%00b"] {
+            let t = s.to_string().replacen("\ncmd ", &format!("\nenv {bad}\ncmd "), 1);
+            assert!(t.parse::<Schedule>().is_err(), "{bad}");
+        }
     }
 
     #[test]
     fn timeout_line_only_when_not_default() {
         let old = "crfuzz-schedule 1\nseed 0\nattacker 1:1\ncmd /bin/true\noutcome Clean\n";
         let s = old.parse::<Schedule>().unwrap();
-        assert_eq!((s.timeout, s.private.len()), (TIMEOUT, 0), "an old file without the lines");
+        assert_eq!((s.timeout, s.private.len(), s.env.len()), (TIMEOUT, 0, 0), "an old file without the lines");
         assert_eq!(s.to_string(), old, "the default is not written");
         let s = Schedule { timeout: 5, ..s };
         assert!(s.to_string().contains("\ntimeout 5\n"));
