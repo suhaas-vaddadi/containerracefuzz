@@ -1,6 +1,6 @@
 //! The gate: the sched_ext scheduler (BPF), loaded by `serve` (`scx_crfuzz
 //! gated`, or a `Scheduler` thread in a run's own process), and `GateMap`, the
-//! client the engine drives it with over the pinned objects (spec §3.2).
+//! client the engine drives it with over the pinned objects.
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -177,7 +177,8 @@ fn test_run(prog: &OwnedFd) -> Result<u32> {
 }
 
 /// One run's handle on the gate scheduler. Every call first checks the scheduler
-/// is still the one this run opened (L:Gate: 30 s ejection / restart).
+/// is still the one this run opened: a task held past 30 s ejects it, and a
+/// restarted scheduler reads `enabled` again but has fresh maps.
 /// Drop removes this run's gate entries.
 pub struct GateMap {
     tgid: MapHandle,

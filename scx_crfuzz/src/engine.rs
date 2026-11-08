@@ -1,6 +1,6 @@
-//! Discovery loop: wait for a complete frontier (D1) up to a limit (D2), let
-//! POS pick, fire the mutator (D6), release, repeat until the SUT exits. With
-//! a judge, probe as alice at the final hold (§5). Replaying (§3.8), the
+//! Discovery loop: wait for a complete frontier (no SUT thread running) up to
+//! a limit, let POS pick, fire the mutator, release, repeat until the SUT
+//! exits. With a judge, probe as alice at the final hold. Replaying, the
 //! recorded step is released instead of POS's pick.
 
 use crate::backend::{Event, GateBackend, SelfCheckFailed};
@@ -16,24 +16,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// A mutator still running then is killed: a tree hold must end well before
-/// sched_ext's 30 s watchdog ejects the scheduler (L:Gate).
+/// sched_ext's 30 s watchdog ejects the scheduler.
 const MUTATOR_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long a frontier may stay incomplete before POS decides anyway (D2).
+/// How long a frontier may stay incomplete before POS decides anyway: a
+/// spinning thread or a fast ticker would otherwise stall the run.
 const LIMIT: Duration = Duration::from_millis(200);
 
 /// One POS decision, as the canonical log records it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Decision {
     pub id: EventId,
-    /// The event's conflict keys (D3), for its partial order (M8). Inode
+    /// The event's conflict keys, for its partial order. Inode
     /// numbers: this run only.
     pub keys: Keys,
-    /// Decided at the limit over an incomplete frontier (D2); replay and the
+    /// Decided at the limit over an incomplete frontier; replay and the
     /// determinism claim cover complete decisions only.
     pub partial: bool,
     /// The mutator fired at this hold: its exit status, or why it has none
-    /// (a primitive failure, never a finding: §3.6).
+    /// (a primitive failure, never a finding).
     pub mutation: Option<Result<ExitStatus, String>>,
 }
 
@@ -44,13 +45,13 @@ impl std::fmt::Debug for Decision {
     }
 }
 
-/// The canonical log as a schedule (§3.8): every decision, partial ones
+/// The canonical log as a schedule: every decision, partial ones
 /// included, in order.
 pub fn project(log: &[Decision]) -> Vec<Step> {
     log.iter().map(|d| Step { id: d.id.clone(), mutate: d.mutation.is_some() }).collect()
 }
 
-/// Replay a schedule (§3.8): POS still names events and seeds the mutator (D6).
+/// Replay a schedule: POS still names events and seeds the mutator.
 pub struct Replay<'a> {
     pub fixed: Fixed<'a>,
     /// Minimization: fire the mutator at this step alone, and on a divergence
@@ -72,10 +73,10 @@ impl Replay<'_> {
     }
 }
 
-/// The oracle's side of one run (§5).
+/// The oracle's side of one run.
 pub struct Judge<'a> {
     pub canary: &'a Canary,
-    /// The attacker (§1): an input, never inferred.
+    /// The attacker: an input, never inferred.
     pub alice: Alice,
     /// What the probe found. None: no final hold (the SUT died by a signal).
     pub reached: Option<Vec<Finding>>,
@@ -83,7 +84,7 @@ pub struct Judge<'a> {
     pub task: Option<(u32, u32, String)>,
 }
 
-/// The SUT was still running at the deadline: `RuntimeError` (§6), not an
+/// The SUT was still running at the deadline: `RuntimeError`, not an
 /// invalid run. Check with `err.is::<Deadline>()`.
 #[derive(Debug)]
 pub struct Deadline;
@@ -143,8 +144,8 @@ pub fn stop_on_signals() {
 /// the first hold matching `target`'s syscall, path and occurrence, in any
 /// thread (None: every hold whose event has a known
 /// path); a replay fires where its schedule says instead. With a `judge`, the
-/// mutator runs as alice, self-checked against the canary (§4, §10.1), and
-/// the root process's `exit_group` is probed (§5). Fails with `Deadline` at
+/// mutator runs as alice, self-checked against the canary, and
+/// the root process's `exit_group` is probed. Fails with `Deadline` at
 /// `deadline` (a hung or deadlocked SUT), with `SelfCheckFailed` if alice gets
 /// past the gate, with `Divergence` if a `replay` leaves its schedule, with
 /// `Interrupted` once `stopped()`.
@@ -183,13 +184,14 @@ pub fn run(
             return Err(anyhow::Error::new(Deadline).context(format!("after {} decisions", log.len())));
         }
         // Name events once, as they arrive: occurrence counts history. The
-        // canary directory differs every run (§3.8).
+        // canary directory differs every run, so it is named `<canary>` and a
+        // replay still matches.
         let canary = judge.as_deref().map(|j| j.canary.dir.as_path());
         ids.extend(held[ids.len()..].iter().map(|e| {
             let path = e.path.as_deref().map(|p| canary.and_then(|c| schedule::uncanary(p, c)).unwrap_or_else(|| p.into()));
             pos.id(&e.thread, e.nr, path)
         }));
-        // D1: a tree-gated thread already blocked reads `S`, so the readout
+        // A tree-gated thread already blocked reads `S`, so the readout
         // can look complete when it isn't.
         if !be.tree().is_empty() {
             bail!("POS decision under a tree hold");
@@ -223,10 +225,11 @@ pub fn run(
         // thread's name changes between runs. The first such hold fires, once.
         let hit = !ev.keys.all
             && target.map_or(true, |t| (t.nr, &t.path, t.n) == (id.nr, &id.path, id.n) && !log.iter().any(|d| d.mutation.is_some()));
-        // Logged at once: every ending from here keeps it (§10.3).
+        // Logged at once: every ending from here (deadline, invalid run,
+        // error) keeps it.
         log.push(Decision { id, keys: ev.keys.clone(), partial: !complete, mutation: None });
-        // The whole tree stays put while the mutator runs (§3.3); answer
-        // before ungating (L:Gate).
+        // The whole tree stays put while the mutator runs; answer before
+        // ungating, so a signal can't restart the syscall mid-release.
         if let Some(p) = &ev.path {
             // Dirfd-relative: the fd number means nothing at the final hold.
             if p.is_absolute() || ev.dirfd.is_none() {
@@ -238,9 +241,9 @@ pub fn run(
             Some(prog) if ev.path.is_some() && fire.unwrap_or(hit) => {
                 be.gate_tree()?;
                 match be.mutate(&ev, prog, judged, seed, MUTATOR_TIMEOUT) {
-                    // §4: the run ends here (main judges whether the SUT opened
-                    // the gate). Anything else (alice unmapped in the task's
-                    // namespace) is a primitive failure.
+                    // The self-check failed: the run ends here (main judges
+                    // whether the SUT opened the gate). Anything else (alice
+                    // unmapped in the task's namespace) is a primitive failure.
                     Err(e) if e.is::<SelfCheckFailed>() => {
                         log.last_mut().expect("pushed above").mutation = Some(Err(format!("{e:#}")));
                         return Err(e);
@@ -252,7 +255,7 @@ pub fn run(
         };
         let mutated = mutation.is_some();
         log.last_mut().expect("pushed above").mutation = mutation;
-        // §5: the final hold. exit_group has no path, so it is never also mutated.
+        // The final hold. exit_group has no path, so it is never also mutated.
         let probe = match judge.as_deref_mut() {
             Some(j) if ev.nr == libc::SYS_exit_group && ev.tgid == root => {
                 be.gate_tree()?;

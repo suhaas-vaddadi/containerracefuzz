@@ -3,18 +3,19 @@
 //! scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID] [--seeds N] [--time DURATION] [--jobs N] [--resume] [-v]
 //! scx_crfuzz gated | status | reset | check
 //!
-//! `run` sweeps seeds S..S+N (default S 0; §3.10), each exhaustive over its
+//! `run` sweeps seeds S..S+N (default S 0), each exhaustive over its
 //! windows; with no `--seeds`, S, S+1, ... until stopped. `--time DURATION`
 //! (`90s`, `30m`, `2h`; bare: seconds) starts no run once that much time has
 //! passed: the stop below, but with a `time limit:` line and exit 0 or 3.
 //! A seed runs CMD under POS (discovery): a baseline under the seed, no
 //! mutator, then once per window, each run with its own canary, judged
-//! against the attacker alice (UID:GID, no groups, no caps: §1). The windows
+//! against the attacker alice (UID:GID, no groups, no caps). The windows
 //! are the baseline's holds with a known path, not keys.all and not a `?tid`,
 //! one per (syscall, path, occurrence): with `--mutator`, PROG (a binary or a
 //! script with a #!) runs at window k's hold alone, once, as alice in the held
 //! task's view: its namespaces, root and cwd, the path as issued in argv[1]
-//! (§10.1). `--scope DIR` (repeatable) keeps only windows whose absolute path
+//! (as alice, not the held task: a mutation with the SUT's privilege proves
+//! nothing). `--scope DIR` (repeatable) keeps only windows whose absolute path
 //! is under one of the DIRs: where alice can act. A window that never reaches
 //! its target is unmutated. `--layout PROG` (absolute, recorded in the
 //! schedule) runs as root before every run to restore the starting
@@ -39,7 +40,7 @@
 //! rows, `runs/<seed>/` and `seed:k` lines are dropped and it runs again; the
 //! findings and totals carry on from what is left.
 //!
-//! Window k's schedule (§3.8) goes to `DIR/runs/<seed>/<k>.sched` and a row to
+//! Window k's schedule goes to `DIR/runs/<seed>/<k>.sched` and a row to
 //! `DIR/runs.tsv`; its runs' output (SUT and layout: discovery, confirm,
 //! minimize) to `DIR/runs/<seed>/<k>.log`, the baseline's to `baseline.log`,
 //! each run after a `== <run>` line. A Violation repeating a finding (`Dedup::repeated_by`) is
@@ -304,8 +305,9 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
 
     /// Replays a discovery gets to reproduce before it counts as unconfirmed.
     const CONFIRM_TRIES: u32 = 3;
-    // ponytail: a fixed watch set (the path syscalls D3 decodes, minus execve,
-    // which needs CMD as a path) and fixed timing; flags when a scenario needs them.
+    // ponytail: a fixed watch set (the path syscalls the backend's `observe`
+    // decodes, minus execve, which needs CMD as a path) and fixed timing;
+    // flags when a scenario needs them.
     const WATCHED: &[i64] = &[
         libc::SYS_openat,
         libc::SYS_openat2,
@@ -323,7 +325,8 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         libc::SYS_linkat,
         libc::SYS_symlinkat,
         libc::SYS_chdir,
-        // The final hold (§5): its keys are `all`, so no mutator fires there.
+        // The final hold (the probe's): its keys are `all`, so no mutator
+        // fires there.
         libc::SYS_exit_group,
     ];
 
@@ -593,7 +596,8 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         Some(a) => return Err(usage(format!("unknown command {a}"))),
         None => return Err(usage("a command is required".into())),
     };
-    // §1: an input, never inferred; refused before anything starts.
+    // An input, never inferred (an alice guessed as root would judge every
+    // canary reachable); refused before anything starts.
     let alice = attacker.ok_or_else(|| usage("--attacker is required".into()))?;
     let (prog, rest) = cmd.split_first().ok_or_else(|| usage("run needs a CMD after --".into()))?;
     // An old campaign's runs/ and findings/ read as this one's: only if it is this one.
@@ -620,17 +624,17 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         }
     }
 
-    /// One judged run (§5, §6).
+    /// One judged run: the probe's and the canary's findings, and the ending.
     struct Judged {
         /// None: the deadline, or a self-check failed on a changed canary.
         end: Option<ExitStatus>,
         /// Read and write halves together.
         found: Vec<Finding>,
-        /// Ended by the deadline (§3.8: replay lets it end there too).
+        /// Ended by the deadline (a replay may end there too).
         deadline: bool,
-        /// `found`, normalized: what replays compare (§3.8).
+        /// `found`, normalized: what replays compare.
         norm: BTreeSet<Finding>,
-        /// Removed on drop unless kept (§10.2).
+        /// Removed on drop unless kept (the evidence of a Violation).
         canary: Canary,
     }
 
@@ -769,7 +773,7 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         )
     };
 
-    // The run in `log` as a schedule (§3.8); `mutated`: it had a target.
+    // The run in `log` as a schedule; `mutated`: it had a target.
     let attacker = format!("{}:{}", alice.uid, alice.gid);
     let schedule = |seed: u64, mutated: bool, class: &str, deadline: bool, findings: BTreeSet<Finding>, log: &[Decision]| Schedule {
         seed,
@@ -887,7 +891,7 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         return Ok(if s.class == "Violation" { 3 } else { 0 });
     };
 
-    // §3.10: the sweep. Each row is written as its run ends: an interrupted
+    // The sweep. Each row is written as its run ends: an interrupted
     // campaign keeps them.
     std::fs::create_dir_all(dir.join("runs")).with_context(|| dir.display().to_string())?;
     std::fs::write(dir.join("args"), argv.iter().map(|a| format!("{a}\n")).collect::<String>())?;

@@ -7,8 +7,8 @@ license = "GPL-2.0-only"
 [dependencies]
 anyhow = "1"
 
-# The gate's BPF only builds on Linux; elsewhere the crate builds without it
-# (spec §3.1).
+# The gate's BPF only builds on Linux; elsewhere the crate builds without it,
+# so the pure tests run on macOS.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 libbpf-rs = "=0.27.2"

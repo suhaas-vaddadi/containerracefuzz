@@ -1,6 +1,6 @@
-//! The judged CLI (§1, §10). `missing_attacker_refused`,
-//! `usage_errors_exit_2`, `private_refused` and `containerd_preflight_refused` need nothing; the rest need root and a running
-//! `scx_crfuzz gated`:
+//! The judged CLI. `missing_attacker_refused`, `usage_errors_exit_2`,
+//! `private_refused` and `containerd_preflight_refused` need nothing; the
+//! rest need root and a running `scx_crfuzz gated`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -20,7 +20,8 @@ fn left(pid: u32) -> Vec<String> {
     rd.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| n.starts_with(&format!("canary-{pid}-"))).collect()
 }
 
-/// §10.4: no --attacker, refused with the usage error before any canary.
+/// No --attacker (never inferred), refused with the usage error before any
+/// canary.
 #[test]
 fn missing_attacker_refused() {
     let (out, pid) = crfuzz(&["run", "/tmp/crfuzz_cli_none", "--seeds", "1", "--", "/bin/true"]);
@@ -165,7 +166,7 @@ fn preflight() {
     assert!(err.contains("root: FAIL: ") && !err.contains(": ok"), "{err}");
 }
 
-/// §10.2: an invalid run (alice as uid 0 owns the gate: read before fails)
+/// An invalid run (alice as uid 0 owns the gate: read before fails)
 /// leaves no canary behind; the seed is recorded invalid and the run goes on.
 #[test]
 #[ignore]
@@ -213,7 +214,7 @@ fn sigint_stops_cleanly() {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// §8 acceptance. A root SUT checks `p` (alice's) then writes it; alice's
+/// End to end: a root SUT checks `p` (alice's) then writes it; alice's
 /// mutator swaps `p` for a symlink into the fuzzed run's canary.
 mod accept {
     use super::{crfuzz, left};

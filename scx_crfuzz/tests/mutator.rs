@@ -1,5 +1,5 @@
-//! The mutator runs at a hold as the held task (D6). Needs root, a running
-//! `scx_crfuzz gated`, `unshare` and `setpriv`:
+//! The mutator runs at a hold in the held task's view, as the task or, judged,
+//! as alice. Needs root, a running `scx_crfuzz gated`, `unshare` and `setpriv`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -125,8 +125,9 @@ fn judged_run(cmd: Command, watched: &[i64], m: &Path, canary: &Canary, alice: &
     run(&mut be, &mut Pos::new(1), Some(m), None, None, Some(&mut j), Instant::now() + Duration::from_secs(30), &mut Vec::new())
 }
 
-/// §4 aborts: alice as uid 0 (no caps) owns the gate, so it doesn't stop her:
-/// the run fails with SelfCheckFailed before the mutator starts.
+/// The self-check aborts: alice as uid 0 (no caps) owns the gate, so it
+/// doesn't stop her: the run fails with SelfCheckFailed before the mutator
+/// starts.
 #[test]
 #[ignore]
 fn self_check_aborts_root() {
@@ -141,8 +142,8 @@ fn self_check_aborts_root() {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// §4 ENOENT passes: with a tmpfs over /var/lib/crfuzz in the SUT's
-/// namespace, root's look finds no canary either, so the mutator runs.
+/// The self-check's ENOENT passes: with a tmpfs over /var/lib/crfuzz in the
+/// SUT's namespace, root's look finds no canary either, so the mutator runs.
 #[test]
 #[ignore]
 fn self_check_enoent_passes() {
@@ -158,8 +159,8 @@ fn self_check_enoent_passes() {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// §4 passes with another directory at the canary's path in the SUT's view:
-/// the mutator runs, and CRFUZZ_CANARY doesn't name it.
+/// The self-check passes with another directory at the canary's path in the
+/// SUT's view: the mutator runs, and CRFUZZ_CANARY doesn't name it.
 #[test]
 #[ignore]
 fn self_check_other_dir_passes() {
@@ -175,7 +176,7 @@ fn self_check_other_dir_passes() {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// §10.1: judged, the mutator runs as alice even where the SUT is root, with
+/// Judged, the mutator runs as alice even where the SUT is root, with
 /// NO_NEW_PRIVS, and the gate stops her (EACCES): the run is valid.
 #[test]
 #[ignore]

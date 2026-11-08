@@ -1,4 +1,4 @@
-//! The read half at the final hold (§5) and read before. Needs root, a
+//! The read half: the probe at the final hold, and read before. Needs root, a
 //! running `scx_crfuzz gated`, `unshare`, `mount` and `setpriv`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
@@ -67,7 +67,7 @@ fn copy_found() {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// §10.5: a SUT that chroots into `<canary>/dir`, drops to nobody and exits,
+/// A SUT that chroots into `<canary>/dir`, drops to nobody and exits,
 /// changing nothing: alice's root is a canary entry, so reached through the
 /// task's root handle, not an invalid run.
 #[test]
@@ -107,7 +107,8 @@ fn root_sut_attacker_nobody() {
 }
 
 /// Read before: a fresh canary stops nobody; a gate she can search but not
-/// read fails, although §4's open of the gate alone would still pass.
+/// read fails, although the self-check's open of the gate alone would still
+/// pass.
 #[test]
 #[ignore]
 fn read_before_catches_searchable_gate() {
@@ -120,7 +121,7 @@ fn read_before_catches_searchable_gate() {
     fs::set_permissions(&c.dir, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// §10.3: a SUT that sleeps past the deadline fails with `Deadline`, and the
+/// A SUT that sleeps past the deadline fails with `Deadline`, and the
 /// decisions made before it are kept.
 #[test]
 #[ignore]

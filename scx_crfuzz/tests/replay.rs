@@ -1,5 +1,6 @@
-//! M7: a discovered Violation is written as a schedule, confirmed by replay
-//! and minimized to one hold; `replay` does it again from the file. Needs root, a running `scx_crfuzz gated` and cc:
+//! A discovered Violation is written as a schedule, confirmed by replay and
+//! minimized to one hold; `replay` does it again from the file. Needs root, a
+//! running `scx_crfuzz gated` and cc:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 

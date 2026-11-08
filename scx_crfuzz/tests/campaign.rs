@@ -1,5 +1,6 @@
-//! M8: a campaign over check_use dedups to findings on `p`; over the corrected
-//! bundle, none; at --jobs 4 the same; interrupted and resumed, the same. Needs root, a running `scx_crfuzz gated` and cc:
+//! A campaign over check_use dedups to findings on `p`; over the corrected
+//! bundle, none; at --jobs 4 the same; interrupted and resumed, the same.
+//! Needs root, a running `scx_crfuzz gated` and cc:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -127,7 +128,7 @@ fn deduped(out: &str) -> Vec<String> {
     v
 }
 
-/// The design's --jobs acceptance: check_use at --jobs 4 with `alice` private
+/// --jobs: check_use at --jobs 4 with `alice` private
 /// finds what --jobs 1 finds, the fixed SUT nothing, a finding replays on its
 /// own, and the shared `alice` is never touched. The mutator finds its canary
 /// by $CRFUZZ_CANARY; the layout restores `alice`'s contents in place.
@@ -201,7 +202,7 @@ fn findings(dir: &Path, out: &str) -> Vec<(String, Vec<String>)> {
     v
 }
 
-/// Task 10: a 3-seed campaign stopped by SIGINT once seed 0 ends, then
+/// --resume: a 3-seed campaign stopped by SIGINT once seed 0 ends, then
 /// `--resume`d, ends as the uninterrupted one: the same runs.tsv seeds,
 /// windows, classes and finding numbers, seeds.tsv, findings and totals.
 /// Other arguments, or no `--resume`, are refused.

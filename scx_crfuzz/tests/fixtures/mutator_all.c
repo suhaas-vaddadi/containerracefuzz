@@ -1,4 +1,5 @@
-// Deterministic filesystem TOCTOU mutator for scx_crfuzz (development only).
+// Deterministic filesystem TOCTOU mutator for scx_crfuzz: the containerd
+// target's, embedded in the binary.
 //
 // Model runc's symlink-exchange mount bug (CVE-2021-30465), create-time
 // dangling links, and subpath/ancestor rebinding (Kubernetes CVE-2021-25741).

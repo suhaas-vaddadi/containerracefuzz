@@ -1,4 +1,5 @@
-//! Milestone 4 on the real backend. Needs root, a running `scx_crfuzz gated`:
+//! POS on the real backend: a seed fixes the decision log. Needs root, a
+//! running `scx_crfuzz gated`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -25,7 +26,7 @@ fn once(seed: u64, a: &Path, b: &Path) -> Vec<Decision> {
     log
 }
 
-/// Two racing `cat`s (forked: named by creation tree, D4): the engine decides
+/// Two racing `cat`s (forked: named by creation tree): the engine decides
 /// every openat on a complete frontier, a seed fixes the whole decision log,
 /// and the seed is what picks which trigger opens first.
 #[test]
@@ -37,7 +38,7 @@ fn seed_fixes_trigger_order() {
         let logs: Vec<Vec<EventId>> = (0..5)
             .map(|_| {
                 let log = once(seed, &a, &b);
-                // A partial decision is outside the claim (D2).
+                // A partial decision is outside the determinism claim.
                 assert!(log.iter().all(|d| !d.partial), "seed {seed}: partial decision");
                 assert!(log.iter().all(|d| !d.id.thread.starts_with('?')), "seed {seed}: unnamed thread");
                 log.into_iter().map(|d| d.id).collect()

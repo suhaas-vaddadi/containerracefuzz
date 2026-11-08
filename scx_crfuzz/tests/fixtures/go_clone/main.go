@@ -1,4 +1,4 @@
-// Fixture for the clone-hold spike: 8 goroutines read os.Args[1] in a loop
+// Fixture for the clone-hold test: 8 goroutines read os.Args[1] in a loop
 // (blocking syscalls make the runtime start new Ms, i.e. clone) while
 // allocating and forcing GCs (stop-the-world). Exits 0 when all are done.
 package main

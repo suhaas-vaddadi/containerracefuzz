@@ -1,5 +1,6 @@
-// §8: as root, stat(p) then open(p, O_WRONLY) and write. With "nofollow",
-// the open is O_NOFOLLOW: a swapped-in symlink fails it (ELOOP), exit 1.
+// The check-then-use bug: as root, stat(p) then open(p, O_WRONLY) and write.
+// With "nofollow", the open is O_NOFOLLOW: a swapped-in symlink fails it
+// (ELOOP), exit 1.
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>

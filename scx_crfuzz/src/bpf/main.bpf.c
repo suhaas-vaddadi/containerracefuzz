@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * crfuzz_gate: a sched_ext scheduler that refuses to run gated tasks.
- * See spec §3.2 / L:Gate. Only tasks enrolled in SCHED_EXT are affected.
+ * A gated tgid is enqueued on HOLD_DSQ, which the kernel never drains, until
+ * it is ungated; kick_all catches tasks already on a CPU. Only tasks enrolled
+ * in SCHED_EXT are affected.
  */
 #include <scx/common.bpf.h>
 

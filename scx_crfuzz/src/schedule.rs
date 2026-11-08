@@ -1,5 +1,5 @@
-//! The schedule file, the fixed-schedule policy and finding identity (spec
-//! §3.8, M7); a run's partial order and the campaign's dedup key (§3.10, M8).
+//! The schedule file, the fixed-schedule policy and finding identity (replay
+//! and minimization); a run's partial order and the campaign's dedup key.
 //! Pure: no I/O, so it is tested off-target.
 
 use crate::pos::{EventId, Keys};
@@ -26,7 +26,8 @@ pub fn uncanary(p: &Path, canary: &Path) -> Option<PathBuf> {
 }
 
 /// A finding's identity across runs: the canary directory as `<canary>`, the
-/// probed task's /proc handles named by its thread (D4), fd numbers dropped.
+/// probed task's /proc handles named by its creation-tree thread name (tids
+/// differ every run), fd numbers dropped.
 /// `task`: the probed event's `(tid, tgid, thread)`; `probe` reads only its
 /// `/proc/<tid>/{cwd,root}` and `/proc/<tgid>/fd/N`.
 pub fn normalize(f: &Finding, canary: &Path, task: Option<(u32, u32, &str)>) -> Finding {
@@ -55,7 +56,7 @@ pub fn normalize(f: &Finding, canary: &Path, task: Option<(u32, u32, &str)>) -> 
     }
 }
 
-/// One schedule step (§3.8): release `id`; `mutate`: the mutator fired at its
+/// One schedule step: release `id`; `mutate`: the mutator fired at its
 /// hold in discovery (a failed primitive included).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -63,7 +64,7 @@ pub struct Step {
     pub mutate: bool,
 }
 
-/// A replay left the schedule (D4: divergent). `expected` None: an event was
+/// A replay left the schedule (a divergence). `expected` None: an event was
 /// held after the last step; `held` empty: the SUT exited first.
 #[derive(Debug)]
 pub struct Divergence {
@@ -86,7 +87,8 @@ pub fn tolerated(only: Option<usize>, d: &Divergence) -> bool {
     only.is_some_and(|k| d.step > k)
 }
 
-/// The fixed-schedule policy (§3.5): release the recorded steps in order.
+/// The fixed-schedule policy, POS's replacement in a replay: release the
+/// recorded steps in order.
 pub struct Fixed<'a> {
     pub steps: &'a [Step],
     /// Steps released so far.
@@ -98,7 +100,7 @@ pub struct Fixed<'a> {
 
 impl Fixed<'_> {
     /// Index in `ready` of the next step's event, as `Pos::pick`. Called once
-    /// the frontier is complete or the limit expired (D2): a nonempty
+    /// the frontier is complete or the limit expired: a nonempty
     /// frontier without it has left the schedule.
     pub fn pick(&mut self, ready: &[(&EventId, &Keys)]) -> Result<Option<usize>, Divergence> {
         if ready.is_empty() {
@@ -139,14 +141,14 @@ pub struct Schedule {
     /// Absolute.
     pub mutator: Option<PathBuf>,
     /// Absolute; run as root before every run to restore the starting
-    /// filesystem (§3.9 `layout.sh`).
+    /// filesystem (`--layout`).
     pub layout: Option<PathBuf>,
     /// The run deadline, in seconds (`--timeout`).
     pub timeout: u64,
     /// `--private` directories, absolute: each run sees its own copy.
     pub private: Vec<PathBuf>,
     pub cmd: Vec<String>,
-    /// The discovery outcome class (§6), `Outcome`'s variant name.
+    /// The discovery outcome class, `Outcome`'s variant name.
     pub class: String,
     /// Discovery ended by the deadline, the SUT still running.
     pub deadline: bool,
@@ -273,9 +275,10 @@ impl std::str::FromStr for Schedule {
     }
 }
 
-/// A run's decisions as one canonical member of their partial order (§1.3):
-/// two are ordered iff on one thread or their keys conflict (D3), earlier
-/// first; ties go to the smallest `EventId`. Equal outputs, same partial order.
+/// A run's decisions as one canonical member of their partial order (what
+/// "same seed, same order" promises): two are ordered iff on one thread or
+/// their keys conflict, earlier first; ties go to the smallest `EventId`.
+/// Equal outputs, same partial order.
 /// Edges with the ordered pairs' transitive closure (so the same ready sets),
 /// O(n + keys) of them: the thread's last, the last `all` and (for an `all`)
 /// everything since, each key's last writer and (for a writer) its readers
@@ -323,7 +326,7 @@ pub fn canonical(log: &[(&EventId, &Keys)]) -> Vec<EventId> {
     out
 }
 
-/// A deduped finding (§3.10): the guilty hold's `(thread, nr, path)`,
+/// A deduped finding: the guilty hold's `(thread, nr, path)`,
 /// occurrence dropped (None: needs more than one hold), and the schedule's
 /// normalized findings.
 #[derive(Debug, Clone, PartialEq, Eq)]

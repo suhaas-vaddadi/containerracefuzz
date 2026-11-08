@@ -1,4 +1,4 @@
-// §10.5: as root, chroot into argv[1], drop to nobody, exit: no exec, so
+// As root, chroot into argv[1], drop to nobody, exit: no exec, so
 // nothing needs to exist inside the new root.
 #define _GNU_SOURCE
 #include <grp.h>
