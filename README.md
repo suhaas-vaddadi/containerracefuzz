@@ -44,25 +44,26 @@ ln -sfn "$c/file" /tmp/q/alice/p.new && mv -f /tmp/q/alice/p.new /tmp/q/alice/p
 EOF
 chmod +x /tmp/q/layout.sh /tmp/q/swap.sh
 
-# One seed: a run per window, each Violating one confirmed by replay and minimized.
-sudo target/release/scx_crfuzz --attacker 65534:65534 --seed 0 \
-  --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh --log /tmp/q/sched \
-  -- /tmp/q/check_use /tmp/q/alice/p
-#   window 14/15 target: EventId { thread: "0", nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
-#   outcome: Violation([Changed { entry: "file" }, ...])
-#   schedule: /tmp/q/sched.14
-#   confirmed: Violation
-#   guilty: step 13 EventId { thread: "0", nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
-#   ...
-#   seed 0: unsafe
-
-# Replay that schedule later (everything comes from the file).
-sudo target/release/scx_crfuzz --replay /tmp/q/sched.14
-
-# A campaign over 8 seeds (each all its windows), deduped. The fixed SUT (O_NOFOLLOW) gives 0 findings.
-sudo target/release/scx_crfuzz --campaign /tmp/q/camp --seeds 8 --attacker 65534:65534 \
+# One seed: a run per window, each new Violation confirmed by replay and minimized.
+sudo target/release/scx_crfuzz run /tmp/q/one --seeds 1 --attacker 65534:65534 \
   --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh -- /tmp/q/check_use /tmp/q/alice/p
-sudo target/release/scx_crfuzz --campaign /tmp/q/camp-fixed --seeds 8 --attacker 65534:65534 \
+#   [1/1] seed 0 window 4: Violation, confirming
+#     confirmed: Violation
+#     guilty: step 3 EventId { thread: "0", nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
+#   [1/1] seed 0 window 4/5: Violation → confirmed, guilty step 3 (0 79 /tmp/q/alice/p) → finding #1 (new)  0.0s
+#   ...
+#   [1/1] seed 0: unsafe
+#   ...
+#   finding #1: 1 runs, guilty (0 79 /tmp/q/alice/p), {Changed { entry: "file" }, ...}, /tmp/q/one/findings/1
+echo $?   # 3: a confirmed finding
+
+# Replay a finding later (everything comes from the file); -v prints every decision.
+sudo target/release/scx_crfuzz replay /tmp/q/one/findings/1/schedule
+
+# 8 seeds (each all its windows), deduped. The fixed SUT (O_NOFOLLOW) gives 0 findings, exit 0.
+sudo target/release/scx_crfuzz run /tmp/q/camp --seeds 8 --attacker 65534:65534 \
+  --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh -- /tmp/q/check_use /tmp/q/alice/p
+sudo target/release/scx_crfuzz run /tmp/q/camp-fixed --seeds 8 --attacker 65534:65534 \
   --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh -- /tmp/q/check_use /tmp/q/alice/p nofollow
 ```
 
@@ -72,34 +73,44 @@ behind, `sudo scx_crfuzz_gated --reset` clears every gate.
 ### `scx_crfuzz`
 
 ```
-scx_crfuzz --attacker UID:GID [--seed N] [--mutator PROG] [--layout PROG] [--scope DIR]... [--log FILE] -- CMD [ARGS...]
-scx_crfuzz --replay FILE
-scx_crfuzz --campaign DIR --seeds N --attacker UID:GID [--mutator PROG] [--layout PROG] [--scope DIR]... -- CMD [ARGS...]
+scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG]
+               [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+scx_crfuzz replay FILE [-v]
+scx_crfuzz --help | -h
+scx_crfuzz --version | -V
 ```
+
+`run` sweeps seeds `S..S+N`, each over all its windows, into `DIR` (see
+below); `DIR` must be absent or empty. To study one seed:
+`run DIR --seeds 1 --first-seed S -v`. `replay FILE` reruns a schedule:
+baseline, strict confirm, minimize.
 
 | Flag | Meaning |
 |---|---|
 | `--attacker UID:GID` | The attacker identity ("alice"): no groups, no capabilities. Required; never inferred. |
-| `--seed N` | POS seed (default 0). Same seed ⇒ same partial order of held events. A seed runs its baseline, then one run per **window**: per distinct `(syscall, path, occurrence)` hold of the baseline with a path. |
+| `--seeds N` | Required. How many seeds to sweep. A POS seed: same seed ⇒ same partial order of held events. A seed runs its baseline, then one run per **window**: per distinct `(syscall, path, occurrence)` hold of the baseline with a path. |
+| `--first-seed S` | The first seed (default 0). |
 | `--mutator PROG` | Run at one window's hold per run, as alice inside the held task's namespaces, root and cwd. Gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL` and `CRFUZZ_SEED`. Must exist inside the task's root. 15 s watchdog; a failure is logged, never a finding. |
 | `--layout PROG` | Run as root before **every** run (baseline, discovery, confirm, each minimization, each campaign seed) to restore the starting filesystem. A failure makes the run invalid. |
 | `--scope DIR` | Repeatable. Only holds whose absolute path is under one of the DIRs (where the attacker can act) become windows. Default: every hold with a path. |
-| `--log FILE` | Write each Violating window k's schedule to `FILE.k`, then confirm and minimize it. |
-| `--replay FILE` | Rerun a schedule: baseline, strict confirm, minimize. |
-| `--campaign DIR --seeds N` | Sweep seeds `0..N`, each over all its windows (see below). `DIR` must be absent or empty. |
+| `--timeout SECS` | End a run still going after SECS (1 to 30, default 30): `RuntimeError`. Recorded in the schedule; `replay` uses it. |
+| `-v` | Print every run's decision log (baseline, discovery, confirm, minimize). Without it no decision log is printed; a `replay` that fails says to rerun with `-v`. |
 
 Every seed first runs a **baseline** (no mutator) under that seed that must
 leak nothing, else the scenario is invalid; its holds are the seed's windows.
 A seed ends with a verdict: `safe` (every window valid, mutated and not a
 Violation), `unsafe` (some window a Violation), `incomplete` (else: a window
 invalid or its target never reached), or `no windows` (no mutator or no
-target: one unmutated run). Exit status is 0 whatever the verdict; nonzero
-only for an invalid baseline (after printing its decisions). Needs root
-and a running `scx_crfuzz_gated`.
+target: one unmutated run). An invalid run or baseline is recorded and the
+sweep goes on. Needs root and a running `scx_crfuzz_gated`.
+
+**Exit status**: 0 finished, no findings; 3 finished with a confirmed finding
+(`replay`: a confirmed Violation); 2 a usage error (the usage on stderr); 1
+any other error, including a `replay` that does not reproduce its schedule.
 
 **Outcome classes** (one per run): `Violation` (alice can reach, or has
 changed, the canary) / `RuntimeRefused` (the SUT exited nonzero: it noticed) /
-`RuntimeError` (signal, the 60 s deadline, or a failing baseline) / `Clean`.
+`RuntimeError` (signal, the `--timeout` deadline, or a failing baseline) / `Clean`.
 
 ### `scx_crfuzz_gated`
 
@@ -151,7 +162,7 @@ releases every run; `scx_crfuzz` detects that and fails the run.
    fd numbers stripped). Minimization replays once per mutated step with only
    that mutation on and reports the **first** step whose run still flags one
    of the findings: the guilty hold.
-7. **Campaign** (`main.rs`). Seeds `0..N`, each its baseline and windows. A Violation
+7. **Campaign** (`main.rs`). Seeds `S..S+N`, each its baseline and windows. A Violation
    whose findings and guilty `(thread, syscall, path)` match a known finding
    is counted against it without re-confirming; a new one is confirmed and
    minimized.
@@ -163,7 +174,7 @@ checked by replay (divergence) rather than guaranteed.
 
 ## Files
 
-### Schedule file (`--log`, `runs/<seed>/<k>.sched`, `findings/<n>/schedule`)
+### Schedule file (`runs/<seed>/<k>.sched`, `findings/<n>/schedule`)
 
 Space-separated lines; in paths and arguments, bytes outside printable ASCII,
 space and `%` are `%XX`, and an empty string is a lone `%`.
@@ -174,6 +185,7 @@ seed 0
 attacker 65534:65534
 mutator /tmp/q/swap.sh            optional
 layout /tmp/q/layout.sh           optional
+timeout 30                        optional: --timeout, only if not 60
 deadline                          only if discovery ended at the deadline
 cmd /tmp/q/check_use /tmp/q/alice/p
 outcome Violation

@@ -126,6 +126,10 @@ impl Fixed<'_> {
     }
 }
 
+/// The run deadline, in seconds, of a schedule without a `timeout` line:
+/// files from before `--timeout`. New runs default to 30.
+pub const TIMEOUT: u64 = 60;
+
 /// A self-contained schedule file: what discovery ran and found, and its steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
@@ -137,6 +141,8 @@ pub struct Schedule {
     /// Absolute; run as root before every run to restore the starting
     /// filesystem (§3.9 `layout.sh`).
     pub layout: Option<PathBuf>,
+    /// The run deadline, in seconds (`--timeout`).
+    pub timeout: u64,
     pub cmd: Vec<String>,
     /// The discovery outcome class (§6), `Outcome`'s variant name.
     pub class: String,
@@ -195,6 +201,9 @@ impl std::fmt::Display for Schedule {
         if let Some(l) = &self.layout {
             writeln!(f, "layout {}", esc_path(l))?;
         }
+        if self.timeout != TIMEOUT {
+            writeln!(f, "timeout {}", self.timeout)?;
+        }
         writeln!(f, "cmd {}", self.cmd.iter().map(|a| esc(a.as_bytes())).collect::<Vec<_>>().join(" "))?;
         writeln!(f, "outcome {}", self.class)?;
         if self.deadline {
@@ -225,7 +234,7 @@ impl std::str::FromStr for Schedule {
     fn from_str(text: &str) -> Result<Self> {
         let mut lines = text.lines();
         ensure!(lines.next() == Some("crfuzz-schedule 1"), "not a crfuzz schedule (version 1)");
-        let mut s = Schedule { seed: 0, attacker: String::new(), mutator: None, layout: None, cmd: vec![], class: String::new(), deadline: false, findings: BTreeSet::new(), steps: vec![] };
+        let mut s = Schedule { seed: 0, attacker: String::new(), mutator: None, layout: None, timeout: TIMEOUT, cmd: vec![], class: String::new(), deadline: false, findings: BTreeSet::new(), steps: vec![] };
         for (i, line) in lines.enumerate() {
             let w: Vec<&str> = line.split(' ').collect();
             let bad = || format!("line {}: {line:?}", i + 2);
@@ -234,6 +243,7 @@ impl std::str::FromStr for Schedule {
                 ["attacker", a] => s.attacker = a.into(),
                 ["mutator", m] => s.mutator = Some(unesc_path(m)?),
                 ["layout", l] => s.layout = Some(unesc_path(l)?),
+                ["timeout", t] => s.timeout = t.parse().with_context(bad)?,
                 ["cmd", ref args @ ..] => s.cmd = args.iter().map(|a| unesc_str(a)).collect::<Result<_>>()?,
                 ["outcome", c] => s.class = c.into(),
                 ["deadline"] => s.deadline = true,
@@ -359,6 +369,7 @@ mod tests {
             attacker: "65534:65534".into(),
             mutator: Some("/tmp/m m.sh".into()),
             layout: Some("/tmp/layout.sh".into()),
+            timeout: 5,
             cmd: vec!["/bin/sh".into(), "-c".into(), "echo a%b".into(), "".into()],
             class: "Violation".into(),
             deadline: true,
@@ -374,6 +385,17 @@ mod tests {
                 Step { id: id("0", None, 0), mutate: false },
             ],
         };
+        assert_eq!(s.to_string().parse::<Schedule>().unwrap(), s);
+    }
+
+    #[test]
+    fn timeout_line_only_when_not_default() {
+        let old = "crfuzz-schedule 1\nseed 0\nattacker 1:1\ncmd /bin/true\noutcome Clean\n";
+        let s = old.parse::<Schedule>().unwrap();
+        assert_eq!(s.timeout, TIMEOUT, "an old file without the line");
+        assert_eq!(s.to_string(), old, "the default is not written");
+        let s = Schedule { timeout: 5, ..s };
+        assert!(s.to_string().contains("\ntimeout 5\n"));
         assert_eq!(s.to_string().parse::<Schedule>().unwrap(), s);
     }
 
