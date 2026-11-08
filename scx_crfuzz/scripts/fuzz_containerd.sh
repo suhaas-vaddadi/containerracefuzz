@@ -96,7 +96,7 @@ while [ ! -S "$d/sock" ]; do
 	[ "$i" -gt 400 ] && { echo "containerd socket never appeared" >&2; exit 1; }
 	sleep 0.05
 done
-# --cgroup: beside ours (run-N/sut) under the run cgroup, so runc init stays tracked.
+# --cgroup: beside ours (run-<pid>-<epoch>/sut) under the run cgroup, so runc init stays tracked.
 cg=$(cut -d: -f3 /proc/self/cgroup)
 "$CRFUZZ_CTR" --address "$d/sock" run --rm --cgroup "${cg%/*}/busy" --runc-root "$d/runc" --rootfs "$CRFUZZ_ROOTFS" busy \
 	/bin/busybox sh -c '/bin/busybox echo busy; /bin/busybox sleep 0.5'

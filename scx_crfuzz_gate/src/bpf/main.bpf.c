@@ -12,7 +12,7 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
-/* Gate entries: key tgid / tid, value the owning run's epoch. */
+/* Gate entries: key tgid, value the owning run's epoch. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_GATES);
@@ -20,21 +20,13 @@ struct {
 	__type(value, u32);
 } gate_tgid SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_GATES);
-	__type(key, u32);
-	__type(value, u32);
-} gate_tid SEC(".maps");
-
 u32 epoch_seq;
 
 static bool is_held(struct task_struct *p)
 {
-	u32 tgid = p->tgid, tid = p->pid;
+	u32 tgid = p->tgid;
 
-	return bpf_map_lookup_elem(&gate_tgid, &tgid) ||
-	       bpf_map_lookup_elem(&gate_tid, &tid);
+	return bpf_map_lookup_elem(&gate_tgid, &tgid);
 }
 
 /* Must exist and insert nothing, or wakeups to idle CPUs skip enqueue. */
@@ -66,10 +58,9 @@ void BPF_STRUCT_OPS(crfuzz_gate_dispatch, s32 cpu, struct task_struct *prev)
 void BPF_STRUCT_OPS(crfuzz_gate_exit_task, struct task_struct *p,
 		    struct scx_exit_task_args *args)
 {
-	u32 tgid = p->tgid, tid = p->pid;
+	u32 tgid = p->tgid;
 
-	bpf_map_delete_elem(&gate_tid, &tid);
-	if (tid == tgid)
+	if (p->pid == tgid)
 		bpf_map_delete_elem(&gate_tgid, &tgid);
 }
 

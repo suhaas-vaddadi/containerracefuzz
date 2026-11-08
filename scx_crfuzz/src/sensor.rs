@@ -13,6 +13,9 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Snapshot spacing (backend poll timeout) while waiting for a frontier.
+const INTERVAL: Duration = Duration::from_millis(1);
+
 /// tid -> (state char from /proc/<tid>/stat, ns on CPU from schedstat).
 pub type Snap = BTreeMap<u32, (u8, u64)>;
 
@@ -66,12 +69,11 @@ impl std::error::Error for Exited {}
 pub fn wait_frontier(
     be: &mut GateBackend,
     held: &mut Vec<Event>,
-    interval: Duration,
     deadline: Instant,
 ) -> Result<Option<u32>> {
     let mut prev = snapshot(be.cgroup());
     for round in 1.. {
-        match be.poll(interval)? {
+        match be.poll(INTERVAL)? {
             Poll::Events(evs) => held.extend(evs),
             Poll::Closed => return Err(Exited.into()),
             Poll::Idle => {}

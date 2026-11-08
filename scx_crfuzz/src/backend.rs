@@ -98,11 +98,15 @@ impl GateBackend {
             bail!("watching execve needs a program path, not a bare name: {:?}", cmd.get_program());
         }
         let gate = GateMap::open()?;
-        let cgroup = PathBuf::from(format!("{CGROUP_ROOT}/run-{}", gate.epoch));
-        // The SUT in a leaf, `run-N/sut`: cgroup v2 forbids processes in a cgroup
+        // `run-<pid>-<epoch>`: epochs restart with the daemon, so the pid keeps
+        // a dead crfuzz's leftover run (see `sweep`) from being reused.
+        let cgroup = PathBuf::from(format!("{CGROUP_ROOT}/run-{}-{}", std::process::id(), gate.epoch));
+        // The SUT in a leaf, `run/sut`: cgroup v2 forbids processes in a cgroup
         // whose children have controllers, so a container cgroup can then sit
-        // beside it under `run-N` (runc's `--cgroup`), tracked with the tree.
-        fs::create_dir_all(cgroup.join("sut")).with_context(|| cgroup.display().to_string())?;
+        // beside it under `run` (runc's `--cgroup`), tracked with the tree.
+        // create_dir: an existing run cgroup is an error, never reused.
+        fs::create_dir_all(CGROUP_ROOT).with_context(|| CGROUP_ROOT)?;
+        fs::create_dir(&cgroup).and_then(|_| fs::create_dir(cgroup.join("sut"))).with_context(|| cgroup.display().to_string())?;
         let procs = File::options().write(true).open(cgroup.join("sut/cgroup.procs"))?;
         let filter = notify_filter(&watched);
 
@@ -186,10 +190,6 @@ impl GateBackend {
 
     pub fn child(&mut self) -> &mut Child {
         &mut self.child
-    }
-
-    pub fn gate(&self) -> &GateMap {
-        &self.gate
     }
 
     /// The run cgroup; the SUT tree lives in it and its children.
@@ -433,17 +433,65 @@ impl Drop for GateBackend {
         let _ = self.gate.clear();
         let _ = fs::write(self.cgroup.join("cgroup.kill"), "1");
         let _ = self.child.wait();
-        // Reparented descendants are reaped by init; wait for the cgroups to
-        // drain. Children first: a cgroup with child cgroups can't be removed.
-        for _ in 0..100 {
-            for dir in cgroup_dirs(&self.cgroup).iter().rev() {
-                let _ = fs::remove_dir(dir);
-            }
-            if !self.cgroup.exists() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        remove_cgroup(&self.cgroup);
+    }
+}
+
+/// Wait up to 1 s for a killed `cgroup` to drain and remove it: reparented
+/// descendants are reaped by init. Children first: a cgroup with child
+/// cgroups can't be removed. False if it's still there.
+fn remove_cgroup(cgroup: &Path) -> bool {
+    for _ in 0..100 {
+        for dir in cgroup_dirs(cgroup).iter().rev() {
+            let _ = fs::remove_dir(dir);
         }
+        if !cgroup.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// `<prefix><pid>-<n>` whose pid is gone: left by a crfuzz that died.
+fn stale(name: &str, prefix: &str) -> bool {
+    let pid = name.strip_prefix(prefix).and_then(|r| r.split_once('-')?.0.parse::<u32>().ok());
+    pid.is_some_and(|p| !Path::new(&format!("/proc/{p}")).exists())
+}
+
+/// At startup: kill and remove the run cgroups of crfuzz processes that died
+/// without dropping their GateBackend; report, never remove, their canaries
+/// (evidence, and maybe mounts: see `Canary`'s Drop). Old-format `run-<epoch>`
+/// dirs are left alone. A live owner's runs are never touched: several crfuzz
+/// processes can share one daemon.
+// ponytail: a dead owner's pid reused by a live process keeps its stale
+// cgroup until that pid exits.
+pub fn sweep() {
+    let names = |dir: &str| fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok());
+    let mut left = 0;
+    for n in names(CGROUP_ROOT).filter(|n| stale(n, "run-")) {
+        let cg = Path::new(CGROUP_ROOT).join(n);
+        // Ungate before killing, as Drop does: a run that died in a tree hold
+        // left its gate entries. By member tgid, not by epoch: epochs restart
+        // with the daemon, so a live run may share the name's. No daemon: no
+        // pins, nothing gated.
+        let tgids: Vec<u32> = cgroup_dirs(&cg)
+            .iter()
+            .filter_map(|d| fs::read_to_string(d.join("cgroup.procs")).ok())
+            .flat_map(|l| l.lines().filter_map(|t| t.parse().ok()).collect::<Vec<_>>())
+            .collect();
+        let _ = scx_crfuzz_gate::ungate_tgids(&tgids);
+        let _ = fs::write(cg.join("cgroup.kill"), "1");
+        if !remove_cgroup(&cg) {
+            left += 1;
+        }
+    }
+    if left > 0 {
+        eprintln!("{left} stale run cgroups left in {CGROUP_ROOT}");
+    }
+    let canaries = names(oracle::ROOT).filter(|n| stale(n, "canary-")).count();
+    if canaries > 0 {
+        eprintln!("{canaries} canaries from earlier runs in {}", oracle::ROOT);
     }
 }
 

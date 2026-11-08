@@ -14,7 +14,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
-const ROOT: &str = "/var/lib/crfuzz";
+pub(crate) const ROOT: &str = "/var/lib/crfuzz";
 
 /// What the write half compares, with `Entry::id`: everything but times.
 #[derive(Debug, PartialEq)]
@@ -260,6 +260,17 @@ pub enum Outcome {
     RuntimeRefused,
     RuntimeError,
     Clean,
+}
+
+impl Outcome {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Outcome::Violation(_) => "Violation",
+            Outcome::RuntimeRefused => "RuntimeRefused",
+            Outcome::RuntimeError => "RuntimeError",
+            Outcome::Clean => "Clean",
+        }
+    }
 }
 
 /// §6, first match wins. An ending of None: the deadline.

@@ -106,7 +106,6 @@ changed, the canary) / `RuntimeRefused` (the SUT exited nonzero: it noticed) /
 ```
 scx_crfuzz_gated            run the daemon (until SIGINT or ejection)
 scx_crfuzz_gated --status   sched_ext state + pins
-scx_crfuzz_gated --kick     open the gate map and kick every CPU
 scx_crfuzz_gated --reset    delete every gate entry of every run
 ```
 

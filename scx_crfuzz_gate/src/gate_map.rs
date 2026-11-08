@@ -7,7 +7,7 @@ use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
 
 pub const PIN_DIR: &str = "/sys/fs/bpf/scx_crfuzz";
 pub const LOCK_PATH: &str = "/run/scx_crfuzz_gated.lock";
-pub const PINS: [&str; 4] = ["gate_tgid", "gate_tid", "kick_all", "new_epoch"];
+pub const PINS: [&str; 3] = ["gate_tgid", "kick_all", "new_epoch"];
 
 pub fn sched_ext_state() -> Result<String> {
     Ok(fs::read_to_string("/sys/kernel/sched_ext/state")?.trim().to_string())
@@ -46,7 +46,6 @@ fn test_run(prog: &OwnedFd) -> Result<u32> {
 /// Drop removes this run's gate entries.
 pub struct GateMap {
     tgid: MapHandle,
-    tid: MapHandle,
     kick_prog: OwnedFd,
     enable_seq: u64,
     pub epoch: u32,
@@ -64,7 +63,6 @@ impl GateMap {
         let open_map = |n| MapHandle::from_pinned_path(pin_path(n)).with_context(|| pin_path(n));
         let gm = Self {
             tgid: open_map("gate_tgid")?,
-            tid: open_map("gate_tid")?,
             kick_prog: open_pinned_prog("kick_all")?,
             enable_seq,
             epoch: test_run(&open_pinned_prog("new_epoch")?)?,
@@ -94,11 +92,8 @@ impl GateMap {
         Ok(())
     }
 
-    /// Never gate a tgid and tids of the same group at once: is_held ORs them.
     pub fn gate_tgid(&self, tgid: u32) -> Result<()> { self.set(&self.tgid, tgid) }
     pub fn ungate_tgid(&self, tgid: u32) -> Result<()> { self.unset(&self.tgid, tgid) }
-    pub fn gate_tid(&self, tid: u32) -> Result<()> { self.set(&self.tid, tid) }
-    pub fn ungate_tid(&self, tid: u32) -> Result<()> { self.unset(&self.tid, tid) }
 
     /// Preempt every CPU so a gate change takes effect. Asynchronous (IPI):
     /// not a barrier. Returns the number of CPUs kicked.
@@ -109,7 +104,7 @@ impl GateMap {
 
     /// Remove this run's gate entries, then kick.
     pub fn clear(&self) -> Result<()> {
-        clear_maps(&[&self.tgid, &self.tid], Some(self.epoch))?;
+        clear_map(&self.tgid, Some(self.epoch))?;
         self.kick().map(|_| ())
     }
 }
@@ -121,27 +116,36 @@ impl Drop for GateMap {
 }
 
 /// Delete gate entries owned by `epoch`, or all of them if `None`.
-fn clear_maps(maps: &[&MapHandle], epoch: Option<u32>) -> Result<()> {
-    for map in maps {
-        // Collect first: deleting mid-iteration can skip entries.
-        let keys: Vec<Vec<u8>> = map
-            .keys()
-            .filter(|k| match epoch {
-                None => true,
-                Some(e) => matches!(map.lookup(k, MapFlags::ANY), Ok(Some(v)) if v == e.to_ne_bytes()),
-            })
-            .collect();
-        for k in keys {
-            let _ = map.delete(&k);
-        }
+fn clear_map(map: &MapHandle, epoch: Option<u32>) -> Result<()> {
+    // Collect first: deleting mid-iteration can skip entries.
+    let keys: Vec<Vec<u8>> = map
+        .keys()
+        .filter(|k| match epoch {
+            None => true,
+            Some(e) => matches!(map.lookup(k, MapFlags::ANY), Ok(Some(v)) if v == e.to_ne_bytes()),
+        })
+        .collect();
+    for k in keys {
+        let _ = map.delete(&k);
     }
+    Ok(())
+}
+
+/// Drop the gate entries of `tgids`, whatever run owns them, then kick: for a
+/// dead run's processes, which no `GateMap` will clear.
+pub fn ungate_tgids(tgids: &[u32]) -> Result<()> {
+    let map = MapHandle::from_pinned_path(pin_path("gate_tgid")).with_context(|| pin_path("gate_tgid"))?;
+    for t in tgids {
+        let _ = map.delete(&t.to_ne_bytes());
+    }
+    test_run(&open_pinned_prog("kick_all")?)?;
     Ok(())
 }
 
 /// `--reset`: drop every gate entry of every run, then kick.
 pub fn reset_all() -> Result<()> {
     let open_map = |n| MapHandle::from_pinned_path(pin_path(n)).with_context(|| pin_path(n));
-    clear_maps(&[&open_map("gate_tgid")?, &open_map("gate_tid")?], None)?;
+    clear_map(&open_map("gate_tgid")?, None)?;
     test_run(&open_pinned_prog("kick_all")?)?;
     Ok(())
 }

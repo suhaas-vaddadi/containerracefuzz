@@ -13,8 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const INTERVAL: Duration = Duration::from_millis(1);
-
 fn c_bin() -> PathBuf {
     let out = std::env::temp_dir().join("crfuzz_sensor");
     let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sensor.c");
@@ -49,7 +47,7 @@ fn reach(be: &mut GateBackend, trigger: &Path, deadline: Duration) -> Reach {
     let mut held = Vec::new();
     loop {
         let t = Instant::now();
-        let rounds = wait_frontier(be, &mut held, INTERVAL, deadline).unwrap();
+        let rounds = wait_frontier(be, &mut held, deadline).unwrap();
         let r = Reach { rounds, last: t.elapsed(), held: std::mem::take(&mut held) };
         if rounds.is_none() || r.trigger_held(trigger) {
             return r;
@@ -125,7 +123,7 @@ fn periodic_ticker_settle() {
             .map(|_| {
                 let t = Instant::now();
                 let deadline = Instant::now() + Duration::from_secs(1);
-                (wait_frontier(&mut be, &mut held, INTERVAL, deadline).unwrap(), t.elapsed().as_micros())
+                (wait_frontier(&mut be, &mut held, deadline).unwrap(), t.elapsed().as_micros())
             })
             .collect();
         eprintln!("tick {us}us: 20 decisions (rounds, µs) {samples:?}");
@@ -180,7 +178,7 @@ fn gated_threads_under_tree_hold() {
         std::thread::sleep(Duration::from_millis(50));
         let b = snapshot(be.cgroup());
         let mut held = r.held;
-        let decided = wait_frontier(&mut be, &mut held, INTERVAL, Instant::now() + Duration::from_millis(300)).unwrap();
+        let decided = wait_frontier(&mut be, &mut held, Instant::now() + Duration::from_millis(300)).unwrap();
         eprintln!("{mode} under tree hold: {a:?} -> {b:?}; wait_frontier {decided:?}");
         be.ungate_tree().unwrap();
     }
