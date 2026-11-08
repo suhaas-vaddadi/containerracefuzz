@@ -1,5 +1,5 @@
 //! M8: a campaign over check_use dedups to findings on `p`; over the corrected
-//! bundle, none. Needs root, a running scx_crfuzz_gated and cc:
+//! bundle, none. Needs root, a running `scx_crfuzz gated` and cc:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 

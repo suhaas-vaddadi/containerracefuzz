@@ -1,8 +1,8 @@
-//! Needs root and a running scx_crfuzz_gated:
-//!   sudo -E cargo test -p scx_crfuzz_gate -- --ignored --test-threads=1
+//! Needs root and a running `scx_crfuzz gated`:
+//!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1
 #![cfg(target_os = "linux")]
 
-use scx_crfuzz_gate::GateMap;
+use scx_crfuzz::gate::GateMap;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 use std::thread::sleep;

@@ -1,5 +1,6 @@
 //! scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 //! scx_crfuzz replay FILE [-v]
+//! scx_crfuzz gated | status | reset
 //!
 //! `run` sweeps seeds S..S+N (default S 0; §3.10), each exhaustive over its
 //! windows. A seed runs CMD under POS (discovery): a baseline under the seed,
@@ -41,7 +42,14 @@
 //! any other error (`replay`: the schedule not reproduced), 130 stopped by
 //! SIGINT or SIGTERM: the runs then ending are discarded, the campaign's
 //! summary printed after an `interrupted:` line; a second signal kills at
-//! once. Needs root and a running scx_crfuzz_gated.
+//! once. Needs root.
+//!
+//! The gate scheduler: `run` and `replay` use the one running (another
+//! crfuzz's, or `gated`'s), else load their own for their life; any other
+//! sched_ext scheduler is an error. `gated` holds it in the foreground until
+//! SIGINT or SIGTERM (exit 0) or ejection, for tests and for several crfuzz
+//! processes sharing one; `status` prints sched_ext's state and the pins;
+//! `reset` deletes every gate entry of every run.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -53,6 +61,9 @@ fn main() {
 const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG]
                       [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
        scx_crfuzz replay FILE [-v]
+       scx_crfuzz gated     hold the gate scheduler until SIGINT/SIGTERM
+       scx_crfuzz status    sched_ext state and pins
+       scx_crfuzz reset     delete every gate entry of every run
        scx_crfuzz --help | --version";
 
 /// A bad or missing argument: exit 2, after the usage.
@@ -94,6 +105,7 @@ fn crfuzz() -> anyhow::Result<i32> {
     use anyhow::{bail, ensure, Context, Result};
     use scx_crfuzz::backend::{self, GateBackend, SelfCheckFailed};
     use scx_crfuzz::engine::{self, Deadline, Decision, Interrupted, Judge, Replay};
+    use scx_crfuzz::gate;
     use scx_crfuzz::oracle::{self, Alice, Canary, Finding, Outcome};
     use scx_crfuzz::pos::{EventId, Pos};
     use scx_crfuzz::schedule::{self, Dedup, Divergence, Fixed, Schedule};
@@ -154,6 +166,20 @@ fn crfuzz() -> anyhow::Result<i32> {
         }
         Some("-V" | "--version") => {
             println!("scx_crfuzz {}", env!("CARGO_PKG_VERSION"));
+            return Ok(0);
+        }
+        Some(c @ ("gated" | "status" | "reset")) => {
+            if let Some(a) = args.next() {
+                return Err(usage(format!("unknown argument {a}")));
+            }
+            match c {
+                "gated" => {
+                    engine::stop_on_signals();
+                    gate::serve(&engine::stopped, |seq| println!("scx_crfuzz gated: attached, enable_seq={seq}"))?;
+                }
+                "status" => gate::status()?,
+                _ => gate::reset_all()?,
+            }
             return Ok(0);
         }
         // Everything comes from the file.
@@ -438,6 +464,8 @@ fn crfuzz() -> anyhow::Result<i32> {
     };
 
     engine::stop_on_signals();
+    // Ours for this process's life unless crfuzz's already runs.
+    let _sched = gate::Scheduler::start()?;
     backend::sweep();
     println!("{alice}");
     let mut log = Vec::new();

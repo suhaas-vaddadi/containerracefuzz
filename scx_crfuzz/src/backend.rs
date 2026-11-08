@@ -6,7 +6,7 @@
 use crate::oracle::{self, Alice, Canary, Finding};
 use crate::pos::{Key, Keys};
 use anyhow::{bail, ensure, Context, Result};
-use scx_crfuzz_gate::GateMap;
+use crate::gate::GateMap;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File};
@@ -472,15 +472,15 @@ pub fn sweep() {
     for n in names(CGROUP_ROOT).filter(|n| stale(n, "run-")) {
         let cg = Path::new(CGROUP_ROOT).join(n);
         // Ungate before killing, as Drop does: a run that died in a tree hold
-        // left its gate entries. By member tgid, not by epoch: epochs restart
-        // with the daemon, so a live run may share the name's. No daemon: no
-        // pins, nothing gated.
+        // left its gate entries, and cgroup.kill can't take a gated task. By
+        // member tgid, not by epoch: epochs restart with each load, so a live
+        // run may share the name's. No scheduler: no pins, nothing gated.
         let tgids: Vec<u32> = cgroup_dirs(&cg)
             .iter()
             .filter_map(|d| fs::read_to_string(d.join("cgroup.procs")).ok())
             .flat_map(|l| l.lines().filter_map(|t| t.parse().ok()).collect::<Vec<_>>())
             .collect();
-        let _ = scx_crfuzz_gate::ungate_tgids(&tgids);
+        let _ = crate::gate::ungate_tgids(&tgids);
         let _ = fs::write(cg.join("cgroup.kill"), "1");
         if !remove_cgroup(&cg) {
             left += 1;

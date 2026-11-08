@@ -1,5 +1,5 @@
 //! The mutator runs at a hold as the held task (D6). Needs root, a running
-//! scx_crfuzz_gated, `unshare` and `setpriv`:
+//! `scx_crfuzz gated`, `unshare` and `setpriv`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 

@@ -1,5 +1,5 @@
 //! Milestone 3 spike: the `/proc` double-snapshot sensor. Needs root, a running
-//! scx_crfuzz_gated, `cc` and `go`:
+//! `scx_crfuzz gated`, `cc` and `go`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 

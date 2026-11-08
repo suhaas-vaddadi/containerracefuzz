@@ -1,4 +1,4 @@
-//! Milestone 2 acceptance. Needs root, a running scx_crfuzz_gated, and `go`:
+//! Milestone 2 acceptance. Needs root, a running `scx_crfuzz gated`, and `go`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -220,7 +220,7 @@ fn sweep_removes_only_dead_owners_runs() {
     let mut sleeper = sleeper.arg("60").spawn().unwrap();
     std::fs::write(stale.join("sut/cgroup.procs"), sleeper.id().to_string()).unwrap();
     // The dead owner's gate entry: forgotten, so no Drop clears it.
-    let gate = scx_crfuzz_gate::GateMap::open().unwrap();
+    let gate = scx_crfuzz::gate::GateMap::open().unwrap();
     gate.gate_tgid(sleeper.id()).unwrap();
     gate.kick().unwrap();
     std::mem::forget(gate);
