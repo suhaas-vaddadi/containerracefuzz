@@ -36,7 +36,8 @@ fn campaign(dir: &Path, first: u64, cmd: &[&str], m: &Path, layout: &Path, code:
 
 /// Schedules under `DIR/runs/<seed>/`.
 fn runs(dir: &Path) -> usize {
-    fs::read_dir(dir.join("runs")).unwrap().map(|s| fs::read_dir(s.unwrap().path()).unwrap().count()).sum()
+    let scheds = |s: fs::DirEntry| fs::read_dir(s.path()).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "sched")).count();
+    fs::read_dir(dir.join("runs")).unwrap().map(|s| scheds(s.unwrap())).sum()
 }
 
 fn line<'a>(out: &'a str, prefix: &str) -> &'a str {
@@ -84,6 +85,12 @@ fn campaign_dedups() {
     let rows: Vec<Vec<&str>> = tsv.lines().skip(1).map(|l| l.split('\t').collect()).collect();
     assert_eq!(runs(&c), rows.len(), "{tsv}");
     assert!(rows.iter().any(|r| r[3] == "repeat"), "{tsv}");
+    // A new finding's window log: its discovery, then its confirm and minimize runs.
+    let r = rows.iter().find(|r| r[3] == "new").unwrap();
+    let wlog = fs::read_to_string(c.join(format!("runs/{}/{}.log", r[0], r[1]))).unwrap();
+    let heads: Vec<&str> = wlog.lines().filter(|l| l.starts_with("== ")).collect();
+    assert!(heads.len() >= 3 && heads[..2] == ["== discovery", "== confirm 1/3"] && heads[2].starts_with("== minimize step "), "{wlog}");
+    assert!(fs::read_to_string(c.join(format!("runs/{}/baseline.log", r[0]))).unwrap().starts_with("== baseline\n"));
     for i in 1..=n {
         let f = c.join(format!("findings/{i}"));
         let mut want: Vec<String> = rows.iter().filter(|r| r[4] == i.to_string()).map(|r| format!("{}:{}", r[0], r[1])).collect();
