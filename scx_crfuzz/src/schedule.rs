@@ -126,7 +126,8 @@ impl Fixed<'_> {
     }
 }
 
-/// The run deadline, in seconds, of a schedule without a `timeout` line.
+/// The run deadline, in seconds, of a schedule without a `timeout` line:
+/// files from before `--timeout`. New runs default to 30.
 pub const TIMEOUT: u64 = 60;
 
 /// A self-contained schedule file: what discovery ran and found, and its steps.

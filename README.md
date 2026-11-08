@@ -93,7 +93,7 @@ baseline, strict confirm, minimize.
 | `--mutator PROG` | Run at one window's hold per run, as alice inside the held task's namespaces, root and cwd. Gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL` and `CRFUZZ_SEED`. Must exist inside the task's root. 15 s watchdog; a failure is logged, never a finding. |
 | `--layout PROG` | Run as root before **every** run (baseline, discovery, confirm, each minimization, each campaign seed) to restore the starting filesystem. A failure makes the run invalid. |
 | `--scope DIR` | Repeatable. Only holds whose absolute path is under one of the DIRs (where the attacker can act) become windows. Default: every hold with a path. |
-| `--timeout SECS` | End a run still going after SECS (default 60): `RuntimeError`. Recorded in the schedule; `replay` uses it. |
+| `--timeout SECS` | End a run still going after SECS (1 to 30, default 30): `RuntimeError`. Recorded in the schedule; `replay` uses it. |
 | `-v` | Print every run's decision log (baseline, discovery, confirm, minimize). Without it no decision log is printed; a `replay` that fails says to rerun with `-v`. |
 
 Every seed first runs a **baseline** (no mutator) under that seed that must
@@ -106,7 +106,7 @@ sweep goes on. Needs root and a running `scx_crfuzz_gated`.
 
 **Exit status**: 0 finished, no findings; 3 finished with a confirmed finding
 (`replay`: a confirmed Violation); 2 a usage error (the usage on stderr); 1
-any other error.
+any other error, including a `replay` that does not reproduce its schedule.
 
 **Outcome classes** (one per run): `Violation` (alice can reach, or has
 changed, the canary) / `RuntimeRefused` (the SUT exited nonzero: it noticed) /

@@ -14,8 +14,8 @@
 //! its target is unmutated. `--layout PROG` (absolute, recorded in the
 //! schedule) runs as root before every run to restore the starting
 //! filesystem, so no run sees what an earlier one's SUT or mutator left
-//! behind; a failure makes the run invalid. `--timeout SECS` (default 60,
-//! recorded) ends a run still going.
+//! behind; a failure makes the run invalid. `--timeout SECS` (1 to 30,
+//! default 30, recorded) ends a run still going.
 //!
 //! Window k's schedule (§3.8) goes to `DIR/runs/<seed>/<k>.sched` and a row to
 //! `DIR/runs.tsv`. A Violation repeating a finding (`Dedup::repeated_by`) is
@@ -34,7 +34,7 @@
 //!
 //! `-v` prints every run's decisions. Exit status: 0 done, 3 done with a
 //! confirmed finding (`replay`: a confirmed Violation), 2 a usage error, 1
-//! any other error. Needs root and a running scx_crfuzz_gated.
+//! any other error (`replay`: the schedule not reproduced). Needs root and a running scx_crfuzz_gated.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -133,7 +133,7 @@ fn crfuzz() -> anyhow::Result<i32> {
     let num = |args: &mut Args, flag: &str| -> Result<u64> { val(args, flag)?.parse().map_err(|_| usage(format!("{flag}: not a number"))) };
     let mut args = std::env::args().skip(1);
     let (mut mutator, mut layout, mut attacker, mut scope) = (None, None, None, Vec::<PathBuf>::new());
-    let (mut verbose, mut timeout) = (false, schedule::TIMEOUT);
+    let (mut verbose, mut timeout) = (false, 30);
     // campaign: DIR and the seeds; loaded: the schedule to replay.
     let (campaign, loaded, cmd) = match args.next().as_deref() {
         Some("-h" | "--help") => {
@@ -172,7 +172,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                     Some("--mutator") => mutator = Some(std::fs::canonicalize(val(&mut args, "--mutator")?).context("--mutator")?),
                     Some("--layout") => layout = Some(std::fs::canonicalize(val(&mut args, "--layout")?).context("--layout")?),
                     Some("--scope") => scope.push(std::fs::canonicalize(val(&mut args, "--scope")?).context("--scope")?),
-                    Some("--timeout") => timeout = num(&mut args, "--timeout")?,
+                    Some("--timeout") => timeout = Some(num(&mut args, "--timeout")?).filter(|t| (1..=30).contains(t)).ok_or_else(|| usage("--timeout: 1 to 30 seconds".into()))?,
                     Some("-v") => verbose = true,
                     Some("--") => break args.collect(),
                     Some(a) => return Err(usage(format!("unknown argument {a}"))),
@@ -408,8 +408,9 @@ fn crfuzz() -> anyhow::Result<i32> {
         let (end, targets, secs) = baseline(s.seed, &mut log).inspect_err(hint)?;
         println!("{}", telemetry(&log, targets.len(), secs));
         println!("discovery: {}", s.class);
-        let confirmed = confirm(&s, end, &mut log, "").inspect_err(hint)?;
-        return Ok(if confirmed.is_some() && s.class == "Violation" { 3 } else { 0 });
+        // Not reproduced in CONFIRM_TRIES: an error, never a clean exit.
+        confirm(&s, end, &mut log, "").and_then(|c| c.with_context(|| format!("not reproduced in {CONFIRM_TRIES} tries: {}", s.class))).inspect_err(hint)?;
+        return Ok(if s.class == "Violation" { 3 } else { 0 });
     };
 
     // §3.10: the sweep. Each row is written as its run ends: an interrupted

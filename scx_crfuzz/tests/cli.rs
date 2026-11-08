@@ -44,6 +44,8 @@ fn usage_errors_exit_2() {
         run(&["--seeds"]),
         run(&["--seeds", "x", "--", "/bin/true"]),
         run(&["--timeout", "-1", "--seeds", "1", "--", "/bin/true"]),
+        run(&["--timeout", "0", "--seeds", "1", "--", "/bin/true"]),
+        run(&["--timeout", "31", "--seeds", "1", "--", "/bin/true"]),
         run(&["--seeds", "1", "--bogus", "--", "/bin/true"]),
         run(&["--seeds", "1"]),
         run(&["--seeds", "1", "--"]),
