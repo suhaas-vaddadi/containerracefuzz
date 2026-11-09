@@ -14,7 +14,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
-pub(crate) const ROOT: &str = "/var/lib/crfuzz";
+pub const ROOT: &str = "/var/lib/crfuzz";
 
 /// What the write half compares, with `Entry::id`: everything but times.
 #[derive(Debug, PartialEq)]

@@ -1,5 +1,5 @@
-//! The judged CLI (§1, §10). `missing_attacker_refused` and
-//! `usage_errors_exit_2` need nothing; the rest need root and a running
+//! The judged CLI (§1, §10). `missing_attacker_refused`,
+//! `usage_errors_exit_2` and `private_refused` need nothing; the rest need root and a running
 //! `scx_crfuzz gated`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
@@ -46,10 +46,15 @@ fn usage_errors_exit_2() {
         run(&["--timeout", "-1", "--seeds", "1", "--", "/bin/true"]),
         run(&["--timeout", "0", "--seeds", "1", "--", "/bin/true"]),
         run(&["--timeout", "31", "--seeds", "1", "--", "/bin/true"]),
+        run(&["--seeds", "0", "--", "/bin/true"]),
+        run(&["--time", "0", "--", "/bin/true"]),
+        run(&["--time", "1d", "--", "/bin/true"]),
+        run(&["--time"]),
         run(&["--seeds", "1", "--bogus", "--", "/bin/true"]),
         run(&["--seeds", "1"]),
         run(&["--seeds", "1", "--"]),
-        run(&["--", "/bin/true"]),
+        run(&["--jobs", "2", "--", "/bin/true"]),
+        run(&["--jobs", "0", "--private", "/tmp", "--", "/bin/true"]),
         vec!["run", "/tmp/crfuzz_cli_none", "--attacker", "1", "--seeds", "1", "--", "/bin/true"],
         vec!["replay"],
         vec!["replay", "a", "b"],
@@ -65,6 +70,20 @@ fn usage_errors_exit_2() {
         let (out, _) = crfuzz(&[args]);
         assert_eq!(out.status.code(), Some(0), "{args}");
         assert!(String::from_utf8_lossy(&out.stdout).starts_with(want), "{args}");
+    }
+}
+
+/// `--private` overlapping the canaries or holding DIR, or not a directory:
+/// refused before anything starts (DIR never created).
+#[test]
+fn private_refused() {
+    let d = "/tmp/crfuzz_cli_private/out";
+    for (private, why) in [("/var/lib", "where the canaries must stay shared"), ("/tmp", "holds DIR"), ("/etc/passwd", "not a directory")] {
+        let (out, pid) = crfuzz(&["run", d, "--attacker", "1:1", "--jobs", "2", "--private", private, "--", "/bin/true"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{private}: {err}");
+        assert!(err.contains(why), "{private}: {err}");
+        assert!(left(pid).is_empty() && !std::path::Path::new(d).exists());
     }
 }
 
