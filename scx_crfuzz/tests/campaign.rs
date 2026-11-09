@@ -1,5 +1,5 @@
 //! M8: a campaign over check_use dedups to findings on `p`; over the corrected
-//! bundle, none. Needs root, a running scx_crfuzz_gated and cc:
+//! bundle, none. Needs root, a running `scx_crfuzz gated` and cc:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -13,17 +13,18 @@ const D: &str = "/tmp/crfuzz_campaign";
 /// seed: the second seed's are repeats.
 const SEEDS: usize = 2;
 
-/// A campaign's stdout; fails on a crfuzz error. Removes the canaries it kept.
-fn campaign(dir: &Path, cmd: &[&str], m: &Path, layout: &Path) -> String {
-    let seeds = SEEDS.to_string();
-    let mut args = vec!["--campaign", dir.to_str().unwrap(), "--seeds", &seeds, "--attacker", "65534:65534"];
+/// A campaign's stdout, seeds `first..`; fails unless it exits `code`.
+/// Removes the canaries it kept.
+fn campaign(dir: &Path, first: u64, cmd: &[&str], m: &Path, layout: &Path, code: i32) -> String {
+    let (seeds, first) = (SEEDS.to_string(), first.to_string());
+    let mut args = vec!["run", dir.to_str().unwrap(), "--seeds", &seeds, "--first-seed", &first, "--attacker", "65534:65534"];
     args.extend(["--mutator", m.to_str().unwrap(), "--layout", layout.to_str().unwrap(), "--"]);
     args.extend(cmd);
     let child = Command::new(env!("CARGO_BIN_EXE_scx_crfuzz")).args(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let pid = child.id();
     let res = child.wait_with_output().unwrap();
     let out = String::from_utf8_lossy(&res.stdout).into_owned();
-    assert!(res.status.success(), "{out}\n{}", String::from_utf8_lossy(&res.stderr));
+    assert_eq!(res.status.code(), Some(code), "{out}\n{}", String::from_utf8_lossy(&res.stderr));
     for e in fs::read_dir("/var/lib/crfuzz").unwrap().flatten() {
         if e.file_name().to_string_lossy().starts_with(&format!("canary-{pid}-")) {
             fs::remove_dir_all(e.path()).unwrap();
@@ -35,7 +36,8 @@ fn campaign(dir: &Path, cmd: &[&str], m: &Path, layout: &Path) -> String {
 
 /// Schedules under `DIR/runs/<seed>/`.
 fn runs(dir: &Path) -> usize {
-    fs::read_dir(dir.join("runs")).unwrap().map(|s| fs::read_dir(s.unwrap().path()).unwrap().count()).sum()
+    let scheds = |s: fs::DirEntry| fs::read_dir(s.path()).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "sched")).count();
+    fs::read_dir(dir.join("runs")).unwrap().map(|s| scheds(s.unwrap())).sum()
 }
 
 fn line<'a>(out: &'a str, prefix: &str) -> &'a str {
@@ -68,7 +70,8 @@ fn campaign_dedups() {
     let (sut_s, p_s) = (sut.to_str().unwrap(), p.to_str().unwrap());
 
     let c = d.join("bug");
-    let out = campaign(&c, &[sut_s, p_s], &m, &layout);
+    // 3: a confirmed finding.
+    let out = campaign(&c, 0, &[sut_s, p_s], &m, &layout, 3);
     assert!(line(&out, "campaign: ").contains(" 0 invalid"), "{out}");
     let n: usize = line(&out, "findings: ").parse().unwrap();
     assert!(n >= 1, "{out}");
@@ -82,6 +85,12 @@ fn campaign_dedups() {
     let rows: Vec<Vec<&str>> = tsv.lines().skip(1).map(|l| l.split('\t').collect()).collect();
     assert_eq!(runs(&c), rows.len(), "{tsv}");
     assert!(rows.iter().any(|r| r[3] == "repeat"), "{tsv}");
+    // A new finding's window log: its discovery, then its confirm and minimize runs.
+    let r = rows.iter().find(|r| r[3] == "new").unwrap();
+    let wlog = fs::read_to_string(c.join(format!("runs/{}/{}.log", r[0], r[1]))).unwrap();
+    let heads: Vec<&str> = wlog.lines().filter(|l| l.starts_with("== ")).collect();
+    assert!(heads.len() >= 3 && heads[..2] == ["== discovery", "== confirm 1/3"] && heads[2].starts_with("== minimize step "), "{wlog}");
+    assert!(fs::read_to_string(c.join(format!("runs/{}/baseline.log", r[0]))).unwrap().starts_with("== baseline\n"));
     for i in 1..=n {
         let f = c.join(format!("findings/{i}"));
         let mut want: Vec<String> = rows.iter().filter(|r| r[4] == i.to_string()).map(|r| format!("{}:{}", r[0], r[1])).collect();
@@ -94,9 +103,13 @@ fn campaign_dedups() {
     }
 
     let c = d.join("fixed");
-    let out = campaign(&c, &[sut_s, p_s, "nofollow"], &m, &layout);
+    let out = campaign(&c, 5, &[sut_s, p_s, "nofollow"], &m, &layout, 0);
     assert_eq!(line(&out, "findings: "), "0", "{out}");
     assert_eq!(line(&out, "seeds: "), format!("{SEEDS} safe, 0 unsafe, 0 incomplete, 0 no windows"), "{out}");
-    assert_eq!(fs::read_dir(c.join("runs")).unwrap().count(), SEEDS);
+    // Seeds 5 and 6, counted from 1 within the run.
+    let mut seeds: Vec<String> = fs::read_dir(c.join("runs")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    seeds.sort();
+    assert_eq!(seeds, ["5", "6"]);
+    assert_eq!(out.lines().filter_map(|l| l.strip_prefix("[2/2] seed 6: ")).last(), Some("safe"), "{out}");
     fs::remove_dir_all(d).unwrap();
 }

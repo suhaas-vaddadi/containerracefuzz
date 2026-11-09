@@ -46,6 +46,19 @@ pub struct Entry {
 /// Keyed by path relative to the canary directory; "" is the gate itself.
 pub type Tree = BTreeMap<PathBuf, Entry>;
 
+/// ROOT and its ancestors, those present, are root-owned, not group or other
+/// writable, and not symlinks: a parent alice can write lets her swap the gate.
+pub fn root_only() -> Result<()> {
+    for a in Path::new(ROOT).ancestors() {
+        let m = match fs::symlink_metadata(a) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            m => m.with_context(|| a.display().to_string())?,
+        };
+        ensure!(m.uid() == 0 && m.mode() & 0o022 == 0 && !m.file_type().is_symlink(), "{} is not root-only", a.display());
+    }
+    Ok(())
+}
+
 /// Removes itself on drop unless `keep()` was called (§10.2).
 pub struct Canary {
     pub dir: PathBuf,
@@ -63,11 +76,7 @@ impl Canary {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e).context(ROOT),
             _ => {}
         }
-        // A parent alice can write lets her swap the gate itself.
-        for a in Path::new(ROOT).ancestors() {
-            let m = fs::symlink_metadata(a)?;
-            ensure!(m.uid() == 0 && m.mode() & 0o022 == 0 && !m.file_type().is_symlink(), "{} is not root-only", a.display());
-        }
+        root_only()?;
         let mut raw = [0u8; 16];
         File::open("/dev/urandom")?.read_exact(&mut raw)?;
         let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();

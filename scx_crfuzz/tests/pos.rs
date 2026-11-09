@@ -1,4 +1,4 @@
-//! Milestone 4 on the real backend. Needs root, a running scx_crfuzz_gated:
+//! Milestone 4 on the real backend. Needs root, a running `scx_crfuzz gated`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 

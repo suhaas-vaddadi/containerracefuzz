@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fuzz a containerd -> shim -> runc container startup with the mutator in
-# tests/fixtures/mutator_all.c. Needs root and a running scx_crfuzz_gated.
+# tests/fixtures/mutator_all.c. Needs root; scx_crfuzz loads the gate scheduler.
 #
 #   fuzz_containerd.sh <seeds>
 #
@@ -9,7 +9,6 @@
 #
 # Env (optional):
 #   CRFUZZ_BIN       scx_crfuzz binary      [<repo>/target-linux/debug/scx_crfuzz]
-#   CRFUZZ_GATED     scx_crfuzz_gated bin   [<repo>/target-linux/debug/scx_crfuzz_gated]
 #   CRFUZZ_ATTACKER  attacker UID:GID       [65534:65534]
 #   CRFUZZ_DIR       scratch directory      [/tmp/crfuzz-containerd]
 #   CRFUZZ_IMAGE     static busybox to use  [/usr/bin/busybox]
@@ -19,7 +18,8 @@
 #
 # Logs, under $CRFUZZ_DIR/logs/: scx_crfuzz.log (campaign output), mutator.log
 # and containerd.log (appended, one "==" header per SUT run). Results are in
-# $CRFUZZ_DIR/campaign (runs.tsv, runs/, findings/).
+# $CRFUZZ_DIR/campaign (runs.tsv, runs/, findings/). Exits as scx_crfuzz run
+# does: 3 if there is a finding.
 #
 # The container's cgroup is placed under the run cgroup (ctr --cgroup), so runc
 # init and the container are tracked. Known limit (spec L:Engine): a hold inside
@@ -36,7 +36,6 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo=$(CDPATH= cd -- "$here/../.." && pwd)
 
 CRFUZZ_BIN=${CRFUZZ_BIN:-$repo/target-linux/debug/scx_crfuzz}
-CRFUZZ_GATED=${CRFUZZ_GATED:-$repo/target-linux/debug/scx_crfuzz_gated}
 CRFUZZ_ATTACKER=${CRFUZZ_ATTACKER:-65534:65534}
 CRFUZZ_DIR=${CRFUZZ_DIR:-/tmp/crfuzz-containerd}
 CRFUZZ_IMAGE=${CRFUZZ_IMAGE:-/usr/bin/busybox}
@@ -51,11 +50,6 @@ agid=${CRFUZZ_ATTACKER##*:}
 
 CONTAINERD=$(command -v containerd) || { echo "$0: containerd not on PATH" >&2; exit 1; }
 CTR=$(command -v ctr) || { echo "$0: ctr not on PATH" >&2; exit 1; }
-
-if [ -x "$CRFUZZ_GATED" ]; then
-	"$CRFUZZ_GATED" --status 2>/dev/null | grep -q '^state: *enabled' ||
-		echo "warning: sched_ext not enabled; start $CRFUZZ_GATED first" >&2
-fi
 
 # Fresh scratch: rootfs, static mutator (also mirrored at the same absolute path
 # inside the rootfs, so it exists in the held task's view), SUT and layout.
@@ -125,7 +119,7 @@ echo | tee -a "$log"
 # The SUT inherits this cwd: keep relative paths out of the repo.
 cd "$CRFUZZ_DIR"
 set +e
-"$CRFUZZ_BIN" --campaign "$CRFUZZ_DIR/campaign" --seeds "$SEEDS" \
+"$CRFUZZ_BIN" run "$CRFUZZ_DIR/campaign" --seeds "$SEEDS" \
 	--attacker "$CRFUZZ_ATTACKER" \
 	--mutator "$CRFUZZ_DIR/mut/mutator_all" \
 	--layout "$CRFUZZ_DIR/layout.sh" \

@@ -1,5 +1,5 @@
 //! M7: a discovered Violation is written as a schedule, confirmed by replay
-//! and minimized to one hold. Needs root, a running scx_crfuzz_gated and cc:
+//! and minimized to one hold; `replay` does it again from the file. Needs root, a running `scx_crfuzz gated` and cc:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -10,13 +10,13 @@ use std::process::{Command, Stdio};
 
 const D: &str = "/tmp/crfuzz_replay";
 
-/// crfuzz's stdout; fails on an invalid run. Removes the canaries it kept.
-fn crfuzz(args: &[&str]) -> String {
+/// crfuzz's stdout; fails unless it exits `code`. Removes the canaries it kept.
+fn crfuzz(args: &[&str], code: i32) -> String {
     let child = Command::new(env!("CARGO_BIN_EXE_scx_crfuzz")).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let pid = child.id();
     let res = child.wait_with_output().unwrap();
     let out = String::from_utf8_lossy(&res.stdout).into_owned();
-    assert!(res.status.success(), "{out}\n{}", String::from_utf8_lossy(&res.stderr));
+    assert_eq!(res.status.code(), Some(code), "{out}\n{}", String::from_utf8_lossy(&res.stderr));
     for e in fs::read_dir("/var/lib/crfuzz").unwrap().flatten() {
         if e.file_name().to_string_lossy().starts_with(&format!("canary-{pid}-")) {
             fs::remove_dir_all(e.path()).unwrap();
@@ -53,24 +53,29 @@ fn discover_confirm_minimize() {
     let layout = d.join("layout.sh");
     fs::write(&layout, format!("#!/bin/sh\nrm -f {p}\n: > {p}\n", p = p.display())).unwrap();
     fs::set_permissions(&layout, fs::Permissions::from_mode(0o755)).unwrap();
-    let log = d.join("schedule");
-    let (log_s, m_s, l_s, sut_s, p_s) = (log.to_str().unwrap(), m.to_str().unwrap(), layout.to_str().unwrap(), sut.to_str().unwrap(), p.to_str().unwrap());
+    let c = d.join("camp");
+    let (c_s, m_s, l_s, sut_s, p_s) = (c.to_str().unwrap(), m.to_str().unwrap(), layout.to_str().unwrap(), sut.to_str().unwrap(), p.to_str().unwrap());
 
-    // Seed 0 runs every window; each Violating window k is written to
-    // `schedule.k`, confirmed and minimized to its one hold.
-    let out = crfuzz(&["--attacker", "65534:65534", "--mutator", m_s, "--layout", l_s, "--log", log_s, "--", sut_s, p_s]);
+    // Seed 0 runs every window; each new Violation is confirmed and minimized
+    // to its one hold, and is finding n. 3: a confirmed finding.
+    let out = crfuzz(&["run", c_s, "--seeds", "1", "--timeout", "30", "--attacker", "65534:65534", "--mutator", m_s, "--layout", l_s, "--", sut_s, p_s], 3);
     eprintln!("{out}");
-    let scheds = line(&out, "schedule: ");
-    assert!(!scheds.is_empty() && line(&out, "seed 0: ") == ["unsafe"], "{out}");
-    assert_eq!(line(&out, "confirmed: "), vec!["Violation"; scheds.len()], "{out}");
-    let guilty = line(&out, "guilty: step ");
-    assert_eq!(guilty.len(), scheds.len(), "one hold each: {out}");
+    let new = out.lines().filter(|l| l.ends_with(": Violation, confirming")).count();
+    assert!(new > 0 && line(&out, "[1/1] seed 0: ").last() == Some(&"unsafe"), "{out}");
+    assert_eq!(line(&out, "  confirmed: "), vec!["Violation"; new], "{out}");
+    let guilty = line(&out, "  guilty: step ");
+    assert_eq!(guilty.len(), new, "one hold each: {out}");
+    // Without -v, no decision log.
+    assert!(!out.contains("Decision {"), "{out}");
+    let sched = c.join("findings/1/schedule");
+    assert!(fs::read_to_string(&sched).unwrap().contains("\ntimeout 30\n"));
 
-    // Left as the last minimization run's SUT made it: --replay resets it.
-    let again = crfuzz(&["--replay", scheds[0]]);
+    // Left as the last minimization run's SUT made it: replay resets it.
+    let again = crfuzz(&["replay", sched.to_str().unwrap(), "-v"], 3);
     eprintln!("{again}");
     assert_eq!(line(&again, "confirmed: "), ["Violation"], "{again}");
     assert_eq!(line(&again, "guilty: step "), guilty[..1], "{again}");
+    assert!(again.lines().any(|l| l.starts_with("Decision {")), "-v: {again}");
     // The guilty hold is one of the SUT's own on `p`.
     assert!(guilty[0].contains(p_s), "{}", guilty[0]);
     fs::remove_dir_all(d).unwrap();

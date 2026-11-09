@@ -1,7 +1,7 @@
 //! D4 on Go: clones are released without a POS decision, so holding them
 //! doesn't stall stop-the-world (the runtime clones without handing off its
 //! P), and every thread gets a creation-tree name. Needs root, a running
-//! scx_crfuzz_gated, `go`:
+//! `scx_crfuzz gated`, `go`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
