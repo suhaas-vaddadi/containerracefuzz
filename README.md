@@ -20,14 +20,12 @@ one hold that causes it.
 
 ### Quickstart
 
-Build, start the gate daemon (one per machine, leave it running), then fuzz
-the bundled check-then-use fixture: root `stat`s a path in a directory the
-attacker owns, then opens and writes it.
+Build, then fuzz the bundled check-then-use fixture: root `stat`s a path in
+a directory the attacker owns, then opens and writes it. `scx_crfuzz` loads
+its gate scheduler itself (see below).
 
 ```sh
 cargo build --release
-sudo target/release/scx_crfuzz_gated &          # until SIGINT
-sudo target/release/scx_crfuzz_gated --status   # expect: enabled
 
 # The scenario: alice (65534) owns /tmp/q/alice; the SUT runs as root on alice/p.
 mkdir -p /tmp/q/alice && sudo chown 65534:65534 /tmp/q/alice
@@ -67,8 +65,8 @@ sudo target/release/scx_crfuzz run /tmp/q/camp-fixed --seeds 8 --attacker 65534:
   --mutator /tmp/q/swap.sh --layout /tmp/q/layout.sh -- /tmp/q/check_use /tmp/q/alice/p nofollow
 ```
 
-Stop the daemon with Ctrl-C (or `kill -INT`). If a crash leaves gated tasks
-behind, `sudo scx_crfuzz_gated --reset` clears every gate.
+If a crash leaves gated tasks behind, `sudo scx_crfuzz reset` clears every
+gate.
 
 ### `scx_crfuzz`
 
@@ -76,6 +74,7 @@ behind, `sudo scx_crfuzz_gated --reset` clears every gate.
 scx_crfuzz run DIR --attacker UID:GID --seeds N [--first-seed S] [--mutator PROG]
                [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 scx_crfuzz replay FILE [-v]
+scx_crfuzz gated | status | reset
 scx_crfuzz --help | -h
 scx_crfuzz --version | -V
 ```
@@ -102,7 +101,7 @@ A seed ends with a verdict: `safe` (every window valid, mutated and not a
 Violation), `unsafe` (some window a Violation), `incomplete` (else: a window
 invalid or its target never reached), or `no windows` (no mutator or no
 target: one unmutated run). An invalid run or baseline is recorded and the
-sweep goes on. Needs root and a running `scx_crfuzz_gated`.
+sweep goes on. Needs root.
 
 **Exit status**: 0 finished, no findings; 3 finished with a confirmed finding
 (`replay`: a confirmed Violation); 2 a usage error (the usage on stderr); 1
@@ -115,18 +114,22 @@ seeds complete`; a second signal kills at once.
 changed, the canary) / `RuntimeRefused` (the SUT exited nonzero: it noticed) /
 `RuntimeError` (signal, the `--timeout` deadline, or a failing baseline) / `Clean`.
 
-### `scx_crfuzz_gated`
+### The gate scheduler
 
 ```
-scx_crfuzz_gated            run the daemon (until SIGINT or ejection)
-scx_crfuzz_gated --status   sched_ext state + pins
-scx_crfuzz_gated --reset    delete every gate entry of every run
+scx_crfuzz gated    hold the gate scheduler in the foreground (until SIGINT/SIGTERM or ejection)
+scx_crfuzz status   sched_ext state, scheduler and pins
+scx_crfuzz reset    delete every gate entry of every run
 ```
 
-One scheduler per machine. It refuses to start if another `sched_ext`
-scheduler is enabled or another daemon holds its lockfile. A gated task held
-past 30 s trips the `sched_ext` watchdog, which ejects the scheduler and
-releases every run; `scx_crfuzz` detects that and fails the run.
+One gate scheduler per machine, shared by every crfuzz process. `run` and
+`replay` use the one running, or, with `sched_ext` disabled, load their own
+and hold it until they exit (a kill leaves stale pins, which are harmless
+and removed by the next load). Start `scx_crfuzz gated` to keep one up
+across processes (the on-target tests need it). If another `sched_ext` scheduler is enabled, crfuzz refuses and names it
+(`/sys/kernel/sched_ext/root/ops`). A gated task held past 30 s trips the
+`sched_ext` watchdog, which ejects the scheduler and releases every run;
+`scx_crfuzz` reports that and fails the run.
 
 ## How it works
 
@@ -139,7 +142,7 @@ releases every run; `scx_crfuzz` detects that and fails the run.
                            mutator (as alice)   decision log ─▶ schedule file
 ```
 
-1. **Hold** (`backend.rs`, `scx_crfuzz_gate`). The SUT starts in its own
+1. **Hold** (`backend.rs`, `gate.rs`). The SUT starts in its own
    cgroup, enrolled in `SCHED_EXT`, with a seccomp filter that turns each
    watched path syscall into a user notification: the thread sleeps until it
    is answered. While the mutator runs, every thread of the SUT tree is gated
@@ -234,10 +237,10 @@ scx_crfuzz/                engine, backend, POS, oracle, schedule, CLI
   src/oracle.rs            canary, attacker identity, outcome class
   src/schedule.rs          schedule file, fixed-schedule policy, finding
                            normalization, dedup, canonical partial order
-  src/main.rs              CLI: single run, replay, campaign
+  src/gate.rs              loads the gate scheduler; GateMap, its client
+  src/bpf/main.bpf.c       the sched_ext gate scheduler
+  src/main.rs              CLI: run, replay, campaign, gated/status/reset
   tests/                   on-target tests and C/Go fixtures
-scx_crfuzz_gate/           sched_ext gate scheduler, daemon and GateMap client
-  src/bpf/main.bpf.c
 ```
 
 ## Testing
@@ -247,13 +250,13 @@ cargo test -p scx_crfuzz      # pure tests (POS, schedule); also runs on macOS
 ```
 
 The on-target tests are `#[ignore]`d and need root and a running
-`scx_crfuzz_gated`; some also need `cc`, `go`, `unshare`, `mount` or
+`scx_crfuzz gated`; some also need `cc`, `go`, `unshare`, `mount` or
 `setpriv` (see each file's header). Build them, then run each binary:
 
 ```sh
 cargo test -p scx_crfuzz --no-run
+sudo target/debug/scx_crfuzz gated &     # stop with sudo kill -TERM
 sudo env PATH=$PATH target/debug/deps/<suite>-<hash> --include-ignored --test-threads=1
-sudo -E cargo test -p scx_crfuzz_gate -- --ignored --test-threads=1
 ```
 
 ## Limitations

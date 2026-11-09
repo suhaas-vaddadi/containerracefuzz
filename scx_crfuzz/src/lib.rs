@@ -5,6 +5,8 @@ pub mod sensor;
 #[cfg(target_os = "linux")]
 pub mod engine;
 #[cfg(target_os = "linux")]
+pub mod gate;
+#[cfg(target_os = "linux")]
 pub mod oracle;
 pub mod pos;
 pub mod schedule;

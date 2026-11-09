@@ -1,6 +1,6 @@
 //! The judged CLI (§1, §10). `missing_attacker_refused` and
 //! `usage_errors_exit_2` need nothing; the rest need root and a running
-//! scx_crfuzz_gated:
+//! `scx_crfuzz gated`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -53,6 +53,8 @@ fn usage_errors_exit_2() {
         vec!["run", "/tmp/crfuzz_cli_none", "--attacker", "1", "--seeds", "1", "--", "/bin/true"],
         vec!["replay"],
         vec!["replay", "a", "b"],
+        vec!["gated", "x"],
+        vec!["status", "x"],
     ] {
         let (out, _) = crfuzz(&args);
         let err = String::from_utf8_lossy(&out.stderr);

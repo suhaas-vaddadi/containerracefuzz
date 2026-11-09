@@ -6,7 +6,13 @@ license = "GPL-2.0-only"
 
 [dependencies]
 anyhow = "1"
-scx_crfuzz_gate = { path = "../scx_crfuzz_gate" }
 
+# The gate's BPF only builds on Linux; elsewhere the crate builds without it
+# (spec §3.1).
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+libbpf-rs = "=0.27.2"
+scx_utils = "=1.1.4"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+scx_cargo = "=1.1.4"

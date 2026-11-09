@@ -837,15 +837,6 @@ name = "scx_crfuzz"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "libc",
- "scx_crfuzz_gate",
-]
-
-[[package]]
-name = "scx_crfuzz_gate"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "libbpf-rs",
  "libc",
  "scx_cargo",

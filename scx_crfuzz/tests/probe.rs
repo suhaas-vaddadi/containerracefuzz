@@ -1,5 +1,5 @@
 //! The read half at the final hold (§5) and read before. Needs root, a
-//! running scx_crfuzz_gated, `unshare`, `mount` and `setpriv`:
+//! running `scx_crfuzz gated`, `unshare`, `mount` and `setpriv`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
