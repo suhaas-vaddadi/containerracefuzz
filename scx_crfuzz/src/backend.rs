@@ -1,5 +1,5 @@
 //! GateBackend: park SUT threads at watched syscalls (seccomp user-notify) and
-//! stop the whole SUT tree with the gate (spec §3.3, L:Seccomp, L:Gate).
+//! stop the whole SUT tree with the gate scheduler while the mutator runs.
 //! Becoming alice needs Linux 5.11 (close_range CLOEXEC) and openat2 (5.6);
 //! older kernels fail every mutation and probe, so every judged run is invalid.
 
@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 const SCHED_EXT: i32 = 7;
 
-/// Syscalls that create a task; always watched, to name threads (D4).
+/// Syscalls that create a task; always watched, to name threads by their
+/// place in the creation tree.
 #[cfg(target_arch = "aarch64")]
 const CLONES: &[i64] = &[libc::SYS_clone, libc::SYS_clone3];
 #[cfg(target_arch = "x86_64")]
@@ -45,7 +46,8 @@ pub struct Event {
     pub id: u64,
     pub tid: u32,
     pub tgid: u32,
-    /// The thread's place in the creation tree (D4): the root is `0`, the
+    /// The thread's place in the creation tree (stable across runs, unlike a
+    /// tid): the root is `0`, the
     /// k-th task a thread creates is `<its name>/k`. `?<tid>` if unknown.
     pub thread: String,
     pub nr: i64,
@@ -53,7 +55,7 @@ pub struct Event {
     pub path: Option<PathBuf>,
     /// The dirfd a relative `path` resolves from; None: the cwd.
     pub dirfd: Option<i32>,
-    /// Conflict keys (D3); as best-effort as `path`.
+    /// Conflict keys; as best-effort as `path`.
     pub keys: Keys,
     /// The syscall's arguments, to re-walk `keys` after a mutation.
     pub args: [u64; 6],
@@ -88,7 +90,8 @@ pub struct GateBackend {
 impl GateBackend {
     /// Spawn `cmd` as the SUT: in the run cgroup, enrolled in SCHED_EXT, with
     /// `watched` syscalls trapping to us. Fails if the gate daemon isn't up
-    /// (never fall back to seccomp-only: L:Gate).
+    /// (never fall back to seccomp-only: without the gate the tree can't be
+    /// stopped while the mutator runs).
     pub fn spawn(mut cmd: Command, watched: &[i64]) -> Result<Self> {
         let exec_watched = watched.contains(&libc::SYS_execve);
         let watched: Vec<i64> = CLONES.iter().chain(watched).copied().collect::<BTreeSet<_>>().into_iter().collect();
@@ -121,7 +124,9 @@ impl GateBackend {
         // Between fork and exec: raw syscalls only, no allocation.
         unsafe {
             cmd.pre_exec(move || {
-                // Order matters (L:Seccomp): cgroup first, filter last.
+                // Order matters: the run cgroup first, so everything the SUT
+                // forks is tracked; the filter last, after the NO_NEW_PRIVS
+                // it requires.
                 if libc::write(procs_fd, b"0".as_ptr().cast(), 1) != 1 {
                     return Err(Error::last_os_error());
                 }
@@ -210,7 +215,7 @@ impl GateBackend {
 
     /// Wait up to `timeout` for held syscalls; returns every one ready now.
     /// Clones never show up: they touch no path, so they conflict with
-    /// nothing and are released here, one at a time to name the child (D4).
+    /// nothing and are released here, one at a time to name the child.
     pub fn poll(&mut self, timeout: Duration) -> Result<Poll> {
         self.advance_clones()?;
         let mut events = Vec::new();
@@ -288,7 +293,7 @@ impl GateBackend {
             self.names.retain(|t, _| before.contains(t));
             self.retry.retain(|t, _| before.contains(t));
             match notif_continue(self.notify.as_raw_fd(), id) {
-                // The index counts clone attempts (D4), so a failed clone still
+                // The index counts clone attempts, so a failed clone still
                 // uses its index. A childless clone redone as the parent's very
                 // next trap is the same attempt: a signal restart
                 // (ERESTARTNOINTR) or a retry (EAGAIN). That is decided by
@@ -360,7 +365,7 @@ impl GateBackend {
 
     /// Let a held syscall run as issued. Under a tree hold the thread stays
     /// gated until `ungate_tree`; answering first means a signal can't restart
-    /// the syscall mid-release (L:Gate).
+    /// the syscall mid-release.
     pub fn release(&mut self, ev: &Event) -> Result<()> {
         // A non-leader's execve takes over the leader's tid.
         // ponytail: moved on release, so a failed execve misnames both;
@@ -377,12 +382,13 @@ impl GateBackend {
         }
     }
 
-    /// Gate every process in the SUT tree (L:Seccomp: runc and runc init are
-    /// two tgids), child cgroups included (runc init moves into the
-    /// container's, placed under ours: §3.4). A gated process can't fork, so re-reading the cgroup until
-    /// no new tgid shows up catches children forked mid-sweep.
+    /// Gate every process in the SUT tree (runc and runc init are two tgids),
+    /// child cgroups included (runc init moves into the container's cgroup,
+    /// placed under ours). A gated process can't fork, so re-reading the
+    /// cgroup until no new tgid shows up catches children forked mid-sweep.
     // ponytail: a tgid forking in the kick's IPI latency after the final read
-    // escapes; same residual window as L:Gate's, close it with Gate phase 2.
+    // escapes, like the userspace round trip between a trap and its gate; a
+    // gate set in-kernel, in the trapping task's own context, would close both.
     pub fn gate_tree(&mut self) -> Result<()> {
         loop {
             let new: Vec<u32> = self.cgroup_ids("cgroup.procs")?.into_iter().filter(|t| !self.tree_gated.contains(t)).collect();
@@ -399,7 +405,7 @@ impl GateBackend {
 
     pub fn ungate_tree(&mut self) -> Result<()> {
         // A clone in flight couldn't run while gated: restart its wait, or a
-        // long hold would make it look failed and leave its child unnamed (D4).
+        // long hold would make it look failed and leave its child unnamed.
         if let Some((_, _, _, at)) = &mut self.in_flight {
             *at = Instant::now();
         }
@@ -429,7 +435,7 @@ impl GateBackend {
 impl Drop for GateBackend {
     fn drop(&mut self) {
         // Ungate before killing: a gated task can't run to act on SIGKILL, and
-        // would stall into the 30 s watchdog (L:Gate).
+        // would stall into sched_ext's 30 s watchdog.
         let _ = self.gate.clear();
         let _ = fs::write(self.cgroup.join("cgroup.kill"), "1");
         let _ = self.child.wait();
@@ -500,7 +506,8 @@ pub fn sweep() {
     }
 }
 
-/// Alice's credentials got past the canary gate (§4): the setup is wrong and
+/// Alice's credentials got past the canary gate (the self-check): the setup
+/// is wrong and
 /// the run is invalid. Not a primitive failure. Check with
 /// `err.is::<SelfCheckFailed>()`.
 #[derive(Debug)]
@@ -516,7 +523,7 @@ impl std::error::Error for SelfCheckFailed {}
 
 /// The held task's root is a canary entry: the SUT put it there, so no view
 /// alice could have starts from it. A primitive failure for the mutator; for
-/// the probe, only the handle check judges it (§10.5).
+/// the probe, only the handle check judges it.
 #[derive(Debug)]
 pub struct RootInCanary;
 
@@ -534,7 +541,7 @@ const SELF_CHECK: i32 = libc::ENOTRECOVERABLE;
 
 /// Who a child becomes in the held task's view.
 pub enum As<'a> {
-    /// The held task's own ids (D6): the mutator.
+    /// The held task's own ids: the mutator, unjudged.
     Held,
     /// Alice's, mapped into the held task's user namespace, caps set to hers,
     /// NO_NEW_PRIVS: the judged mutator and the probes.
@@ -553,7 +560,8 @@ struct View {
     groups: Vec<u32>,
     /// Some: alice's CapEff, set as effective and permitted, then NO_NEW_PRIVS.
     caps: Option<u64>,
-    /// §4: the canary path, whether root can't find it in this view either,
+    /// The self-check: the canary path, whether root can't find it in this
+    /// view either,
     /// whether root finds the gate itself there, and the gate's `(dev, ino)`.
     gate: Option<(CString, bool, bool, (u64, u64))>,
     /// The canary's `(dev, ino)`s: a root or cwd among them is the held
@@ -612,8 +620,9 @@ impl GateBackend {
             map("gid_map", &mut gid)?;
             map("gid_map", &mut groups)?;
         }
-        // §4: ENOENT passes only if root cannot find the canary in the task's
-        // view either.
+        // Alice's ENOENT passes only if root cannot find the canary in the
+        // task's view either (runc: the canary is on the host, outside the
+        // rootfs); otherwise she should have hit the gate.
         let gate = match canary {
             Some(c) => {
                 let gate = CString::new(c.dir.as_os_str().as_bytes())?;
@@ -637,12 +646,14 @@ impl GateBackend {
     }
 
     /// Run the mutator `prog` on held event `ev` in its task's view (`view`).
-    /// Judged, as alice (§10.1): her ids mapped into the task's user namespace,
-    /// her caps, NO_NEW_PRIVS, self-checked against the canary at the given
-    /// path (§4); unjudged, with the task's own ids (D6). `prog` gets the path
+    /// Judged, as alice (not the held task: wherever it outranks her, the
+    /// self-check would fail, and that is every hold a race matters at): her
+    /// ids mapped into the task's user namespace, her caps, NO_NEW_PRIVS,
+    /// self-checked against the canary at the given path; unjudged, with the
+    /// task's own ids. `prog` gets the path
     /// as issued; killed after `timeout`. CRFUZZ_CANARY names a fresh
     /// directory each run (and replay): choices must come from CRFUZZ_SEED,
-    /// never from that name, or replay can't fire the same mutation (D6).
+    /// never from that name, or replay can't fire the same mutation.
     // ponytail: `prog` is exec'd after the chroot, so it (and a script's
     // interpreter) must exist inside the task's root; exec it from an fd opened
     // beforehand once a target has its own root (runc).
@@ -722,7 +733,7 @@ impl GateBackend {
         }
     }
 
-    /// The read half (§5) at the final hold `ev`: as alice in its view, `stat`
+    /// The read half at the final hold `ev`: as alice in its view, `stat`
     /// the footprint and every mount point, and look for the token in each
     /// regular file she can open; then, as root, the task's own handles if it
     /// runs as alice. Killed after `timeout`; any failure makes the run invalid.
@@ -893,22 +904,24 @@ fn cached_id(f: &File) -> Option<(u64, u64)> {
     (r == 0).then(|| (libc::makedev(st.stx_dev_major, st.stx_dev_minor), st.stx_ino))
 }
 
-/// §4's root-side look: true iff `path` is not in the view rooted at `root`
-/// at all. Any other error counts as present, so alice must then get EACCES.
+/// The self-check's root-side look: true iff `path` is not in the view rooted
+/// at `root` at all. Any other error counts as present, so alice must then
+/// get EACCES.
 fn absent(root: &File, path: &CStr, flags: i32) -> bool {
     matches!(open_in(root, path, flags), Err(e) if e.raw_os_error() == Some(libc::ENOENT))
 }
 
-/// §5 read before: before the SUT, alice must be stopped at every canary
+/// Read before: before the SUT, alice must be stopped at every canary
 /// entry: EACCES, or ENOENT where root can't find it in this view either.
-/// Catches a gate she can search but not read, which §4's open passes.
+/// Catches a gate she can search but not read, which the self-check's open
+/// passes.
 pub fn read_before(canary: &Canary, alice: &Alice) -> Result<()> {
     let dir = |p: &str| File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(p);
     let root = dir("/")?;
     let entries = canary
         .before
         .keys()
-        .filter(|k| !k.as_os_str().is_empty()) // the gate: §4's check, in enter()
+        .filter(|k| !k.as_os_str().is_empty()) // the gate: the self-check's, in enter()
         .map(|k| {
             let p = CString::new(canary.dir.join(k).as_os_str().as_bytes())?;
             // O_NOFOLLOW: a symlink entry is checked itself, not its target.
@@ -968,7 +981,7 @@ pub fn read_before(canary: &Canary, alice: &Alice) -> Result<()> {
 impl View {
     /// Between fork and exec (or _exit): raw syscalls only, no allocation.
     /// User namespace first: it grants the capabilities to enter the mount
-    /// namespace it owns. The §4 self-check last, with the final credentials.
+    /// namespace it owns. The self-check last, with the final credentials.
     unsafe fn enter(&self) -> std::io::Result<()> {
         let ok = |r: i32| if r < 0 { Err(Error::last_os_error()) } else { Ok(()) };
         // An fd crfuzz inherited without CLOEXEC would reach the mutator.
@@ -986,11 +999,11 @@ impl View {
         ok(libc::fchdir(self.root.as_raw_fd()))?;
         ok(libc::chroot(b".\0".as_ptr().cast()))?;
         // A cwd (or dirfd) inside the canary is the held task's: resolve from
-        // the root instead, which can only miss (§9).
+        // the root instead, which can only miss a finding.
         // ponytail: fchdir runs as root, so outside the canary alice may start
         // in a directory she could not reach by path (a 0777 dir under a 0700
         // one): a mutator there exceeds her. Check she can reach it, falling
-        // back to the root, if false findings show up there (§9).
+        // back to the root, if false findings show up there.
         if !self.inside(&self.cwd) {
             ok(libc::fchdir(self.cwd.as_raw_fd()))?;
         }
@@ -1018,8 +1031,8 @@ impl View {
         if self.inside(&self.root) {
             return Err(Error::from_raw_os_error(SELF_CHECK));
         }
-        // §4, last: with the final credentials the gate must stop us, or
-        // nothing that runs from here is really alice.
+        // The self-check, last: with the final credentials the gate must stop
+        // us, or nothing that runs from here is really alice.
         let fd = libc::open(gate.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
         if fd >= 0 {
             // Something else at the gate's path (a mount in the task's view)
@@ -1140,7 +1153,7 @@ fn path_args(nr: i64) -> &'static [(Option<usize>, usize, bool)] {
     }
 }
 
-/// The event's path and its conflict keys (D3): every key a path walk passes
+/// The event's path and its conflict keys: every key a path walk passes
 /// is read; a rebind writes the final name and object of each path it changes.
 fn observe(tid: u32, nr: i64, args: &[u64; 6]) -> (Option<PathBuf>, Keys) {
     let mut k = Keys::default();
@@ -1176,7 +1189,7 @@ fn observe(tid: u32, nr: i64, args: &[u64; 6]) -> (Option<PathBuf>, Keys) {
 
 /// Resolve `path` as `tid` would (from its root, cwd, or `dirfd`), adding to
 /// `reads` the (dev, ino) of each directory walked and of the target, and each
-/// (parent, name) passed, through every symlink met (D3). Returns the final
+/// (parent, name) passed, through every symlink met. Returns the final
 /// name and object, of the link and of every target it chains to, whatever the
 /// flags: `O_CREAT` through a dangling link creates the target's name. None:
 /// the walk met a procfs magic link, whose target we can't resolve as tid.

@@ -1,4 +1,5 @@
-//! Milestone 2 acceptance. Needs root, a running `scx_crfuzz gated`, and `go`:
+//! The hold: seccomp parks a thread, the tree gate stops its siblings. Needs
+//! root, a running `scx_crfuzz gated`, and `go`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -121,7 +122,7 @@ fn check(be: &mut GateBackend, bytes: &AtomicU64, trigger: &Path, label: &str) {
     assert!(after > 0, "SUT did not resume after release");
 }
 
-/// Spec §4 milestone 2: zero sibling bytes during a hold on the Go fixture.
+/// Zero sibling bytes during a hold on the Go fixture.
 #[test]
 #[ignore]
 fn tree_hold_stops_go_siblings() {
@@ -172,7 +173,8 @@ fn watched_execve_spawns_and_holds_next_exec() {
     assert!(bare.is_err(), "bare program name accepted with execve watched");
 }
 
-/// runc moves `runc init` into the container cgroup, under ours (spec §3.4).
+/// runc moves `runc init` into the container cgroup, which crfuzz's targets
+/// place under ours.
 /// Here a subshell moves itself into a child cgroup and writes; the tree hold
 /// must still stop it, and Drop must remove both cgroups.
 #[test]

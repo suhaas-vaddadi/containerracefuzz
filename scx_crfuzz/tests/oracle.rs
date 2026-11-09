@@ -1,4 +1,5 @@
-//! The canary (§2). Needs root:
+//! The canary: a directory alice cannot reach, and what changed in it. Needs
+//! root:
 //!   sudo <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -34,7 +35,7 @@ fn changed_canary_stays() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// §10.2: kept, the directory outlives the canary.
+/// Kept, the directory outlives the canary.
 #[test]
 #[ignore]
 fn canary_keep() {

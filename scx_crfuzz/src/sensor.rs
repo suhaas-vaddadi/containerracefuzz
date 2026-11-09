@@ -1,4 +1,5 @@
-//! Readout sensor (spec §3.4), `/proc` double-snapshot variant (M3 spike).
+//! Readout sensor: is no SUT thread running? A `/proc` double snapshot, not a
+//! BPF tracepoint sensor.
 //!
 //! Two snapshots of the run cgroup's threads with the same tid set, no thread
 //! `R`, and unchanged on-CPU time mean every thread slept through the gap

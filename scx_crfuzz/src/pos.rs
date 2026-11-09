@@ -1,6 +1,6 @@
-//! POS over SUT threads (spec §3.5): seeded per-event priorities, release the
-//! max, redraw only the ready events whose keys (D3) conflict with it. Events
-//! are named by creation-tree thread names (D4). Pure: no I/O, so the
+//! POS over SUT threads: seeded per-event priorities, release the max, redraw
+//! only the ready events whose read/write keys conflict with it. Events are
+//! named by creation-tree thread names, never tids. Pure: no I/O, so the
 //! determinism test runs off-target.
 
 use std::cmp::Reverse;
@@ -10,7 +10,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 /// `(thread, syscall, path, occurrence)`, the thread named by its place in
-/// the creation tree, not its tid (D4). Ord is the canonical tie-break order.
+/// the creation tree, not its tid (which differs every run). Ord is the
+/// canonical tie-break order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId {
     pub thread: String,
@@ -19,7 +20,7 @@ pub struct EventId {
     pub n: u32,
 }
 
-/// One conflict key (D3).
+/// One conflict key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Key {
     /// `(dev, ino)` of a directory walked or of the target.
@@ -28,14 +29,15 @@ pub enum Key {
     Name(u64, u64, OsString),
 }
 
-/// What resolving an event's path(s) touches (D3). `reads` holds every key the
+/// What resolving an event's path(s) touches. `reads` holds every key the
 /// walk passed, `writes` (a subset) the names and objects a rebind changes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Keys {
     pub reads: BTreeSet<Key>,
     pub writes: BTreeSet<Key>,
     /// What it touches is unknown (no path, or a syscall we can't decode):
-    /// conflicts with everything (D3: when unsure, report a conflict).
+    /// conflicts with everything (when unsure, report a conflict: a false one
+    /// costs only a redraw, a missed one skips orders).
     pub all: bool,
 }
 
@@ -71,13 +73,13 @@ impl Pos {
     }
 
     /// Priority from the seed and the event alone, never its ready-set position
-    /// (L:Engine, arrival order).
+    /// (arrival order is not reproducible run to run).
     pub fn prio(&self, id: &EventId) -> u64 {
         self.hash(id, &self.redraws.get(id).copied().unwrap_or(0).to_le_bytes())
     }
 
     /// The mutator's seed at this event's hold: from the seed and the event
-    /// alone, so a replay fires the same mutation (D6).
+    /// alone, so a replay fires the same mutation.
     pub fn event_seed(&self, id: &EventId) -> u64 {
         self.hash(id, &[])
     }
@@ -101,7 +103,8 @@ impl Pos {
     }
 
     /// Index of the event to release from `ready`, redrawing the priorities of
-    /// the rest that conflict with it. Order of `ready` doesn't matter (D4).
+    /// the rest that conflict with it. Order of `ready` doesn't matter: ties
+    /// break on `EventId`'s order.
     pub fn pick(&mut self, ready: &[(&EventId, &Keys)]) -> Option<usize> {
         let top = (0..ready.len()).max_by_key(|&i| (self.prio(ready[i].0), Reverse(ready[i].0)))?;
         for (id, _) in ready.iter().filter(|(id, k)| *id != ready[top].0 && k.conflicts(ready[top].1)) {
@@ -221,7 +224,7 @@ mod tests {
         out
     }
 
-    /// Spec §4 milestone 4: same seed ⇒ same sampled order, whatever order each
+    /// Same seed ⇒ same sampled order, whatever order each
     /// frontier's events arrive in. Complete frontiers make that a total order,
     /// which implies the partial one.
     #[test]
@@ -325,7 +328,7 @@ mod tests {
         assert_eq!(pos.id("0", OPEN, None).n, 0);
     }
 
-    /// §3.8: the fixed-schedule pick releases the recorded order whatever
+    /// The fixed-schedule pick releases the recorded order whatever
     /// the seed and arrival order, and flags a schedule the run leaves.
     #[test]
     fn fixed_schedule_follows_and_diverges() {

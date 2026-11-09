@@ -1,4 +1,4 @@
-//! The oracle (spec §3.7, M6): a canary directory alice cannot reach, the
+//! The oracle: a canary directory alice cannot reach, the
 //! attacker identity, and the outcome class. A run is a `Violation` iff alice
 //! can reach or has changed a canary afterwards: the mutator acts with at most
 //! her privileges, so anything past them went through the SUT.
@@ -37,8 +37,9 @@ enum Body {
 }
 
 pub struct Entry {
-    /// For reachability (§5): a canary `(dev, ino)` seen anywhere alice can
-    /// reach. Also compared: a bind mount from the same filesystem keeps `dev`.
+    /// For reachability (the probe): a canary `(dev, ino)` seen anywhere alice
+    /// can reach. Also compared: a bind mount from the same filesystem keeps
+    /// `dev`.
     pub id: (u64, u64),
     pub state: State,
 }
@@ -59,7 +60,8 @@ pub fn root_only() -> Result<()> {
     Ok(())
 }
 
-/// Removes itself on drop unless `keep()` was called (§10.2).
+/// Removes itself on drop unless `keep()` was called (only a Violation's or a
+/// leaking baseline's, where the directory is the evidence).
 pub struct Canary {
     pub dir: PathBuf,
     pub token: String,
@@ -212,7 +214,7 @@ fn walk(base: &Path, rel: &Path, dev: u64, before: &Tree, tree: &mut Tree) -> Re
     Ok(())
 }
 
-/// The attacker (§1), in host ids.
+/// The attacker (`--attacker`, never inferred), in host ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alice {
     pub uid: u32,
@@ -232,7 +234,8 @@ impl Alice {
     }
 }
 
-/// Task `tid`'s effective uid, as our namespace sees it (§5's handle check).
+/// Task `tid`'s effective uid, as our namespace sees it (the probe's handle
+/// check: does the final task run as alice?).
 pub fn euid(tid: u32) -> Result<u32> {
     let s = fs::read_to_string(format!("/proc/{tid}/status"))?;
     let uid = s.lines().find_map(|l| l.strip_prefix("Uid:")).context("no Uid:")?;
@@ -282,7 +285,7 @@ impl Outcome {
     }
 }
 
-/// §6, first match wins. An ending of None: the deadline.
+/// The outcome class, first match wins. An ending of None: the deadline.
 pub fn outcome(findings: Vec<Finding>, sut: Option<ExitStatus>, baseline: Option<ExitStatus>) -> Outcome {
     let ok = |s: Option<ExitStatus>| s.is_some_and(|s| s.success());
     if !findings.is_empty() {

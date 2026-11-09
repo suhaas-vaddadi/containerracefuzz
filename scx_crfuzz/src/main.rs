@@ -3,18 +3,19 @@
 //! scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID] [--seeds N] [--time DURATION] [--jobs N] [--resume] [-v]
 //! scx_crfuzz gated | status | reset | check
 //!
-//! `run` sweeps seeds S..S+N (default S 0; §3.10), each exhaustive over its
+//! `run` sweeps seeds S..S+N (default S 0), each exhaustive over its
 //! windows; with no `--seeds`, S, S+1, ... until stopped. `--time DURATION`
 //! (`90s`, `30m`, `2h`; bare: seconds) starts no run once that much time has
 //! passed: the stop below, but with a `time limit:` line and exit 0 or 3.
 //! A seed runs CMD under POS (discovery): a baseline under the seed, no
 //! mutator, then once per window, each run with its own canary, judged
-//! against the attacker alice (UID:GID, no groups, no caps: §1). The windows
+//! against the attacker alice (UID:GID, no groups, no caps). The windows
 //! are the baseline's holds with a known path, not keys.all and not a `?tid`,
 //! one per (syscall, path, occurrence): with `--mutator`, PROG (a binary or a
 //! script with a #!) runs at window k's hold alone, once, as alice in the held
 //! task's view: its namespaces, root and cwd, the path as issued in argv[1]
-//! (§10.1). `--scope DIR` (repeatable) keeps only windows whose absolute path
+//! (as alice, not the held task: a mutation with the SUT's privilege proves
+//! nothing). `--scope DIR` (repeatable) keeps only windows whose absolute path
 //! is under one of the DIRs: where alice can act. A window that never reaches
 //! its target is unmutated. `--layout PROG` (absolute, recorded in the
 //! schedule) runs as root before every run to restore the starting
@@ -34,12 +35,12 @@
 //! `run` writes its arguments after DIR to `DIR/args`, one per line,
 //! escaped as in schedules, and each seed's verdict to `DIR/seeds.tsv` when
 //! it ends; DIR must be empty. `--resume` continues the campaign in DIR
-//! instead, if the arguments match `DIR/args` but for `--resume`, `--seeds`,
-//! `--time` and `--jobs`: seeds with a verdict are skipped; any other seed's
+//! instead, if the arguments match `DIR/args` but for `--resume`, `-v`,
+//! `--seeds`, `--time` and `--jobs`: seeds with a verdict are skipped; any other seed's
 //! rows, `runs/<seed>/` and `seed:k` lines are dropped and it runs again; the
 //! findings and totals carry on from what is left.
 //!
-//! Window k's schedule (§3.8) goes to `DIR/runs/<seed>/<k>.sched` and a row to
+//! Window k's schedule goes to `DIR/runs/<seed>/<k>.sched` and a row to
 //! `DIR/runs.tsv`; its runs' output (SUT and layout: discovery, confirm,
 //! minimize) to `DIR/runs/<seed>/<k>.log`, the baseline's to `baseline.log`,
 //! each run after a `== <run>` line. A Violation repeating a finding (`Dedup::repeated_by`) is
@@ -51,7 +52,8 @@
 //! (else), or `no windows` (no mutator or no target: the seed is one unmutated
 //! run, window 0); the sweep with a summary.
 //!
-//! `replay FILE`: everything comes from the file. One baseline, a replay with
+//! `replay FILE`: everything comes from the file, `run`'s `CRFUZZ_*`
+//! environment too (the layout's, SUT's and mutator's inputs). One baseline, a replay with
 //! every recorded mutation that must give the same class and normalized
 //! findings, then one replay per recorded mutation alone, in order, until one
 //! flags a finding of the schedule's: the guilty hold.
@@ -66,7 +68,9 @@
 //!
 //! The gate scheduler: `run` and `replay` use the one running (another
 //! crfuzz's, or `gated`'s), else load their own for their life; any other
-//! sched_ext scheduler is an error. `gated` holds it in the foreground until
+//! sched_ext scheduler is an error. A campaign whose scheduler is lost
+//! (ejected, or its crfuzz exited) stops as a signal would, but after a
+//! `scheduler lost:` line, exit 1. `gated` holds it in the foreground until
 //! SIGINT or SIGTERM (exit 0) or ejection, for tests and for several crfuzz
 //! processes sharing one; `status` prints sched_ext's state and the pins;
 //! `reset` deletes every gate entry of every run.
@@ -87,7 +91,8 @@
 //! `layout.sh`, `run/` (the daemon's state) and `logs/` (`mutator.log`,
 //! writable by alice, and `containerd.log`); then, from D, runs the campaign
 //! `D/campaign` as `run` with `--private` rootfs, run, /run/containerd/s and
-//! /run/nri, `--scope` the rootfs. `--resume` keeps `campaign/` and `logs/`.
+//! /run/nri, `--scope` the rootfs. `--resume` keeps `campaign/` and `logs/`;
+//! without it, a nonempty `campaign/` is refused.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -140,7 +145,7 @@ fn durations() {
 }
 
 /// What `--resume` compares of `run`'s arguments after DIR: all but
-/// `--resume`, `--seeds`, `--time` and `--jobs` (with their values) before `--`.
+/// `--resume`, `-v`, `--seeds`, `--time` and `--jobs` (with their values) before `--`.
 #[cfg(any(target_os = "linux", test))]
 fn resumable<'a>(argv: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let (mut out, mut it) = (Vec::new(), argv.into_iter());
@@ -151,7 +156,7 @@ fn resumable<'a>(argv: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
                 out.extend(it);
                 break;
             }
-            "--resume" => {}
+            "--resume" | "-v" => {}
             "--seeds" | "--time" | "--jobs" => _ = it.next(),
             _ => out.push(a),
         }
@@ -162,8 +167,8 @@ fn resumable<'a>(argv: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
 #[cfg(test)]
 #[test]
 fn resumable_drops_budget() {
-    let a = resumable("--attacker 1:1 --seeds 3 --resume --time 1h --jobs 2 --private /p -- cmd --seeds 9".split(' '));
-    assert_eq!(a, "--attacker 1:1 --private /p -- cmd --seeds 9".split(' ').collect::<Vec<_>>());
+    let a = resumable("--attacker 1:1 --seeds 3 --resume -v --time 1h --jobs 2 --private /p -- cmd --seeds 9 -v".split(' '));
+    assert_eq!(a, "--attacker 1:1 --private /p -- cmd --seeds 9 -v".split(' ').collect::<Vec<_>>());
 }
 
 /// Whether an ELF64 little-endian image names an interpreter (PT_INTERP):
@@ -294,6 +299,7 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
     use scx_crfuzz::pos::{EventId, Pos};
     use scx_crfuzz::schedule::{self, Dedup, Divergence, Fixed, Schedule};
     use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::hash::BuildHasher;
     use std::io::{IsTerminal, Write};
     use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
     use std::path::{Path, PathBuf};
@@ -304,8 +310,9 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
 
     /// Replays a discovery gets to reproduce before it counts as unconfirmed.
     const CONFIRM_TRIES: u32 = 3;
-    // ponytail: a fixed watch set (the path syscalls D3 decodes, minus execve,
-    // which needs CMD as a path) and fixed timing; flags when a scenario needs them.
+    // ponytail: a fixed watch set (the path syscalls the backend's `observe`
+    // decodes, minus execve, which needs CMD as a path) and fixed timing;
+    // flags when a scenario needs them.
     const WATCHED: &[i64] = &[
         libc::SYS_openat,
         libc::SYS_openat2,
@@ -323,7 +330,8 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         libc::SYS_linkat,
         libc::SYS_symlinkat,
         libc::SYS_chdir,
-        // The final hold (§5): its keys are `all`, so no mutator fires there.
+        // The final hold (the probe's): its keys are `all`, so no mutator
+        // fires there.
         libc::SYS_exit_group,
     ];
 
@@ -449,6 +457,10 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
             }
             let f = file.ok_or_else(|| usage("replay needs a FILE".into()))?;
             let s = std::fs::read_to_string(&f).context(f.clone())?.parse::<Schedule>().context(f)?;
+            // The layout's, SUT's and mutator's inputs, as in discovery. One thread yet.
+            for (k, v) in &s.env {
+                std::env::set_var(k, v);
+            }
             (mutator, layout, timeout, private, attacker) = (s.mutator.clone(), s.layout.clone(), s.timeout, s.private.clone(), Some(Alice::parse(&s.attacker)?));
             let cmd = s.cmd.clone();
             (None, Some(s), cmd)
@@ -536,6 +548,8 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
             let marker = d.join(".crfuzz-containerd");
             let mut rd = std::fs::read_dir(&d)?.peekable();
             ensure!(rd.peek().is_none() || marker.exists(), "--dir {}: not empty and not a containerd scenario (no {}); pass another", d.display(), marker.display());
+            let old = d.join("campaign");
+            ensure!(resume || std::fs::read_dir(&old).map_or(true, |mut e| e.next().is_none()), "--dir {}: holds a campaign; rerun with --resume, or remove {}", d.display(), old.display());
             std::fs::write(&marker, "")?;
             for e in rd {
                 let e = e?;
@@ -593,7 +607,8 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         Some(a) => return Err(usage(format!("unknown command {a}"))),
         None => return Err(usage("a command is required".into())),
     };
-    // §1: an input, never inferred; refused before anything starts.
+    // An input, never inferred (an alice guessed as root would judge every
+    // canary reachable); refused before anything starts.
     let alice = attacker.ok_or_else(|| usage("--attacker is required".into()))?;
     let (prog, rest) = cmd.split_first().ok_or_else(|| usage("run needs a CMD after --".into()))?;
     // An old campaign's runs/ and findings/ read as this one's: only if it is this one.
@@ -601,7 +616,7 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         if resume {
             let old = std::fs::read_to_string(d.join("args")).with_context(|| format!("--resume: {} holds no campaign", d.display()))?;
             let new = resumable(argv.iter().map(String::as_str));
-            ensure!(resumable(old.lines()) == new, "--resume: the arguments differ from {} (only --seeds, --time and --jobs may)", d.join("args").display());
+            ensure!(resumable(old.lines()) == new, "--resume: the arguments differ from {} (only --seeds, --time, --jobs and -v may)", d.join("args").display());
         } else {
             ensure!(std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()), "run: {} is not empty (--resume continues its campaign)", d.display());
         }
@@ -620,25 +635,32 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         }
     }
 
-    /// One judged run (§5, §6).
+    /// One judged run: the probe's and the canary's findings, and the ending.
     struct Judged {
         /// None: the deadline, or a self-check failed on a changed canary.
         end: Option<ExitStatus>,
         /// Read and write halves together.
         found: Vec<Finding>,
-        /// Ended by the deadline (§3.8: replay lets it end there too).
+        /// Ended by the deadline (a replay may end there too).
         deadline: bool,
-        /// `found`, normalized: what replays compare (§3.8).
+        /// `found`, normalized: what replays compare.
         norm: BTreeSet<Finding>,
-        /// Removed on drop unless kept (§10.2).
+        /// Removed on drop unless kept (the evidence of a Violation).
         canary: Canary,
     }
 
+    preflight_ok(None)?;
+    engine::stop_on_signals();
+    // Ours for this process's life unless crfuzz's already runs.
+    let _sched = gate::Scheduler::start()?;
+    let seq = gate::enable_seq()?;
     // --time counts from here; checked before each run, like a stop.
     let started = Instant::now();
-    // A worker's fatal error stops the others the same way.
-    let fatal = AtomicBool::new(false);
-    let over = || limit.is_some_and(|l| started.elapsed() >= l) || fatal.load(Relaxed);
+    // A worker's fatal error stops the others the same way; so does losing
+    // the gate scheduler, which would fail every run from then on.
+    let (fatal, lost) = (AtomicBool::new(false), AtomicBool::new(false));
+    let over = || limit.is_some_and(|l| started.elapsed() >= l) || fatal.load(Relaxed) || lost.load(Relaxed);
+    let sweeping = campaign.is_some();
     // Canary numbers, one per run of this crfuzz: a kept canary is never reused.
     let runs = AtomicU32::new(0);
     // One run with its own canary; its decisions go to `log` whatever the
@@ -719,6 +741,14 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         if engine::stopped() {
             return Err(Interrupted.into());
         }
+        // A campaign's run failed with the scheduler gone (ejected, or the
+        // crfuzz whose it was exited) or restarted: stop, recording nothing.
+        if r.is_err() && sweeping && (!gate::running().unwrap_or(false) || gate::enable_seq().ok() != Some(seq)) {
+            if !lost.swap(true, Relaxed) {
+                eprintln!("the gate scheduler is gone (ejected, or the crfuzz that ran it exited); --resume reruns the unfinished seeds");
+            }
+            return Err(Interrupted.into());
+        }
         r
     };
 
@@ -769,8 +799,9 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         )
     };
 
-    // The run in `log` as a schedule (§3.8); `mutated`: it had a target.
+    // The run in `log` as a schedule; `mutated`: it had a target.
     let attacker = format!("{}:{}", alice.uid, alice.gid);
+    let env: BTreeMap<_, _> = std::env::vars_os().filter(|(k, _)| k.as_bytes().starts_with(b"CRFUZZ_")).collect();
     let schedule = |seed: u64, mutated: bool, class: &str, deadline: bool, findings: BTreeSet<Finding>, log: &[Decision]| Schedule {
         seed,
         attacker: attacker.clone(),
@@ -778,6 +809,7 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         layout: layout.clone(),
         timeout,
         private: private.clone(),
+        env: env.clone(),
         cmd: cmd.clone(),
         class: class.into(),
         deadline,
@@ -859,10 +891,6 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         Ok(Some(None))
     };
 
-    preflight_ok(None)?;
-    engine::stop_on_signals();
-    // Ours for this process's life unless crfuzz's already runs.
-    let _sched = gate::Scheduler::start()?;
     backend::sweep();
     // Worker w's private copies: work/<w>/<i>.
     let work = Path::new(oracle::ROOT).join(format!("work/{}", std::process::id()));
@@ -889,7 +917,7 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         return Ok(if s.class == "Violation" { 3 } else { 0 });
     };
 
-    // §3.10: the sweep. Each row is written as its run ends: an interrupted
+    // The sweep. Each row is written as its run ends: an interrupted
     // campaign keeps them.
     std::fs::create_dir_all(dir.join("runs")).with_context(|| dir.display().to_string())?;
     std::fs::write(dir.join("args"), argv.iter().map(|a| format!("{a}\n")).collect::<String>())?;
@@ -934,7 +962,8 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         decisions: usize,
         partial: usize,
         time: Duration,
-        orders: HashSet<Vec<EventId>>,
+        /// ponytail: 64-bit hashes of the canonical orders; a collision only undercounts.
+        orders: HashSet<u64>,
         unmutated: u64,
         classes: BTreeMap<String, u64>,
         verdicts: [u64; 4],
@@ -1134,7 +1163,8 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
                         let kept = run.canary.dir.clone();
                         drop(run);
                         // Before confirm reuses `log`.
-                        order = Some(schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>()));
+                        let canon = schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>());
+                        order = Some(std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(canon));
                         let row = if !matches!(class, Outcome::Violation(_)) {
                             (class.name(), "-", None, String::new())
                         } else {
@@ -1242,10 +1272,13 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
 
     let stopped = engine::stopped();
     let done = verdicts.iter().sum::<u64>();
+    let lost = lost.load(Relaxed);
     if stopped {
         println!("interrupted: {done} seeds complete");
+    } else if lost {
+        println!("scheduler lost: {done} seeds complete");
     } else if n.is_none_or(|n| done < n) {
-        // Only a stop or --time ends the loop early.
+        // Only a stop, a lost scheduler or --time ends the loop early.
         println!("time limit: {done} seeds complete");
     }
     println!("campaign: {} seeds, {total} runs, {invalid} invalid, discovery {:.1}s", n.unwrap_or(done), time.as_secs_f64());
@@ -1261,5 +1294,5 @@ fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
         let guilty = d.guilty.as_ref().map_or("needs more than one hold".into(), |(t, nr, p)| hold(t, *nr, p));
         println!("finding #{}: {} runs, guilty {guilty}, {:?}, {}", i + 1, runs.len(), d.findings, dir.join(format!("findings/{}", i + 1)).display());
     }
-    Ok(if stopped { 130 } else if found.is_empty() { 0 } else { 3 })
+    Ok(if stopped { 130 } else if lost { 1 } else if found.is_empty() { 0 } else { 3 })
 }

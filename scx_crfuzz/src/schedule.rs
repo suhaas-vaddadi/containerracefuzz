@@ -1,12 +1,12 @@
-//! The schedule file, the fixed-schedule policy and finding identity (spec
-//! §3.8, M7); a run's partial order and the campaign's dedup key (§3.10, M8).
+//! The schedule file, the fixed-schedule policy and finding identity (replay
+//! and minimization); a run's partial order and the campaign's dedup key.
 //! Pure: no I/O, so it is tested off-target.
 
 use crate::pos::{EventId, Keys};
 use anyhow::{bail, ensure, Context, Result};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -25,8 +25,24 @@ pub fn uncanary(p: &Path, canary: &Path) -> Option<PathBuf> {
     p.strip_prefix(canary).ok().map(|rest| Path::new("<canary>").join(rest))
 }
 
+/// A held path as an event names it: the canary directory as `<canary>`, the
+/// run cgroup's name (`run-<pid>-<epoch>`) as `<run>`. Both differ every run,
+/// so a replay still matches. A component, not a prefix: runc opens cgroup
+/// files relative to /sys/fs/cgroup.
+pub fn event_path(p: &Path, canary: Option<&Path>, run: &Path) -> PathBuf {
+    if let Some(p) = canary.and_then(|c| uncanary(p, c)) {
+        return p;
+    }
+    let run = run.file_name();
+    if !p.components().any(|c| Some(c.as_os_str()) == run) {
+        return p.into();
+    }
+    p.components().map(|c| if Some(c.as_os_str()) == run { OsStr::new("<run>") } else { c.as_os_str() }).collect()
+}
+
 /// A finding's identity across runs: the canary directory as `<canary>`, the
-/// probed task's /proc handles named by its thread (D4), fd numbers dropped.
+/// probed task's /proc handles named by its creation-tree thread name (tids
+/// differ every run), fd numbers dropped.
 /// `task`: the probed event's `(tid, tgid, thread)`; `probe` reads only its
 /// `/proc/<tid>/{cwd,root}` and `/proc/<tgid>/fd/N`.
 pub fn normalize(f: &Finding, canary: &Path, task: Option<(u32, u32, &str)>) -> Finding {
@@ -55,7 +71,7 @@ pub fn normalize(f: &Finding, canary: &Path, task: Option<(u32, u32, &str)>) -> 
     }
 }
 
-/// One schedule step (§3.8): release `id`; `mutate`: the mutator fired at its
+/// One schedule step: release `id`; `mutate`: the mutator fired at its
 /// hold in discovery (a failed primitive included).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -63,7 +79,7 @@ pub struct Step {
     pub mutate: bool,
 }
 
-/// A replay left the schedule (D4: divergent). `expected` None: an event was
+/// A replay left the schedule (a divergence). `expected` None: an event was
 /// held after the last step; `held` empty: the SUT exited first.
 #[derive(Debug)]
 pub struct Divergence {
@@ -86,7 +102,8 @@ pub fn tolerated(only: Option<usize>, d: &Divergence) -> bool {
     only.is_some_and(|k| d.step > k)
 }
 
-/// The fixed-schedule policy (§3.5): release the recorded steps in order.
+/// The fixed-schedule policy, POS's replacement in a replay: release the
+/// recorded steps in order.
 pub struct Fixed<'a> {
     pub steps: &'a [Step],
     /// Steps released so far.
@@ -98,7 +115,7 @@ pub struct Fixed<'a> {
 
 impl Fixed<'_> {
     /// Index in `ready` of the next step's event, as `Pos::pick`. Called once
-    /// the frontier is complete or the limit expired (D2): a nonempty
+    /// the frontier is complete or the limit expired: a nonempty
     /// frontier without it has left the schedule.
     pub fn pick(&mut self, ready: &[(&EventId, &Keys)]) -> Result<Option<usize>, Divergence> {
         if ready.is_empty() {
@@ -139,14 +156,17 @@ pub struct Schedule {
     /// Absolute.
     pub mutator: Option<PathBuf>,
     /// Absolute; run as root before every run to restore the starting
-    /// filesystem (§3.9 `layout.sh`).
+    /// filesystem (`--layout`).
     pub layout: Option<PathBuf>,
     /// The run deadline, in seconds (`--timeout`).
     pub timeout: u64,
     /// `--private` directories, absolute: each run sees its own copy.
     pub private: Vec<PathBuf>,
+    /// The `CRFUZZ_*` environment at `run` time (the layout's, SUT's and
+    /// mutator's inputs): `replay` sets it again.
+    pub env: BTreeMap<OsString, OsString>,
     pub cmd: Vec<String>,
-    /// The discovery outcome class (§6), `Outcome`'s variant name.
+    /// The discovery outcome class, `Outcome`'s variant name.
     pub class: String,
     /// Discovery ended by the deadline, the SUT still running.
     pub deadline: bool,
@@ -209,6 +229,9 @@ impl std::fmt::Display for Schedule {
         for p in &self.private {
             writeln!(f, "private {}", esc_path(p))?;
         }
+        for (k, v) in &self.env {
+            writeln!(f, "env {} {}", esc(k.as_bytes()), esc(v.as_bytes()))?;
+        }
         writeln!(f, "cmd {}", self.cmd.iter().map(|a| esc(a.as_bytes())).collect::<Vec<_>>().join(" "))?;
         writeln!(f, "outcome {}", self.class)?;
         if self.deadline {
@@ -239,7 +262,7 @@ impl std::str::FromStr for Schedule {
     fn from_str(text: &str) -> Result<Self> {
         let mut lines = text.lines();
         ensure!(lines.next() == Some("crfuzz-schedule 1"), "not a crfuzz schedule (version 1)");
-        let mut s = Schedule { seed: 0, attacker: String::new(), mutator: None, layout: None, timeout: TIMEOUT, private: vec![], cmd: vec![], class: String::new(), deadline: false, findings: BTreeSet::new(), steps: vec![] };
+        let mut s = Schedule { seed: 0, attacker: String::new(), mutator: None, layout: None, timeout: TIMEOUT, private: vec![], env: BTreeMap::new(), cmd: vec![], class: String::new(), deadline: false, findings: BTreeSet::new(), steps: vec![] };
         for (i, line) in lines.enumerate() {
             let w: Vec<&str> = line.split(' ').collect();
             let bad = || format!("line {}: {line:?}", i + 2);
@@ -250,6 +273,12 @@ impl std::str::FromStr for Schedule {
                 ["layout", l] => s.layout = Some(unesc_path(l)?),
                 ["timeout", t] => s.timeout = t.parse().with_context(bad)?,
                 ["private", p] => s.private.push(unesc_path(p)?),
+                // `replay` sets these: CRFUZZ_* only, and nothing set_var panics on.
+                ["env", k, v] => {
+                    let (k, v) = (unesc(k)?, unesc(v)?);
+                    ensure!(k.starts_with(b"CRFUZZ_") && !k.contains(&b'=') && !k.contains(&0) && !v.contains(&0), "{}: not a CRFUZZ_* variable", bad());
+                    s.env.insert(OsString::from_vec(k), OsString::from_vec(v));
+                }
                 ["cmd", ref args @ ..] => s.cmd = args.iter().map(|a| unesc_str(a)).collect::<Result<_>>()?,
                 ["outcome", c] => s.class = c.into(),
                 ["deadline"] => s.deadline = true,
@@ -273,9 +302,10 @@ impl std::str::FromStr for Schedule {
     }
 }
 
-/// A run's decisions as one canonical member of their partial order (§1.3):
-/// two are ordered iff on one thread or their keys conflict (D3), earlier
-/// first; ties go to the smallest `EventId`. Equal outputs, same partial order.
+/// A run's decisions as one canonical member of their partial order (what
+/// "same seed, same order" promises): two are ordered iff on one thread or
+/// their keys conflict, earlier first; ties go to the smallest `EventId`.
+/// Equal outputs, same partial order.
 /// Edges with the ordered pairs' transitive closure (so the same ready sets),
 /// O(n + keys) of them: the thread's last, the last `all` and (for an `all`)
 /// everything since, each key's last writer and (for a writer) its readers
@@ -323,7 +353,7 @@ pub fn canonical(log: &[(&EventId, &Keys)]) -> Vec<EventId> {
     out
 }
 
-/// A deduped finding (§3.10): the guilty hold's `(thread, nr, path)`,
+/// A deduped finding: the guilty hold's `(thread, nr, path)`,
 /// occurrence dropped (None: needs more than one hold), and the schedule's
 /// normalized findings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +398,19 @@ mod tests {
     }
 
     #[test]
+    fn event_path_names_per_run_dirs() {
+        let (canary, run) = (Path::new("/var/lib/crfuzz/canary-4242-1"), Path::new("/sys/fs/cgroup/crfuzz/run-4242-2"));
+        let e = |p: &str| event_path(Path::new(p), Some(canary), run);
+        assert_eq!(e("/var/lib/crfuzz/canary-4242-1/dir"), Path::new("<canary>/dir"));
+        assert_eq!(e("/sys/fs/cgroup/crfuzz/run-4242-2/sut/cpu.max"), Path::new("/sys/fs/cgroup/crfuzz/<run>/sut/cpu.max"));
+        assert_eq!(e("crfuzz/run-4242-2/busy/cgroup.freeze"), Path::new("crfuzz/<run>/busy/cgroup.freeze"));
+        // Another run's cgroup, or a component-prefix lookalike: as is.
+        assert_eq!(e("/sys/fs/cgroup/crfuzz/run-4242-20/sut/cpu.max"), Path::new("/sys/fs/cgroup/crfuzz/run-4242-20/sut/cpu.max"));
+        assert_eq!(e("/tmp/q"), Path::new("/tmp/q"));
+        assert_eq!(event_path(Path::new("/var/lib/crfuzz/canary-4242-1/x"), None, run), Path::new("/var/lib/crfuzz/canary-4242-1/x"));
+    }
+
+    #[test]
     fn schedule_round_trip() {
         let id = |thread: &str, path: Option<&[u8]>, n| EventId { thread: thread.into(), nr: 56, path: path.map(|p| OsString::from_vec(p.to_vec()).into()), n };
         let s = Schedule {
@@ -377,6 +420,7 @@ mod tests {
             layout: Some("/tmp/layout.sh".into()),
             timeout: 5,
             private: vec!["/tmp/a".into(), "/run/x y".into()],
+            env: [("CRFUZZ_DIR".into(), "/tmp/d d".into()), ("CRFUZZ_EMPTY".into(), "".into()), ("CRFUZZ_X".into(), OsString::from_vec(b"a%\xff\n".to_vec()))].into(),
             cmd: vec!["/bin/sh".into(), "-c".into(), "echo a%b".into(), "".into()],
             class: "Violation".into(),
             deadline: true,
@@ -392,14 +436,19 @@ mod tests {
                 Step { id: id("0", None, 0), mutate: false },
             ],
         };
+        assert!(s.to_string().contains("\nenv CRFUZZ_DIR /tmp/d%20d\nenv CRFUZZ_EMPTY %\nenv CRFUZZ_X a%25%ff%0a\n"));
         assert_eq!(s.to_string().parse::<Schedule>().unwrap(), s);
+        for bad in ["LD_PRELOAD /x.so", "CRFUZZ_A=B c", "CRFUZZ_N%00 v", "CRFUZZ_V a%00b"] {
+            let t = s.to_string().replacen("\ncmd ", &format!("\nenv {bad}\ncmd "), 1);
+            assert!(t.parse::<Schedule>().is_err(), "{bad}");
+        }
     }
 
     #[test]
     fn timeout_line_only_when_not_default() {
         let old = "crfuzz-schedule 1\nseed 0\nattacker 1:1\ncmd /bin/true\noutcome Clean\n";
         let s = old.parse::<Schedule>().unwrap();
-        assert_eq!((s.timeout, s.private.len()), (TIMEOUT, 0), "an old file without the lines");
+        assert_eq!((s.timeout, s.private.len(), s.env.len()), (TIMEOUT, 0, 0), "an old file without the lines");
         assert_eq!(s.to_string(), old, "the default is not written");
         let s = Schedule { timeout: 5, ..s };
         assert!(s.to_string().contains("\ntimeout 5\n"));

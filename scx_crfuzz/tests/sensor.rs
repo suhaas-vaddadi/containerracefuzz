@@ -1,4 +1,4 @@
-//! Milestone 3 spike: the `/proc` double-snapshot sensor. Needs root, a running
+//! The `/proc` double-snapshot sensor. Needs root, a running
 //! `scx_crfuzz gated`, `cc` and `go`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
@@ -60,7 +60,7 @@ fn parked(r: &Reach) -> BTreeSet<u32> {
     r.held.iter().map(|e| e.tid).collect()
 }
 
-/// Spec §4 milestone 3: a thread blocked on a futex doesn't stall the readout.
+/// A thread blocked on a futex doesn't stall the readout.
 #[test]
 #[ignore]
 fn futex_blocked_thread_reaches_decision() {
@@ -160,10 +160,10 @@ fn go_channel_blocked_reaches_decision() {
     eprintln!("go: 20 runs (rounds, µs) sorted {lat:?}");
 }
 
-/// What a gated runnable thread looks like: the spec says a tree-gated thread
-/// reads Running. A spinning thread under a tree hold should be `R` with frozen
-/// cpu time; a futex-blocked one stays `S`, so the frontier can look complete
-/// during a tree hold.
+/// What a gated runnable thread looks like: the design assumed a tree-gated
+/// thread reads Running. A spinning thread under a tree hold should be `R`
+/// with frozen cpu time; a futex-blocked one stays `S`, so the frontier can
+/// look complete during a tree hold.
 #[test]
 #[ignore]
 fn gated_threads_under_tree_hold() {
