@@ -1,4 +1,4 @@
-//! scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
+//! scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--resume] [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 //! scx_crfuzz replay FILE [-v]
 //! scx_crfuzz gated | status | reset | check
 //!
@@ -30,18 +30,25 @@
 //! seed's lines print as one block when it ends, rows and finding numbers go
 //! by completion.
 //!
+//! `run` writes its arguments after DIR to `DIR/args`, one per line,
+//! escaped as in schedules, and each seed's verdict to `DIR/seeds.tsv` when
+//! it ends; DIR must be empty. `--resume` continues the campaign in DIR
+//! instead, if the arguments match `DIR/args` but for `--resume`, `--seeds`,
+//! `--time` and `--jobs`: seeds with a verdict are skipped; any other seed's
+//! rows, `runs/<seed>/` and `seed:k` lines are dropped and it runs again; the
+//! findings and totals carry on from what is left.
+//!
 //! Window k's schedule (§3.8) goes to `DIR/runs/<seed>/<k>.sched` and a row to
 //! `DIR/runs.tsv`; its runs' output (SUT and layout: discovery, confirm,
 //! minimize) to `DIR/runs/<seed>/<k>.log`, the baseline's to `baseline.log`,
-//! each run after a `== <run>` line. A Violation repeating a finding
-//! (`Dedup::repeated_by`) is only counted; a new one is confirmed and
-//! minimized, as `replay` does, and if confirmed is finding n:
-//! `DIR/findings/<n>/{schedule,seeds}`, `seeds` one `seed:k` per line. An
-//! invalid run or baseline is recorded and the sweep goes on. Each seed ends
-//! with its verdict: `safe` (every window valid, mutated and no Violation),
-//! `unsafe` (a window's Violation), `incomplete` (else), or `no windows` (no
-//! mutator or no target: the seed is one unmutated run, window 0); the sweep
-//! with a summary.
+//! each run after a `== <run>` line. A Violation repeating a finding (`Dedup::repeated_by`) is
+//! only counted; a new one is confirmed and minimized, as `replay` does, and
+//! if confirmed is finding n: `DIR/findings/<n>/{schedule,seeds,guilty}`,
+//! `seeds` one `seed:k` per line, `guilty` its step or `-`. An invalid run or baseline is recorded and the sweep
+//! goes on. Each seed ends with its verdict: `safe` (every window valid,
+//! mutated and no Violation), `unsafe` (a window's Violation), `incomplete`
+//! (else), or `no windows` (no mutator or no target: the seed is one unmutated
+//! run, window 0); the sweep with a summary.
 //!
 //! `replay FILE`: everything comes from the file. One baseline, a replay with
 //! every recorded mutation that must give the same class and normalized
@@ -73,7 +80,7 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S]
+const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--resume]
                       [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
        scx_crfuzz replay FILE [-v]
        scx_crfuzz gated     hold the gate scheduler until SIGINT/SIGTERM
@@ -113,6 +120,33 @@ fn durations() {
     for bad in ["", "s", "1d", "1.5h", "+1", "-1", "1 h", "1hs", "2H"] {
         assert_eq!(secs(bad), None, "{bad}");
     }
+}
+
+/// What `--resume` compares of `run`'s arguments after DIR: all but
+/// `--resume`, `--seeds`, `--time` and `--jobs` (with their values) before `--`.
+#[cfg(any(target_os = "linux", test))]
+fn resumable<'a>(argv: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let (mut out, mut it) = (Vec::new(), argv.into_iter());
+    while let Some(a) = it.next() {
+        match a {
+            "--" => {
+                out.push(a);
+                out.extend(it);
+                break;
+            }
+            "--resume" => {}
+            "--seeds" | "--time" | "--jobs" => _ = it.next(),
+            _ => out.push(a),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn resumable_drops_budget() {
+    let a = resumable("--attacker 1:1 --seeds 3 --resume --time 1h --jobs 2 --private /p -- cmd --seeds 9".split(' '));
+    assert_eq!(a, "--attacker 1:1 --private /p -- cmd --seeds 9".split(' ').collect::<Vec<_>>());
 }
 
 #[cfg(target_os = "linux")]
@@ -292,6 +326,8 @@ fn crfuzz() -> anyhow::Result<i32> {
     let mut args = std::env::args().skip(1);
     let (mut mutator, mut layout, mut attacker, mut scope) = (None, None, None, Vec::<PathBuf>::new());
     let (mut verbose, mut timeout, mut limit, mut jobs, mut private) = (false, 30, None, 1, Vec::new());
+    // run: its arguments after DIR, escaped (`DIR/args`).
+    let (mut resume, mut argv) = (false, Vec::new());
     // campaign: DIR and the seeds; loaded: the schedule to replay.
     let (campaign, loaded, cmd) = match args.next().as_deref() {
         Some("-h" | "--help") => {
@@ -341,6 +377,7 @@ fn crfuzz() -> anyhow::Result<i32> {
         }
         Some("run") => {
             let dir = args.next().filter(|d| !d.starts_with('-')).ok_or_else(|| usage("run needs a DIR".into()))?;
+            argv = std::env::args().skip(3).map(|a| schedule::esc(a.as_bytes())).collect();
             let (mut first, mut seeds) = (0, None);
             let cmd: Vec<String> = loop {
                 match args.next().as_deref() {
@@ -351,6 +388,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                         limit = Some(d.ok_or_else(|| usage("--time: not a nonzero N, Ns, Nm or Nh".into()))?);
                     }
                     Some("--first-seed") => first = num(&mut args, "--first-seed")?,
+                    Some("--resume") => resume = true,
                     Some("--jobs") => jobs = nonzero(&mut args, "--jobs")? as usize,
                     Some("--private") => private.push(std::fs::canonicalize(val(&mut args, "--private")?).context("--private")?),
                     // Absolute: the mutator is exec'd after a chdir into the task's cwd.
@@ -378,9 +416,15 @@ fn crfuzz() -> anyhow::Result<i32> {
     // §1: an input, never inferred; refused before anything starts.
     let alice = attacker.ok_or_else(|| usage("--attacker is required".into()))?;
     let (prog, rest) = cmd.split_first().ok_or_else(|| usage("run needs a CMD after --".into()))?;
-    // No resume: an old campaign's runs/ and findings/ would read as this one's.
+    // An old campaign's runs/ and findings/ read as this one's: only if it is this one.
     if let Some((d, ..)) = &campaign {
-        ensure!(std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()), "run: {} is not empty", d.display());
+        if resume {
+            let old = std::fs::read_to_string(d.join("args")).with_context(|| format!("--resume: {} holds no campaign", d.display()))?;
+            let new = resumable(argv.iter().map(String::as_str));
+            ensure!(resumable(old.lines()) == new, "--resume: the arguments differ from {} (only --seeds, --time and --jobs may)", d.join("args").display());
+        } else {
+            ensure!(std::fs::read_dir(d).map_or(true, |mut e| e.next().is_none()), "run: {} is not empty (--resume continues its campaign)", d.display());
+        }
     }
     // The canaries stay shared (unique names), the campaign's output too.
     let canaries = std::fs::canonicalize(oracle::ROOT).unwrap_or_else(|_| oracle::ROOT.into());
@@ -669,11 +713,43 @@ fn crfuzz() -> anyhow::Result<i32> {
     // §3.10: the sweep. Each row is written as its run ends: an interrupted
     // campaign keeps them.
     std::fs::create_dir_all(dir.join("runs")).with_context(|| dir.display().to_string())?;
-    let mut tsv = std::fs::File::create(dir.join("runs.tsv"))?;
-    writeln!(tsv, "seed\twindow\tclass\tstatus\tfinding\tdecisions\tpartial\tsecs\tnote")?;
+    std::fs::write(dir.join("args"), argv.iter().map(|a| format!("{a}\n")).collect::<String>())?;
+    // A file of DIR's, "" if missing (none when not resuming).
+    let read = |p: &Path| match std::fs::read_to_string(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        r => r.with_context(|| p.display().to_string()),
+    };
+    // A seed is complete once it has a verdict; what the others left goes.
+    let seeds_tsv = read(&dir.join("seeds.tsv"))?;
+    let mut complete = BTreeMap::new();
+    let verdict_rows: Vec<&str> = seeds_tsv
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let v = l.split_once('\t').and_then(|(s, v)| Some((s.parse::<u64>().ok()?, VERDICTS.iter().position(|x| x == &v)?)));
+            v.is_some_and(|(s, v)| complete.insert(s, v).is_none())
+        })
+        .collect();
+    let of_complete = |l: &str, sep: char| l.split(sep).next().and_then(|s| s.parse().ok()).is_some_and(|s: u64| complete.contains_key(&s));
+    let runs_tsv = read(&dir.join("runs.tsv"))?;
+    let rows: Vec<&str> = runs_tsv.lines().skip(1).filter(|l| of_complete(l, '\t')).collect();
+    for e in std::fs::read_dir(dir.join("runs"))? {
+        let e = e?;
+        if !e.file_name().to_str().is_some_and(|s| of_complete(s, '/')) {
+            std::fs::remove_dir_all(e.path()).with_context(|| e.path().display().to_string())?;
+        }
+    }
+    // Rewritten whole (then renamed into place), appended to from then on.
+    let table = |name: &str, head: &str, rows: &[&str]| -> Result<std::fs::File> {
+        let (p, tmp) = (dir.join(name), dir.join(format!("{name}.tmp")));
+        std::fs::write(&tmp, rows.iter().fold(format!("{head}\n"), |s, r| s + r + "\n"))?;
+        std::fs::rename(&tmp, &p)?;
+        Ok(std::fs::File::options().append(true).open(&p)?)
+    };
     /// The campaign's totals, behind one lock for every worker.
     struct Tally {
         tsv: std::fs::File,
+        seeds: std::fs::File,
         total: u64,
         invalid: u64,
         decisions: usize,
@@ -681,15 +757,16 @@ fn crfuzz() -> anyhow::Result<i32> {
         time: Duration,
         orders: HashSet<Vec<EventId>>,
         unmutated: u64,
-        classes: BTreeMap<&'static str, u64>,
+        classes: BTreeMap<String, u64>,
         verdicts: [u64; 4],
         /// Seeds ended, for the progress line.
         done: u64,
         /// A baseline has ended: the plan line is out.
         planned: bool,
     }
-    let tally = Mutex::new(Tally {
-        tsv,
+    let mut tally = Tally {
+        tsv: table("runs.tsv", "seed\twindow\tclass\tstatus\tfinding\tdecisions\tpartial\tsecs\tnote", &rows)?,
+        seeds: table("seeds.tsv", "seed\tverdict", &verdict_rows)?,
         total: 0,
         invalid: 0,
         decisions: 0,
@@ -701,10 +778,50 @@ fn crfuzz() -> anyhow::Result<i32> {
         verdicts: [0; 4],
         done: 0,
         planned: false,
-    });
+    };
+    // The totals so far (but the partial orders: their keys are not on disk).
+    for &v in complete.values() {
+        (tally.verdicts[v], tally.done) = (tally.verdicts[v] + 1, tally.done + 1);
+    }
+    for r in &rows {
+        let bad = || format!("{}: bad row {r:?}", dir.join("runs.tsv").display());
+        let c: Vec<&str> = r.split('\t').collect();
+        ensure!(c.len() == 9, bad());
+        *tally.classes.entry(c[2].into()).or_default() += 1;
+        tally.invalid += (c[2] == "invalid" || c[3] == "invalid") as u64;
+        // Not a baseline's row.
+        if c[1] != "-" {
+            tally.total += 1;
+            tally.decisions += c[5].parse::<usize>().with_context(bad)?;
+            tally.partial += c[6].parse::<usize>().with_context(bad)?;
+            tally.time += c[7].parse().ok().and_then(|s| Duration::try_from_secs_f64(s).ok()).with_context(bad)?;
+            tally.unmutated += c[8].starts_with("unmutated") as u64;
+        }
+    }
+    let tally = Mutex::new(tally);
+    // The findings so far, their seed:k lines of complete seeds only: a repeat
+    // counts against them.
+    let mut found = Vec::new();
+    for n in 1.. {
+        let f = dir.join(format!("findings/{n}"));
+        if !f.exists() {
+            break;
+        }
+        let s: Schedule = read(&f.join("schedule"))?.parse().with_context(|| f.display().to_string())?;
+        let guilty = match read(&f.join("guilty"))?.trim() {
+            "-" => None,
+            g => {
+                let id = &g.parse().ok().and_then(|g: usize| s.steps.get(g)).with_context(|| format!("{}/guilty: not a step", f.display()))?.id;
+                Some((id.thread.clone(), id.nr, id.path.clone()))
+            }
+        };
+        let seeds: Vec<String> = read(&f.join("seeds"))?.lines().filter(|l| of_complete(l, ':')).map(String::from).collect();
+        std::fs::write(f.join("seeds"), seeds.iter().map(|s| format!("{s}\n")).collect::<String>())?;
+        found.push((Dedup { guilty, findings: s.findings }, seeds));
+    }
     // Dedup, confirm and push under one lock: two workers on one new bug give
     // a finding and a repeat, never two findings.
-    let found: Mutex<Vec<(Dedup, Vec<String>)>> = Mutex::new(Vec::new());
+    let found: Mutex<Vec<(Dedup, Vec<String>)>> = Mutex::new(found);
     let hold = |t: &str, nr: i64, p: &Option<PathBuf>| format!("({t} {nr} {})", p.as_deref().map_or("-".into(), |p| p.display().to_string()));
     let hms = |s: f64| {
         let s = s.round() as u64;
@@ -722,9 +839,10 @@ fn crfuzz() -> anyhow::Result<i32> {
         let head = match n {
             Some(n) => {
                 let w = 24;
-                let fill = (done * w / n) as usize;
-                // From the seeds so far (confirms included); the plan line has the first guess.
-                let eta = if done == 0 { "?".into() } else { hms(elapsed.as_secs_f64() / done as f64 * (n - done) as f64) };
+                let fill = (done.min(n) * w / n) as usize;
+                // From this session's seeds (confirms included); the plan line has the first guess.
+                let ran = done.saturating_sub(complete.len() as u64);
+                let eta = if ran == 0 { "?".into() } else { hms(elapsed.as_secs_f64() / ran as f64 * n.saturating_sub(done) as f64) };
                 format!("[{}{}] {done}/{n} seeds  ETA {eta}", "#".repeat(fill), ".".repeat(w as usize - fill))
             }
             None => {
@@ -771,6 +889,9 @@ fn crfuzz() -> anyhow::Result<i32> {
                 break;
             }
             let seed = first + idx;
+            if complete.contains_key(&seed) {
+                continue;
+            }
             let t = Instant::now();
             let rd = dir.join(format!("runs/{seed}"));
             std::fs::create_dir_all(&rd)?;
@@ -784,11 +905,12 @@ fn crfuzz() -> anyhow::Result<i32> {
                     g.invalid += 1;
                     g.verdicts[2] += 1;
                     g.done += 1;
-                    *g.classes.entry("invalid").or_default() += 1;
+                    *g.classes.entry("invalid".into()).or_default() += 1;
                     let note = format!("baseline: {e:#}").replace(['\t', '\n'], " ");
                     let part = log.iter().filter(|d| d.partial).count();
                     writeln!(g.tsv, "{seed}\t-\tinvalid\t-\t-\t{}\t{part}\t{:.3}\t{note}", log.len(), t.elapsed().as_secs_f64())?;
                     say(&mut w, format!("[{}{of}] seed {seed}: incomplete, {note}", idx + 1))?;
+                    writeln!(g.seeds, "{seed}\t{}", VERDICTS[2])?;
                     show(&mut w, &g, true)?;
                     continue;
                 }
@@ -861,6 +983,8 @@ fn crfuzz() -> anyhow::Result<i32> {
                                         let f = dir.join(format!("findings/{}", found.len()));
                                         std::fs::create_dir_all(&f)?;
                                         std::fs::write(f.join("schedule"), s.to_string())?;
+                                        // For --resume: the guilty step's index, or `-`.
+                                        std::fs::write(f.join("guilty"), g.map_or("-".into(), |g| g.to_string()) + "\n")?;
                                         ("Violation", "new", Some(found.len()), note)
                                     }
                                 }
@@ -883,7 +1007,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                 (g.total, g.time) = (g.total + 1, g.time + secs);
                 (g.decisions, g.partial) = (g.decisions + len, g.partial + part);
                 bad |= class == "Violation";
-                *g.classes.entry(class).or_default() += 1;
+                *g.classes.entry(class.into()).or_default() += 1;
                 let note = match (unmut, note.is_empty()) {
                     (false, _) => note,
                     (true, true) => "unmutated".into(),
@@ -907,6 +1031,7 @@ fn crfuzz() -> anyhow::Result<i32> {
             let mut g = tally.lock().unwrap();
             g.verdicts[v] += 1;
             g.done += 1;
+            writeln!(g.seeds, "{seed}\t{}", VERDICTS[v])?;
             say(&mut w, format!("[{}{of}] seed {seed}: {}", idx + 1, VERDICTS[v]))?;
             show(&mut w, &g, true)?;
         }
@@ -947,7 +1072,7 @@ fn crfuzz() -> anyhow::Result<i32> {
     println!("campaign: {} seeds, {total} runs, {invalid} invalid, discovery {:.1}s", n.unwrap_or(done), time.as_secs_f64());
     let v: Vec<String> = VERDICTS.iter().zip(verdicts).map(|(name, c)| format!("{c} {name}")).collect();
     println!("seeds: {}", v.join(", "));
-    println!("distinct partial orders: {}", orders.len());
+    println!("distinct partial orders: {}{}", orders.len(), if complete.is_empty() { "" } else { " (this session's runs only)" });
     println!("partial decisions: {partial}/{decisions} ({:.0}%)", 100.0 * partial as f64 / decisions.max(1) as f64);
     if unmutated > 0 {
         println!("unmutated: {unmutated}/{total} runs never reached their target");
