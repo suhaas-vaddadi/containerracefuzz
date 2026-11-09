@@ -643,6 +643,8 @@ fn crfuzz() -> anyhow::Result<i32> {
     backend::sweep();
     // Worker w's private copies: work/<w>/<i>.
     let work = Path::new(oracle::ROOT).join(format!("work/{}", std::process::id()));
+    // A crfuzz killed with our pid left these (sweep keeps a live pid's): never ours yet.
+    let _ = std::fs::remove_dir_all(&work);
     let _work = (!private.is_empty()).then(|| Work(work.clone()));
     println!("{alice}");
     let Some((dir, first, n)) = campaign else {
