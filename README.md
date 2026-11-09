@@ -14,7 +14,11 @@ one hold that causes it.
 
 - Linux with `sched_ext` (6.12+, `CONFIG_SCHED_CLASS_EXT`), cgroup v2, and
   seccomp `WAIT_KILLABLE_RECV` (5.19+). Root.
-- Rust, plus `clang` and libelf/zlib headers for the BPF build.
+- Rust, plus `clang` for the BPF build, and `gcc`, `make`, `autoconf`,
+  `automake`, `autopoint` (gettext), `flex` and `bison` for the bundled
+  libelf/zlib/libbpf, which are linked statically: the release binary needs
+  only libc. Fedora:
+  `dnf install clang gcc make autoconf automake gettext-devel flex bison`.
 - On macOS, the workspace builds and the pure tests run, but nothing executes:
   use a Linux VM (development uses a Lima VM named `sched-ext`).
 
