@@ -1,5 +1,6 @@
 //! scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--resume] [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
 //! scx_crfuzz replay FILE [-v]
+//! scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID] [--seeds N] [--time DURATION] [--jobs N] [--resume] [-v]
 //! scx_crfuzz gated | status | reset | check
 //!
 //! `run` sweeps seeds S..S+N (default S 0; §3.10), each exhaustive over its
@@ -72,6 +73,21 @@
 //!
 //! `check` runs the preflight, one line per check, and exits 1 if any failed;
 //! `run` and `replay` run it first and stop on its failures.
+//!
+//! `containerd` is a built-in target: containerd -> shim -> runc starting a
+//! busybox container from a rootfs alice (default 65534:65534) owns, the
+//! embedded mutator_all at every hold under it. Its preflight adds
+//! `containerd`, `ctr` and `runc` on PATH and BUSYBOX (default
+//! /usr/bin/busybox) readable and static. It recreates D (default
+//! /tmp/crfuzz-containerd; its parent must exist; refused unless it and its
+//! ancestors are root-only, and it is empty or a former D, marked by
+//! `.crfuzz-containerd`): `rootfs/` and its pristine `rootfs.orig/`,
+//! `mut/mutator_all` (mirrored at the same
+//! path inside the rootfs, so the held task's view has it), `sut.sh`,
+//! `layout.sh`, `run/` (the daemon's state) and `logs/` (`mutator.log`,
+//! writable by alice, and `containerd.log`); then, from D, runs the campaign
+//! `D/campaign` as `run` with `--private` rootfs, run, /run/containerd/s and
+//! /run/nri, `--scope` the rootfs. `--resume` keeps `campaign/` and `logs/`.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -83,6 +99,7 @@ fn main() {
 const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID [--seeds N] [--time DURATION] [--first-seed S] [--resume]
                       [--jobs N] [--private DIR]... [--mutator PROG] [--layout PROG] [--scope DIR]... [--timeout SECS] [-v] -- CMD [ARGS...]
        scx_crfuzz replay FILE [-v]
+       scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID] [--seeds N] [--time DURATION] [--jobs N] [--resume] [-v]
        scx_crfuzz gated     hold the gate scheduler until SIGINT/SIGTERM
        scx_crfuzz status    sched_ext state and pins
        scx_crfuzz reset     delete every gate entry of every run
@@ -149,9 +166,46 @@ fn resumable_drops_budget() {
     assert_eq!(a, "--attacker 1:1 --private /p -- cmd --seeds 9".split(' ').collect::<Vec<_>>());
 }
 
+/// Whether an ELF64 little-endian image names an interpreter (PT_INTERP):
+/// dynamically linked. None: not one.
+#[cfg(any(target_os = "linux", test))]
+fn dynamic(elf: &[u8]) -> Option<bool> {
+    let u = |o: usize, n: usize| Some(elf.get(o..o.checked_add(n)?)?.iter().rev().fold(0u64, |a, &b| a << 8 | b as u64));
+    if elf.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let (off, size) = (u(0x20, 8)?, u(0x36, 2)?);
+    for i in 0..u(0x38, 2)? {
+        if u(usize::try_from(off.checked_add(i * size)?).ok()?, 4)? == 3 {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[cfg(test)]
+#[test]
+fn elf_interp() {
+    // A header with one program header at 64 of type `t`.
+    let elf = |t: u8| {
+        let mut b = vec![0; 120];
+        b[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        (b[0x20], b[0x36], b[0x38], b[64]) = (64, 56, 1, t);
+        b
+    };
+    assert_eq!([dynamic(&elf(3)), dynamic(&elf(1)), dynamic(&elf(3)[..66]), dynamic(b"#!/bin/sh")], [Some(true), Some(false), None, None]);
+}
+
+/// `name` in PATH: a file with an execute bit.
+#[cfg(target_os = "linux")]
+fn on_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
 #[cfg(target_os = "linux")]
 fn main() {
-    std::process::exit(match crfuzz() {
+    std::process::exit(match crfuzz(std::env::args().skip(1).collect()) {
         Ok(code) => code,
         Err(e) if e.is::<Usage>() => {
             eprintln!("{e}");
@@ -169,9 +223,10 @@ fn main() {
     });
 }
 
-/// Each check's name and, failed, why and how to fix it.
+/// Each check's name and, failed, why and how to fix it; with `busybox`,
+/// the containerd target's too.
 #[cfg(target_os = "linux")]
-fn preflight() -> Vec<(&'static str, Result<(), String>)> {
+fn preflight(busybox: Option<&std::path::Path>) -> Vec<(&'static str, Result<(), String>)> {
     use scx_crfuzz::{gate, oracle};
     use std::ffi::{CStr, CString};
     let euid = unsafe { libc::geteuid() };
@@ -193,7 +248,7 @@ fn preflight() -> Vec<(&'static str, Result<(), String>)> {
         }
         Ok(())
     };
-    vec![
+    let mut checks = vec![
         ("root", if euid == 0 { Ok(()) } else { Err(format!("euid {euid}; run as root (sudo)")) }),
         ("kernel >= 6.12", if kernel >= (6, 12) { Ok(()) } else { Err(format!("{release} predates sched_ext; boot 6.12 or later")) }),
         (
@@ -209,12 +264,28 @@ fn preflight() -> Vec<(&'static str, Result<(), String>)> {
         ("cgroup v2", mounted("/sys/fs/cgroup", libc::CGROUP2_SUPER_MAGIC as u32, "cgroup2")),
         ("bpffs", mounted("/sys/fs/bpf", libc::BPF_FS_MAGIC as u32, "bpf")),
         ("/var/lib/crfuzz", oracle::root_only().map_err(|e| format!("{e:#}; chown root and chmod go-w it"))),
-    ]
+    ];
+    if let Some(b) = busybox {
+        for p in ["containerd", "ctr", "runc"] {
+            checks.push((p, on_path(p).map(drop).ok_or_else(|| "not on PATH; install it, or keep PATH through sudo (sudo env PATH=$PATH ...)".into())));
+        }
+        let image = match std::fs::read(b) {
+            Err(e) => Err(format!("{}: {e}; pass --image a static busybox", b.display())),
+            Ok(elf) => match dynamic(&elf) {
+                Some(false) => Ok(()),
+                Some(true) => Err(format!("{} is dynamically linked, but the container holds no libc; pass --image a static busybox", b.display())),
+                None => Err(format!("{} is not an ELF64 executable; pass --image a static busybox", b.display())),
+            },
+        };
+        checks.push(("busybox image", image));
+    }
+    checks
 }
 
-/// The exit status: 0, 3 for a confirmed finding, or 130 interrupted.
+/// `all`: the arguments after the program name. The exit status: 0, 3 for a
+/// confirmed finding, or 130 interrupted.
 #[cfg(target_os = "linux")]
-fn crfuzz() -> anyhow::Result<i32> {
+fn crfuzz(all: Vec<String>) -> anyhow::Result<i32> {
     use anyhow::{bail, ensure, Context, Result};
     use scx_crfuzz::backend::{self, GateBackend, SelfCheckFailed};
     use scx_crfuzz::engine::{self, Deadline, Decision, Interrupted, Judge, Replay};
@@ -319,11 +390,18 @@ fn crfuzz() -> anyhow::Result<i32> {
     }
 
     let usage = |why: String| anyhow::Error::new(Usage(why));
-    type Args = std::iter::Skip<std::env::Args>;
+    type Args = std::vec::IntoIter<String>;
     let val = |args: &mut Args, flag: &str| args.next().ok_or_else(|| usage(format!("{flag} needs a value")));
     let num = |args: &mut Args, flag: &str| -> Result<u64> { val(args, flag)?.parse().map_err(|_| usage(format!("{flag}: not a number"))) };
     let nonzero = |args: &mut Args, flag: &str| -> Result<u64> { Some(num(args, flag)?).filter(|&v| v > 0).ok_or_else(|| usage(format!("{flag}: must be at least 1"))) };
-    let mut args = std::env::args().skip(1);
+    let time = |v: &str| duration(v).filter(|d| !d.is_zero()).ok_or_else(|| usage("--time: not a nonzero N, Ns, Nm or Nh".into()));
+    // run, replay and containerd stop on the preflight's failures.
+    let preflight_ok = |busybox: Option<&Path>| -> Result<()> {
+        let failed: Vec<String> = preflight(busybox).into_iter().filter_map(|(name, r)| Some(format!("{name}: FAIL: {}", r.err()?))).collect();
+        ensure!(failed.is_empty(), "preflight:\n{}", failed.join("\n"));
+        Ok(())
+    };
+    let mut args = all.clone().into_iter();
     let (mut mutator, mut layout, mut attacker, mut scope) = (None, None, None, Vec::<PathBuf>::new());
     let (mut verbose, mut timeout, mut limit, mut jobs, mut private) = (false, 30, None, 1, Vec::new());
     // run: its arguments after DIR, escaped (`DIR/args`).
@@ -349,7 +427,7 @@ fn crfuzz() -> anyhow::Result<i32> {
                 }
                 "status" => gate::status()?,
                 "check" => {
-                    let checks = preflight();
+                    let checks = preflight(None);
                     for (name, r) in &checks {
                         println!("{name}: {}", r.as_ref().map_or_else(|e| format!("FAIL: {e}"), |()| "ok".into()));
                     }
@@ -377,16 +455,13 @@ fn crfuzz() -> anyhow::Result<i32> {
         }
         Some("run") => {
             let dir = args.next().filter(|d| !d.starts_with('-')).ok_or_else(|| usage("run needs a DIR".into()))?;
-            argv = std::env::args().skip(3).map(|a| schedule::esc(a.as_bytes())).collect();
+            argv = all[2..].iter().map(|a| schedule::esc(a.as_bytes())).collect();
             let (mut first, mut seeds) = (0, None);
             let cmd: Vec<String> = loop {
                 match args.next().as_deref() {
                     Some("--attacker") => attacker = Some(Alice::parse(&val(&mut args, "--attacker")?).map_err(|e| usage(format!("{e:#}")))?),
                     Some("--seeds") => seeds = Some(nonzero(&mut args, "--seeds")?),
-                    Some("--time") => {
-                        let d = duration(&val(&mut args, "--time")?).filter(|d| !d.is_zero());
-                        limit = Some(d.ok_or_else(|| usage("--time: not a nonzero N, Ns, Nm or Nh".into()))?);
-                    }
+                    Some("--time") => limit = Some(time(&val(&mut args, "--time")?)?),
                     Some("--first-seed") => first = num(&mut args, "--first-seed")?,
                     Some("--resume") => resume = true,
                     Some("--jobs") => jobs = nonzero(&mut args, "--jobs")? as usize,
@@ -409,6 +484,111 @@ fn crfuzz() -> anyhow::Result<i32> {
                 return Err(usage("--jobs N > 1 needs --private DIR: the workers share one filesystem, so their layouts, SUTs and mutators would meet in what the runs write".into()));
             }
             (Some((PathBuf::from(dir), first, seeds)), None, cmd)
+        }
+        // The built-in target: its scenario in D, then `run` on D/campaign.
+        Some("containerd") => {
+            const MUTATOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mutator_all"));
+            const SUT: &str = include_str!("../targets/containerd/sut.sh");
+            const LAYOUT: &str = include_str!("../targets/containerd/layout.sh");
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let (mut d, mut image, mut att) = ("/tmp/crfuzz-containerd".to_string(), "/usr/bin/busybox".to_string(), "65534:65534".to_string());
+            // What goes to `run` as given: the budget, --resume, -v.
+            let mut pass = Vec::new();
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--dir" => d = val(&mut args, "--dir")?,
+                    "--image" => image = val(&mut args, "--image")?,
+                    "--attacker" => att = val(&mut args, "--attacker")?,
+                    // Checked here: D is recreated before `run` parses them.
+                    "--seeds" | "--jobs" => pass.extend([a.clone(), nonzero(&mut args, &a)?.to_string()]),
+                    "--time" => {
+                        let v = val(&mut args, "--time")?;
+                        time(&v)?;
+                        pass.extend([a, v]);
+                    }
+                    "--resume" | "-v" => pass.push(a),
+                    _ => return Err(usage(format!("unknown argument {a}"))),
+                }
+            }
+            let resume = pass.iter().any(|a| a == "--resume");
+            let alice = Alice::parse(&att).map_err(|e| usage(format!("{e:#}")))?;
+            preflight_ok(Some(Path::new(&image)))?;
+            // Root runs sut.sh and layout.sh from D: D is root's alone, and so
+            // is every ancestor, none writable by another user but a sticky
+            // one (as /tmp), so none can be swapped. Checked on the canonical
+            // parent (no symlink to re-point), before D is created.
+            let d = std::path::absolute(&d)?;
+            let (parent, name) = d.parent().zip(d.file_name()).with_context(|| format!("--dir {}: not a scratch directory", d.display()))?;
+            let parent = std::fs::canonicalize(parent).with_context(|| format!("--dir {}: its parent", d.display()))?;
+            for a in parent.ancestors() {
+                let m = std::fs::symlink_metadata(a).with_context(|| a.display().to_string())?;
+                ensure!(m.uid() == 0 && (m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0), "--dir {}: {} is not root-only; pass another", d.display(), a.display());
+            }
+            let d = parent.join(name);
+            match std::fs::DirBuilder::new().mode(0o755).create(&d) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e).context(d.display().to_string()),
+                _ => {}
+            }
+            let m = std::fs::symlink_metadata(&d)?;
+            ensure!(m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0, "--dir {}: not root-only; pass another", d.display());
+            // Only ever a former D is wiped: the marker, written before anything
+            // else, says it is one, even after a setup that failed.
+            let marker = d.join(".crfuzz-containerd");
+            let mut rd = std::fs::read_dir(&d)?.peekable();
+            ensure!(rd.peek().is_none() || marker.exists(), "--dir {}: not empty and not a containerd scenario (no {}); pass another", d.display(), marker.display());
+            std::fs::write(&marker, "")?;
+            for e in rd {
+                let e = e?;
+                if e.path() == marker || resume && (e.file_name() == "campaign" || e.file_name() == "logs") {
+                    continue;
+                }
+                if e.file_type()?.is_dir() { std::fs::remove_dir_all(e.path()) } else { std::fs::remove_file(e.path()) }.with_context(|| e.path().display().to_string())?;
+            }
+            let (rootfs, mutator) = (d.join("rootfs"), d.join("mut/mutator_all"));
+            for p in [rootfs.join("bin"), rootfs.join("proc"), rootfs.join("dev"), rootfs.join("tmp"), d.join("mut"), d.join("logs"), d.join("run"), "/run/containerd/s".into(), "/run/nri".into()] {
+                std::fs::create_dir_all(&p).with_context(|| p.display().to_string())?;
+            }
+            // alice's log is hers to write; logs/ stays root's, or she could
+            // redirect the SUT's own log into the canary.
+            let log = d.join("logs/mutator.log");
+            std::fs::File::options().create(true).append(true).open(&log)?;
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o666))?;
+            std::fs::copy(&image, rootfs.join("bin/busybox")).with_context(|| image.clone())?;
+            // Also at its own path in the rootfs: the held task's view after pivot_root.
+            let mirror = rootfs.join(mutator.strip_prefix("/")?);
+            std::fs::create_dir_all(mirror.parent().context("mutator dir")?)?;
+            for (p, body) in [(&mutator, MUTATOR), (&mirror, MUTATOR), (&d.join("sut.sh"), SUT.as_bytes()), (&d.join("layout.sh"), LAYOUT.as_bytes())] {
+                std::fs::write(p, body).with_context(|| p.display().to_string())?;
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755))?;
+            }
+            let sh = |c: &mut Command| -> Result<()> {
+                let st = c.status().with_context(|| format!("{c:?}"))?;
+                ensure!(st.success(), "{c:?}: {st}");
+                Ok(())
+            };
+            sh(Command::new("chown").arg("-R").arg(format!("{}:{}", alice.uid, alice.gid)).arg("--").arg(&rootfs))?;
+            // Pristine copy; layout.sh restores the rootfs from it before each run.
+            sh(Command::new("cp").arg("-a").arg("--").arg(&rootfs).arg(d.join("rootfs.orig")))?;
+            // sut.sh's and layout.sh's inputs; the mutator's scope and log. Other
+            // CRFUZZ_* pass through to the mutator. One thread yet: set_var is sound.
+            std::env::set_var("CRFUZZ_DIR", &d);
+            std::env::set_var("CRFUZZ_ROOTFS", &rootfs);
+            std::env::set_var("CRFUZZ_SCOPE", &rootfs);
+            std::env::set_var("CRFUZZ_LOG", &log);
+            std::env::set_var("CRFUZZ_CONTAINERD", on_path("containerd").context("containerd")?);
+            std::env::set_var("CRFUZZ_CTR", on_path("ctr").context("ctr")?);
+            // The SUT inherits the cwd: relative paths stay in D.
+            std::env::set_current_dir(&d)?;
+            println!("scenario: containerd -> shim -> runc startup; busy busybox rootfs owned by {att}");
+            println!("campaign: {}", d.join("campaign").display());
+            let p = |p: &Path| p.display().to_string();
+            let mut run = vec!["run".into(), p(&d.join("campaign")), "--attacker".into(), att];
+            run.extend(pass);
+            for x in [p(&rootfs), p(&d.join("run")), "/run/containerd/s".into(), "/run/nri".into()] {
+                run.extend(["--private".into(), x]);
+            }
+            run.extend(["--mutator".into(), p(&mutator), "--layout".into(), p(&d.join("layout.sh")), "--scope".into(), p(&rootfs), "--".into(), p(&d.join("sut.sh"))]);
+            return crfuzz(run);
         }
         Some(a) => return Err(usage(format!("unknown command {a}"))),
         None => return Err(usage("a command is required".into())),
@@ -679,8 +859,7 @@ fn crfuzz() -> anyhow::Result<i32> {
         Ok(Some(None))
     };
 
-    let failed: Vec<String> = preflight().into_iter().filter_map(|(name, r)| Some(format!("{name}: FAIL: {}", r.err()?))).collect();
-    ensure!(failed.is_empty(), "preflight:\n{}", failed.join("\n"));
+    preflight_ok(None)?;
     engine::stop_on_signals();
     // Ours for this process's life unless crfuzz's already runs.
     let _sched = gate::Scheduler::start()?;

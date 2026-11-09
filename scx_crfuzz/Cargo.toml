@@ -16,3 +16,5 @@ scx_utils = "=1.1.4"
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 scx_cargo = "=1.1.4"
+# Only for its compiler lookup: build.rs links the static mutator itself.
+cc = "1"

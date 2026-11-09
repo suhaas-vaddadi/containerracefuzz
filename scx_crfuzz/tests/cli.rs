@@ -1,5 +1,5 @@
 //! The judged CLI (§1, §10). `missing_attacker_refused`,
-//! `usage_errors_exit_2` and `private_refused` need nothing; the rest need root and a running
+//! `usage_errors_exit_2`, `private_refused` and `containerd_preflight_refused` need nothing; the rest need root and a running
 //! `scx_crfuzz gated`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
@@ -60,6 +60,11 @@ fn usage_errors_exit_2() {
         vec!["replay", "a", "b"],
         vec!["gated", "x"],
         vec!["status", "x"],
+        vec!["containerd", "--bogus"],
+        vec!["containerd", "--seeds", "0"],
+        vec!["containerd", "--jobs"],
+        vec!["containerd", "--time", "1d"],
+        vec!["containerd", "--attacker", "1"],
     ] {
         let (out, _) = crfuzz(&args);
         let err = String::from_utf8_lossy(&out.stderr);
@@ -85,6 +90,56 @@ fn private_refused() {
         assert!(err.contains(why), "{private}: {err}");
         assert!(left(pid).is_empty() && !std::path::Path::new(d).exists());
     }
+}
+
+/// containerd: its preflight's failures listed (here the image), before D
+/// is touched.
+#[test]
+fn containerd_preflight_refused() {
+    let d = "/tmp/crfuzz_cli_containerd";
+    let _ = fs::remove_dir_all(d);
+    let (out, _) = crfuzz(&["containerd", "--dir", d, "--image", "/nonexistent", "--seeds", "1"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("busybox image: FAIL: /nonexistent: ") && !err.contains(": ok"), "{err}");
+    assert!(!std::path::Path::new(d).exists());
+}
+
+/// containerd's D, refused and untouched (it is wiped, and its scripts run
+/// as root): non-empty without the marker, or it or an ancestor not root's. Needs root, the
+/// target's preflight to pass (containerd, ctr, runc, /usr/bin/busybox).
+#[test]
+#[ignore]
+fn containerd_dir_refused() {
+    use std::os::unix::fs::chown;
+    let d = "/tmp/crfuzz_cli_containerd_dir";
+    let _ = fs::remove_dir_all(d);
+    fs::create_dir(d).unwrap();
+    fs::write(format!("{d}/keep"), "").unwrap();
+    fs::write(format!("{d}/sut.sh"), "").unwrap();
+    let refused = |why: &str| {
+        let (out, _) = crfuzz(&["containerd", "--dir", d, "--seeds", "1"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(err.contains(why), "{err}");
+        let mut left: Vec<String> = fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        left
+    };
+    assert_eq!(refused("not a containerd scenario"), ["keep", "sut.sh"]);
+    fs::write(format!("{d}/.crfuzz-containerd"), "").unwrap();
+    chown(d, Some(65534), Some(65534)).unwrap();
+    assert_eq!(refused(&format!("--dir {d}: not root-only")), [".crfuzz-containerd", "keep", "sut.sh"]);
+    // An ancestor alice owns (0755): refused, nothing created in it.
+    fs::remove_dir_all(d).unwrap();
+    fs::create_dir(d).unwrap();
+    chown(d, Some(65534), Some(65534)).unwrap();
+    let (out, _) = crfuzz(&["containerd", "--dir", &format!("{d}/x"), "--seeds", "1"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains(&format!("{d} is not root-only")), "{err}");
+    assert_eq!(fs::read_dir(d).unwrap().count(), 0);
+    fs::remove_dir_all(d).unwrap();
 }
 
 /// Preflight: as root with the gate running every check passes; as alice
