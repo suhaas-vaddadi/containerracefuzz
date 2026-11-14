@@ -1,24 +1,13 @@
 //! POS over SUT threads: seeded per-event priorities, release the max, redraw
-//! only the ready events whose read/write keys conflict with it. Events are
-//! named by creation-tree thread names, never tids. Pure: no I/O, so the
-//! determinism test runs off-target.
+//! only the ready events whose read/write keys conflict with it. Pure: no
+//! I/O, so the determinism test runs off-target.
 
+use crate::name::{splitmix, EventId, Fnv};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-
-/// `(thread, syscall, path, occurrence)`, the thread named by its place in
-/// the creation tree, not its tid (which differs every run). Ord is the
-/// canonical tie-break order.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventId {
-    pub thread: String,
-    pub nr: i64,
-    pub path: Option<PathBuf>,
-    pub n: u32,
-}
 
 /// One conflict key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -113,31 +102,6 @@ impl Pos {
         self.redraws.remove(ready[top].0);
         Some(top)
     }
-}
-
-/// FNV-1a, seeded: a hash that stays fixed across Rust releases (std's
-/// DefaultHasher doesn't promise that).
-struct Fnv(u64);
-
-impl Fnv {
-    fn new(seed: u64) -> Self {
-        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
-        h.write(&seed.to_le_bytes());
-        h
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01b3);
-        }
-    }
-}
-
-/// Spread FNV's weak low bits.
-fn splitmix(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 #[cfg(test)]

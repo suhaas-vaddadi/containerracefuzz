@@ -23,7 +23,7 @@ fn go_clones_named_without_stall() {
     for seed in 0..10 {
         let mut cmd = Command::new(&bin);
         cmd.arg(&trigger);
-        let mut be = GateBackend::spawn(cmd, &[libc::SYS_openat]).unwrap();
+        let mut be = GateBackend::spawn(cmd).unwrap();
         let t = Instant::now();
         let deadline = t + Duration::from_secs(60);
         let mut log = Vec::new();
