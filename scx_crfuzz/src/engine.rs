@@ -10,7 +10,6 @@ use crate::pos::{Keys, Pos};
 use crate::schedule::{self, Divergence, Fixed, Step};
 use crate::sensor::{wait_frontier, Frontier};
 use anyhow::{bail, Result};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -169,7 +168,6 @@ pub fn run(
     log: &mut Vec<Decision>,
 ) -> Result<End> {
     let root = be.child().id();
-    let mut footprint = BTreeSet::new();
     let mut held: Vec<Event> = Vec::new();
     let mut ids: Vec<EventId> = Vec::new();
     // Replaying: since the next step was first missing (wall clock, not reset by other releases).
@@ -246,12 +244,6 @@ pub fn run(
         // Logged at once: every ending from here (deadline, invalid run,
         // error) keeps it.
         log.push(Decision { id, keys: ev.keys.clone(), frames: ev.frames, partial: !complete, sleepers, mutation: None });
-        if let Some(p) = &ev.path {
-            // Dirfd-relative: the fd number means nothing at the final hold.
-            if p.is_absolute() || ev.dirfd.is_none() {
-                footprint.insert(p.clone());
-            }
-        }
         let judged = judge.as_deref().map(|j| (&j.alice, j.canary));
         // The whole tree stays put while the mutator runs.
         let mutated = match mutator {
@@ -278,7 +270,7 @@ pub fn run(
             Some(j) if ev.nr == libc::SYS_exit_group && ev.tgid == root => {
                 be.gate_tree()?;
                 j.task = Some((ev.tid, ev.tgid, ev.process.clone()));
-                Some(be.probe(&ev, &j.alice, j.canary, &footprint, MUTATOR_TIMEOUT))
+                Some(be.probe(&ev, &j.alice, j.canary, MUTATOR_TIMEOUT))
             }
             _ => None,
         };

@@ -1,5 +1,6 @@
-//! GateBackend: park SUT threads at watched syscalls (seccomp user-notify) and
-//! stop the whole SUT tree with the gate scheduler while the mutator runs.
+//! GateBackend: park SUT threads at watched syscalls (seccomp user-notify),
+//! let the ones out of scope go at once, and stop the whole SUT tree with the
+//! gate scheduler while the mutator runs.
 //! Becoming alice needs Linux 5.11 (close_range CLOEXEC) and openat2 (5.6);
 //! older kernels fail every mutation and probe, so every judged run is invalid.
 
@@ -95,17 +96,30 @@ pub struct GateBackend {
     gate: GateMap,
     child: Child,
     notify: OwnedFd,
+    /// The `--scope` directories, as the keys a walk through one reads.
+    /// Empty: everything is in scope.
+    scope: Vec<Key>,
     gated: bool,
+    /// Every path the tree issued, as its task saw it: what the probe stats.
+    footprint: BTreeSet<PathBuf>,
 }
 
 impl GateBackend {
     /// Spawn `cmd` as the SUT: the root of a fresh run's tree in the gate
     /// scheduler, enrolled in SCHED_EXT, its `WATCHED` syscalls trapping to
-    /// us. Fails if the gate scheduler isn't up (never fall back to
-    /// seccomp-only: without the gate the tree can't be stopped while the
-    /// mutator runs).
-    pub fn spawn(mut cmd: Command) -> Result<Self> {
+    /// us. With `scope` directories, only the events that resolve through one
+    /// are held; the rest run on as they trap. Fails if the gate scheduler
+    /// isn't up (never fall back to seccomp-only: without the gate the tree
+    /// can't be stopped while the mutator runs).
+    pub fn spawn(mut cmd: Command, scope: &[PathBuf]) -> Result<Self> {
         let gate = GateMap::open()?;
+        // By inode, as the SUT will meet them: under `--private` this is the
+        // worker's own copy, and a path reaches it however it is spelled
+        // (relative, through a dirfd or a symlink, inside a container).
+        let scope = scope
+            .iter()
+            .map(|d| fs::metadata(d).map(|m| Key::Ino(m.dev(), m.ino())).with_context(|| format!("--scope {}", d.display())))
+            .collect::<Result<Vec<_>>>()?;
         let filter = notify_filter(WATCHED);
         let join = gate.joiner();
 
@@ -156,7 +170,7 @@ impl GateBackend {
         drop(theirs);
         let child = child.context("spawn SUT")?;
         let notify = recv_fd(ours.as_raw_fd()).context("receive seccomp listener")?;
-        Ok(Self { gate, child, notify, gated: false })
+        Ok(Self { gate, child, notify, scope, gated: false, footprint: BTreeSet::new() })
     }
 
     pub fn child(&mut self) -> &mut Child {
@@ -206,7 +220,10 @@ impl GateBackend {
         Ok(if events.is_empty() { Poll::Idle } else { Poll::Events(events) })
     }
 
-    /// The next trapped syscall: None if its task is gone.
+    /// The next trapped syscall: None if its task is gone, or if it is out of
+    /// scope, which lets it run on at once: it is never held, named or
+    /// ordered, in discovery and replay alike. The root's `exit_group` is
+    /// always held: the probe runs there.
     fn recv(&mut self) -> Result<Option<Event>> {
         let req = match notif_recv(self.notify.as_raw_fd()) {
             Ok(req) => req,
@@ -222,6 +239,16 @@ impl GateBackend {
         let Some((regs, tgid)) = self.gate.sys_regs(tid) else { return self.resume(req.id).map(|()| None) };
         let (path, keys) = observe(tid, nr, &args);
         let dirfd = path_args(nr).first().and_then(|a| a.0).map(|d| args[d] as i32).filter(|&fd| fd != libc::AT_FDCWD);
+        if let Some(p) = &path {
+            // As the probe will stat it: absolute, or from the directory it
+            // was issued against, as that task's view names it now.
+            let base = dirfd.map_or(format!("/proc/{tid}/cwd"), |fd| format!("/proc/{tid}/fd/{fd}"));
+            self.footprint.extend(if p.is_absolute() { Some(p.clone()) } else { fs::read_link(base).ok().map(|d| d.join(p)) });
+        }
+        let final_hold = nr == libc::SYS_exit_group && tgid == self.child.id();
+        if !self.scope.is_empty() && !final_hold && !self.scope.iter().any(|k| keys.reads.contains(k)) {
+            return self.resume(req.id).map(|()| None);
+        }
         let maps = Maps::parse(&fs::read_to_string(format!("/proc/{tid}/maps")).unwrap_or_default());
         let (callsite, frames) = name::callsite(&unwind(tid, regs, &maps), &maps);
         let process = self.gate.name(tgid).unwrap_or_else(|| format!("?{tgid}"));
@@ -552,10 +579,10 @@ impl GateBackend {
     /// regular file she can open; then, as root, the task's own handles if it
     /// runs as alice. None: the self-check failed. Killed after `timeout`; any
     /// failure makes the run invalid.
-    pub fn probe(&self, ev: &Event, alice: &Alice, canary: &Canary, footprint: &BTreeSet<PathBuf>, timeout: Duration) -> Result<Option<Vec<Finding>>> {
+    pub fn probe(&self, ev: &Event, alice: &Alice, canary: &Canary, timeout: Duration) -> Result<Option<Vec<Finding>>> {
         let mut found = 'view: {
             let Some(view) = self.view(ev, Some(canary), As::Alice(alice))? else { break 'view Vec::new() };
-            let mut paths: Vec<PathBuf> = footprint.iter().cloned().collect();
+            let mut paths: Vec<PathBuf> = self.footprint.iter().cloned().collect();
             paths.extend(oracle::mount_points(&fs::read(format!("/proc/{}/mountinfo", ev.tid))?));
             let cpaths = paths.iter().map(|p| CString::new(p.as_os_str().as_bytes())).collect::<Result<Vec<_>, _>>()?;
             let token = canary.token.as_bytes();

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 /// One run of `cmd`, the mutator firing at `target`: how it ended, and its log.
 fn once(cmd: Command, m: Option<&Path>, target: Option<&EventId>, judge: Option<&mut Judge>) -> (End, Vec<Decision>) {
-    let mut be = GateBackend::spawn(cmd).unwrap();
+    let mut be = GateBackend::spawn(cmd, &[]).unwrap();
     let mut log = Vec::new();
     let end = run(&mut be, &mut Pos::new(1), &[], m, target, None, judge, Instant::now() + Duration::from_secs(30), &mut log).unwrap();
     (end, log)
@@ -85,7 +85,7 @@ fn mutator_timeout_returns() {
     fs::set_permissions(&m, fs::Permissions::from_mode(0o755)).unwrap();
     let mut cmd = Command::new("cat");
     cmd.arg(&f);
-    let mut be = GateBackend::spawn(cmd).unwrap();
+    let mut be = GateBackend::spawn(cmd, &[]).unwrap();
     let end = Instant::now() + Duration::from_secs(5);
     let ev = loop {
         assert!(Instant::now() < end, "open of f never trapped");

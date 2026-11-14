@@ -23,7 +23,7 @@ fn c_bin() -> PathBuf {
 fn spawn_c(mode: &str, trigger: &Path, arg: &str) -> GateBackend {
     let mut cmd = Command::new(c_bin());
     cmd.arg(mode).arg(trigger).arg(arg);
-    GateBackend::spawn(cmd).unwrap()
+    GateBackend::spawn(cmd, &[]).unwrap()
 }
 
 struct Reach {
@@ -132,7 +132,7 @@ fn go_channel_blocked_reaches_decision() {
         let trigger = trigger_file("crfuzz_sensor_go");
         let mut cmd = Command::new(&bin);
         cmd.arg(&trigger);
-        let mut be = GateBackend::spawn(cmd).unwrap();
+        let mut be = GateBackend::spawn(cmd, &[]).unwrap();
         let r = reach(&mut be, &trigger, Duration::from_secs(2));
         assert_eq!(r.end, Frontier::Complete, "run {i}: Go stalled the readout");
         assert!(r.trigger_held(&trigger));

@@ -23,7 +23,7 @@ fn nobody() -> Alice {
 fn judged(canary: &Canary, script: &str) -> Vec<Finding> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(script);
-    let mut be = GateBackend::spawn(cmd).unwrap();
+    let mut be = GateBackend::spawn(cmd, &[]).unwrap();
     let mut j = Judge { canary, alice: nobody(), reached: None, task: None };
     let end = run(&mut be, &mut Pos::new(1), &[], None, None, None, Some(&mut j), Instant::now() + Duration::from_secs(30), &mut Vec::new()).unwrap();
     assert!(matches!(end, End::Exited), "{end:?}");
@@ -128,7 +128,7 @@ fn deadline_keeps_log() {
     let c = Canary::create(205).unwrap();
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg("cat /dev/null; sleep 10");
-    let mut be = GateBackend::spawn(cmd).unwrap();
+    let mut be = GateBackend::spawn(cmd, &[]).unwrap();
     let mut j = Judge { canary: &c, alice: nobody(), reached: None, task: None };
     let mut log = Vec::new();
     let end = run(&mut be, &mut Pos::new(1), &[], None, None, None, Some(&mut j), Instant::now() + Duration::from_secs(2), &mut log).unwrap();

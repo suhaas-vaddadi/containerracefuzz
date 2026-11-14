@@ -1,6 +1,6 @@
 //! The built-in target: containerd -> shim -> runc starting a busybox
 //! container from a rootfs alice owns, the embedded mutator at every hold
-//! under it. Sets its scenario up in D, then runs the
+//! that resolves through it. Sets its scenario up in D, then runs the
 //! campaign `D/campaign`.
 
 use crate::campaign::{self, Campaign};

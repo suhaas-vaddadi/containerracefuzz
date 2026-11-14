@@ -19,7 +19,7 @@ fn once(seed: u64, a: &Path, b: &Path) -> Vec<Decision> {
     let script = format!("cat {} >/dev/null & cat {} >/dev/null & wait", a.display(), b.display());
     let mut cmd = Command::new("sh");
     cmd.args(["-c", &script]);
-    let mut be = GateBackend::spawn(cmd).unwrap();
+    let mut be = GateBackend::spawn(cmd, &[]).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut log = Vec::new();
     run(&mut be, &mut Pos::new(seed), &[], None, None, None, None, deadline, &mut log).unwrap();
