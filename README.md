@@ -18,6 +18,9 @@ To run:
 
 - Linux 6.12 or later with `sched_ext` (`CONFIG_SCHED_CLASS_EXT`), and no
   other `sched_ext` scheduler enabled.
+- aarch64. The build refuses any other architecture: the syscalls held are
+  the `*at` family, which is every path syscall only there (x86_64 also has
+  `open`, `stat`, `rename`, ... and its libcs use them).
 - cgroup v2 at `/sys/fs/cgroup` and bpffs at `/sys/fs/bpf`.
 - Root.
 - `cp` and `chown` (coreutils).
@@ -532,8 +535,10 @@ step 1 0 79 0 /tmp/q/alice/p      mutate thread syscall-nr occurrence [path]
 
 1. **Hold** (`backend.rs`, `gate.rs`). The SUT starts in its own cgroup,
    enrolled in `SCHED_EXT`. A seccomp filter turns each watched path syscall
-   into a user notification, and the thread sleeps until it is answered.
-   While the mutator runs, every thread of the SUT tree is gated in the
+   into a user notification, and the thread sleeps until it is answered. The
+   filter is installed without `NO_NEW_PRIVS` (root may), so what the SUT
+   execs keeps its setuid bits, file capabilities and LSM transitions, as
+   outside crfuzz. While the mutator runs, every thread of the SUT tree is gated in the
    scheduler, so nothing moves.
 2. **Readout** (`sensor.rs`). A decision is taken only when no SUT thread is
    running (a complete frontier), or after a 200 ms limit (logged as
@@ -617,7 +622,7 @@ cli, campaign and gate.
 - Between a trap and the tree gate there is one userspace round trip, which
   lets siblings run briefly. A gate set in the kernel would close it.
 - The watch set and the timing (the 200 ms frontier limit, the 15 s mutator
-  watchdog) are fixed. `execve` is not watched.
+  watchdog) are fixed. `execve` is not watched. aarch64 only.
 - For `run`, the mutator is yours: no default primitives ship with `run`.
   The mutator is exec'd inside the held task's root.
 - Minimization tries single holds only. A bug that needs two mutations is

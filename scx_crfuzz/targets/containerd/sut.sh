@@ -5,17 +5,25 @@ set -eu
 d="$CRFUZZ_DIR/run"
 find "$d" -mindepth 1 -delete  # a mount point: emptied, never removed
 mkdir -p "$d/root" "$d/state"
-echo "== $(date)" >>"$CRFUZZ_DIR/logs/containerd.log"
-"$CRFUZZ_CONTAINERD" --root "$d/root" --state "$d/state" --address "$d/sock" \
-	>>"$CRFUZZ_DIR/logs/containerd.log" 2>&1 &
+exec 4>>"$CRFUZZ_DIR/logs/containerd.log"
+echo "== $(date)" >&4
+# Ready once it logs its boot (its socket is listening by then). Read off a
+# FIFO, not polled: a poll loop's syscall count varies run to run, and every
+# stat it makes is a held event, so a replay could never match it.
+# Unbounded here (sh has no `read -t`, and `timeout` would fork held events):
+# a containerd that exits closes the FIFO, one that hangs meets the run's --timeout.
+mkfifo "$d/log"
+"$CRFUZZ_CONTAINERD" --root "$d/root" --state "$d/state" --address "$d/sock" >"$d/log" 2>&1 &
 cpid=$!
 trap 'kill "$cpid" 2>/dev/null || true' EXIT
-i=0
-while [ ! -S "$d/sock" ]; do
-	i=$((i + 1))
-	[ "$i" -gt 400 ] && { echo "containerd socket never appeared" >&2; exit 1; }
-	sleep 0.05
+exec 3<"$d/log"
+up=
+while IFS= read -r l <&3; do
+	printf '%s\n' "$l" >&4
+	case $l in *"containerd successfully booted"*) up=1 && break ;; esac
 done
+[ -n "$up" ] || { echo "containerd exited before booting" >&2; exit 1; }
+cat <&3 >&4 &
 # --cgroup: beside ours (run-<pid>-<epoch>/sut) under the run cgroup, so runc init stays tracked.
 cg=$(cut -d: -f3 /proc/self/cgroup)
 "$CRFUZZ_CTR" --address "$d/sock" run --rm --cgroup "${cg%/*}/busy" --runc-root "$d/runc" --rootfs "$CRFUZZ_ROOTFS" busy \

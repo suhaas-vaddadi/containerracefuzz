@@ -22,22 +22,23 @@ use std::time::{Duration, Instant};
 
 const SCHED_EXT: i32 = 7;
 
+// The watch set is the `*at` family, which is every path syscall there is on
+// aarch64. x86_64 also has the legacy ones (`open`, `stat`, `rename`,
+// `unlink`, `mkdir`, ...) and its libcs use them, so there the filter would
+// let most path work through unseen.
+#[cfg(not(target_arch = "aarch64"))]
+compile_error!("scx_crfuzz holds only the *at path syscalls, which is all of them on aarch64 alone: add the legacy ones to the watch set and path_args before building for another architecture");
+
 /// Syscalls that create a task; always watched, to name threads by their
 /// place in the creation tree.
-#[cfg(target_arch = "aarch64")]
 const CLONES: &[i64] = &[libc::SYS_clone, libc::SYS_clone3];
-#[cfg(target_arch = "x86_64")]
-const CLONES: &[i64] = &[libc::SYS_clone, libc::SYS_clone3, libc::SYS_fork, libc::SYS_vfork];
 /// A released clone with no child in the cgroup by then failed.
 const CLONE_WAIT: Duration = Duration::from_millis(100);
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/crfuzz";
 /// A trapped clone: (parent tid, instruction pointer, args).
 type Call = (u32, u64, [u64; 6]);
 
-#[cfg(target_arch = "aarch64")]
 const AUDIT_ARCH: u32 = 0xC000_00B7;
-#[cfg(target_arch = "x86_64")]
-const AUDIT_ARCH: u32 = 0xC000_003E;
 
 /// One syscall held by seccomp-notify.
 #[derive(Debug, Clone)]
@@ -125,15 +126,16 @@ impl GateBackend {
         unsafe {
             cmd.pre_exec(move || {
                 // Order matters: the run cgroup first, so everything the SUT
-                // forks is tracked; the filter last, after the NO_NEW_PRIVS
-                // it requires.
+                // forks is tracked; the filter last. No NO_NEW_PRIVS: root
+                // may install a filter without it, and the SUT would hand it
+                // down to everything it execs (no setuid or file
+                // capabilities, restricted LSM transitions), which is not how
+                // it runs outside crfuzz.
                 if libc::write(procs_fd, b"0".as_ptr().cast(), 1) != 1 {
                     return Err(Error::last_os_error());
                 }
                 let param = libc::sched_param { sched_priority: 0 };
-                if libc::sched_setscheduler(0, SCHED_EXT, &param) != 0
-                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                {
+                if libc::sched_setscheduler(0, SCHED_EXT, &param) != 0 {
                     return Err(Error::last_os_error());
                 }
                 let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
