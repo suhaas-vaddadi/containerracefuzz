@@ -1,4 +1,4 @@
-//! The `/proc` double-snapshot sensor. Needs root, a running
+//! The readout sensor: the scheduler's count of the tree's runnable tasks. Needs root, a running
 //! `scx_crfuzz gated`, `cc` and `go`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
@@ -7,8 +7,7 @@ mod common;
 use common::{go_bin, trigger_file};
 
 use scx_crfuzz::backend::{Event, GateBackend};
-use scx_crfuzz::sensor::{quiescent, snapshot, wait_frontier, Frontier};
-use std::collections::BTreeSet;
+use scx_crfuzz::sensor::{wait_frontier, Frontier};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -44,20 +43,17 @@ impl Reach {
 /// Decide-and-release every frontier until one holds `trigger` (or the deadline).
 fn reach(be: &mut GateBackend, trigger: &Path, deadline: Duration) -> Reach {
     let deadline = Instant::now() + deadline;
-    let mut held = Vec::new();
+    let (mut held, mut idle) = (Vec::new(), false);
     loop {
         let t = Instant::now();
-        let end = wait_frontier(be, &mut held, deadline).unwrap();
+        let end = wait_frontier(be, &mut held, deadline, idle).unwrap();
         let r = Reach { end, last: t.elapsed(), held: std::mem::take(&mut held) };
         if r.end != Frontier::Complete || r.trigger_held(trigger) {
             return r;
         }
+        idle = r.held.is_empty();
         r.held.iter().for_each(|e| be.release(e).unwrap());
     }
-}
-
-fn parked(r: &Reach) -> BTreeSet<u32> {
-    r.held.iter().map(|e| e.tid).collect()
 }
 
 /// A thread blocked on a futex doesn't stall the readout.
@@ -67,63 +63,58 @@ fn futex_blocked_thread_reaches_decision() {
     let trigger = trigger_file("crfuzz_sensor_block");
     let mut be = spawn_c("block", &trigger, "");
     let r = reach(&mut be, &trigger, Duration::from_secs(2));
-    let (snap, p) = (snapshot(be.cgroup()), parked(&r));
-    let states: Vec<(char, bool)> = snap.iter().map(|(t, &(s, _))| (s as char, p.contains(t))).collect();
-    eprintln!("block: {:?} in {:?}; (state, parked) per thread {states:?}", r.end, r.last);
+    eprintln!("block: {:?} in {:?}", r.end, r.last);
     assert_eq!(r.end, Frontier::Complete, "stalled with a futex-blocked thread");
     assert!(r.trigger_held(&trigger));
 }
 
-/// A spinning thread is Running forever: never decide, even with the trigger held.
+/// A spinning thread is runnable forever: never complete, even with the trigger held.
 #[test]
 #[ignore]
 fn spinning_thread_never_decides() {
     let trigger = trigger_file("crfuzz_sensor_spin");
     let mut be = spawn_c("spin", &trigger, "");
     let r = reach(&mut be, &trigger, Duration::from_secs(1));
-    eprintln!("spin: {:?}, trigger held {}", r.end, r.trigger_held(&trigger));
-    assert_eq!(r.end, Frontier::Partial, "decided while a thread was spinning");
+    assert_eq!(r.end, Frontier::Partial, "complete while a thread was spinning");
     assert!(r.trigger_held(&trigger), "trigger never trapped");
 }
 
-/// Two threads handing a byte back and forth: one is always running or about
-/// to. Compares a naive single snapshot ("nobody R") with the double snapshot.
+/// Two threads handing a byte back and forth: one is always running or being
+/// woken, and the count never misses the handoff (a wakeup in flight to
+/// another CPU is counted from `sched_waking`).
 #[test]
 #[ignore]
-fn pingpong_never_quiescent() {
+fn pingpong_never_quiet() {
     let trigger = trigger_file("crfuzz_sensor_pingpong");
     let mut be = spawn_c("pingpong", &trigger, "");
     let r = reach(&mut be, &trigger, Duration::from_secs(1));
-    assert_eq!(r.end, Frontier::Partial, "decided during ping-pong");
-    let p = parked(&r);
+    assert_eq!(r.end, Frontier::Partial, "complete during ping-pong");
     let n = 20_000;
-    let mut prev = snapshot(be.cgroup());
-    let (mut single, mut double) = (0, 0);
-    for _ in 0..n {
-        let now = snapshot(be.cgroup());
-        single += now.iter().all(|(t, &(s, _))| p.contains(t) || s != b'R') as u32;
-        double += quiescent(&prev, &now, &p) as u32;
-        prev = now;
-    }
-    eprintln!("pingpong: false 'quiescent' in {n} back-to-back snapshots: single {single}, double {double}");
-    assert_eq!(double, 0, "double snapshot reported quiescence during ping-pong");
+    let quiet = (0..n).filter(|_| be.quiet().unwrap()).count();
+    assert_eq!(quiet, 0, "the tree read quiet in {quiet} of {n} reads during ping-pong");
 }
 
-/// A thread waking on a timer: it is Blocked between ticks, so deciding is
-/// allowed, but B has to find a quiet window spanning two snapshots.
+/// A thread waking on a timer: it is asleep between ticks, so a frontier is
+/// complete then (the determinism claim leaves timed sleepers out).
 #[test]
 #[ignore]
 fn periodic_ticker_settle() {
     for us in ["50", "200", "1000", "10000"] {
         let trigger = trigger_file("crfuzz_sensor_tick");
         let mut be = spawn_c("tick", &trigger, us);
-        let mut held = reach(&mut be, &trigger, Duration::from_secs(2)).held;
+        let r = reach(&mut be, &trigger, Duration::from_secs(2));
+        assert!(r.trigger_held(&trigger));
+        // Mid-sleep nearly always; only the long tick is sure to be.
+        if us == "10000" {
+            assert_eq!(be.sleepers(&r.held), 1, "the ticker is a timed sleeper");
+        }
+        let mut held = r.held;
         // Re-decide 20 times with the trigger still parked; the ticker keeps ticking.
         let samples: Vec<_> = (0..20)
             .map(|_| {
                 let t = Instant::now();
                 let deadline = Instant::now() + Duration::from_secs(1);
-                (wait_frontier(&mut be, &mut held, deadline).unwrap(), t.elapsed().as_micros())
+                (wait_frontier(&mut be, &mut held, deadline, false).unwrap(), t.elapsed().as_micros())
             })
             .collect();
         eprintln!("tick {us}us: 20 decisions (frontier, µs) {samples:?}");
@@ -145,41 +136,28 @@ fn go_channel_blocked_reaches_decision() {
         let r = reach(&mut be, &trigger, Duration::from_secs(2));
         assert_eq!(r.end, Frontier::Complete, "run {i}: Go stalled the readout");
         assert!(r.trigger_held(&trigger));
-        let snap = snapshot(be.cgroup());
-        if i == 0 {
-            let states: String = snap.values().map(|&(s, _)| s as char).collect();
-            let t = Instant::now();
-            for _ in 0..1000 {
-                snapshot(be.cgroup());
-            }
-            eprintln!("go: {} threads, states {states}; snapshot cost {:?}", snap.len(), t.elapsed() / 1000);
-        }
         lat.push(r.last.as_micros());
     }
     lat.sort();
     eprintln!("go: 20 runs, µs sorted {lat:?}");
 }
 
-/// What a gated runnable thread looks like: the design assumed a tree-gated
-/// thread reads Running. A spinning thread under a tree hold should be `R`
-/// with frozen cpu time; a futex-blocked one stays `S`, so the frontier can
-/// look complete during a tree hold.
+/// Under a tree hold a spinning thread stays runnable (it waits on the hold
+/// queue), so the tree is not quiet; a futex-blocked one is asleep, so the
+/// frontier reads complete during the hold (the engine never decides there).
 #[test]
 #[ignore]
 fn gated_threads_under_tree_hold() {
-    for mode in ["spin", "block"] {
+    for (mode, want) in [("spin", Frontier::Partial), ("block", Frontier::Complete)] {
         let trigger = trigger_file("crfuzz_sensor_gated");
         let mut be = spawn_c(mode, &trigger, "");
         let r = reach(&mut be, &trigger, Duration::from_secs(1));
         assert!(r.trigger_held(&trigger));
         be.gate_tree().unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        let a = snapshot(be.cgroup());
-        std::thread::sleep(Duration::from_millis(50));
-        let b = snapshot(be.cgroup());
         let mut held = r.held;
-        let decided = wait_frontier(&mut be, &mut held, Instant::now() + Duration::from_millis(300)).unwrap();
-        eprintln!("{mode} under tree hold: {a:?} -> {b:?}; wait_frontier {decided:?}");
+        let decided = wait_frontier(&mut be, &mut held, Instant::now() + Duration::from_millis(300), false).unwrap();
         be.ungate_tree().unwrap();
+        assert_eq!(decided, want, "{mode} under a tree hold");
     }
 }

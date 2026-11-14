@@ -151,7 +151,7 @@ fn preflight() {
     let (out, _) = crfuzz(&["check"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}");
-    assert!(stdout.lines().count() == 6 && stdout.lines().all(|l| l.ends_with(": ok")), "{stdout}");
+    assert!(stdout.lines().count() == 5 && stdout.lines().all(|l| l.ends_with(": ok")), "{stdout}");
     let alice = |args: &[&str]| {
         let id = ["--reuid", "65534", "--regid", "65534", "--clear-groups", env!("CARGO_BIN_EXE_scx_crfuzz")];
         Command::new("setpriv").args(id).args(args).output().unwrap()
@@ -182,9 +182,9 @@ fn invalid_run_leaves_no_canary() {
     fs::remove_dir_all(d).unwrap();
 }
 
-/// SIGINT mid-window: the window is discarded, every Drop runs (run cgroup,
-/// gate entries, canary), the summary prints after `interrupted:`, exit 130.
-/// Needs bpftool.
+/// SIGINT mid-window: the window is discarded, every Drop runs (the run in
+/// the gate with its tree, the canary), the summary prints after
+/// `interrupted:`, exit 130. Needs bpftool.
 #[test]
 #[ignore]
 fn sigint_stops_cleanly() {
@@ -206,11 +206,11 @@ fn sigint_stops_cleanly() {
     assert_eq!(child.wait().unwrap().code(), Some(130), "{rest:?}");
     assert!(rest.iter().any(|l| l == "interrupted: 0 seeds complete"), "{rest:?}");
     assert_eq!(fs::read_to_string(format!("{d}/runs.tsv")).unwrap().lines().count(), 1, "header only");
-    let cgroups: Vec<_> = fs::read_dir("/sys/fs/cgroup/crfuzz").unwrap().filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| n.starts_with(&format!("run-{pid}-"))).collect();
-    assert!(cgroups.is_empty(), "{cgroups:?}");
     assert!(left(pid).is_empty(), "{:?}", left(pid));
-    let gates = Command::new("bpftool").args(["-j", "map", "dump", "pinned", "/sys/fs/bpf/scx_crfuzz/gate_tgid"]).output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&gates.stdout).trim(), "[]");
+    for map in ["runs", "procs"] {
+        let left = Command::new("bpftool").args(["-j", "map", "dump", "pinned", &format!("/sys/fs/bpf/scx_crfuzz/{map}")]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "[]", "{map}");
+    }
     fs::remove_dir_all(d).unwrap();
 }
 

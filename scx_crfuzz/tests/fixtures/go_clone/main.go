@@ -1,10 +1,13 @@
 // Fixture for the clone-hold test: 8 goroutines read os.Args[1] in a loop
 // (blocking syscalls make the runtime start new Ms, i.e. clone) while
-// allocating and forcing GCs (stop-the-world). Exits 0 when all are done.
+// allocating and forcing GCs (stop-the-world), and one goroutine forks
+// /bin/true 5 times in sequence, so process clones (Go's raw vfork, restarted
+// by SIGURG) happen while the runtime makes Ms. Exits 0 when all are done.
 package main
 
 import (
 	"os"
+	"os/exec"
 	"runtime"
 	"sync"
 )
@@ -33,5 +36,14 @@ func main() {
 			}
 		}()
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			if err := exec.Command("/bin/true").Run(); err != nil {
+				panic(err)
+			}
+		}
+	}()
 	wg.Wait()
 }

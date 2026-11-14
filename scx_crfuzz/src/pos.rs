@@ -43,7 +43,7 @@ impl Keys {
 
 pub struct Pos {
     seed: u64,
-    /// Prior hits per `(thread, nr, path)` this run.
+    /// Prior hits per `(process, nr, path)` this run.
     seen: HashMap<(String, i64, Option<PathBuf>), u32>,
     /// Times each ready event's priority was redrawn.
     redraws: HashMap<EventId, u32>,
@@ -55,10 +55,10 @@ impl Pos {
     }
 
     /// Name a newly held event: call once per held syscall, as it arrives.
-    pub fn id(&mut self, thread: &str, nr: i64, path: Option<PathBuf>) -> EventId {
-        let n = self.seen.entry((thread.into(), nr, path.clone())).or_default();
+    pub fn id(&mut self, process: &str, nr: i64, path: Option<PathBuf>) -> EventId {
+        let n = self.seen.entry((process.into(), nr, path.clone())).or_default();
         *n += 1;
-        EventId { thread: thread.into(), nr, path, n: *n - 1 }
+        EventId { process: process.into(), nr, path, n: *n - 1 }
     }
 
     /// Priority from the seed and the event alone, never its ready-set position
@@ -75,9 +75,9 @@ impl Pos {
 
     fn hash(&self, id: &EventId, tail: &[u8]) -> u64 {
         let mut h = Fnv::new(self.seed);
-        // Length-prefixed so (thread, path) splits can't collide.
-        h.write(&(id.thread.len() as u64).to_le_bytes());
-        h.write(id.thread.as_bytes());
+        // Length-prefixed so (process, path) splits can't collide.
+        h.write(&(id.process.len() as u64).to_le_bytes());
+        h.write(id.process.as_bytes());
         h.write(&id.nr.to_le_bytes());
         match &id.path {
             Some(p) => {
@@ -282,12 +282,12 @@ mod tests {
     }
 
     #[test]
-    fn occurrence_counts_per_thread_syscall_and_path() {
+    fn occurrence_counts_per_process_syscall_and_path() {
         let mut pos = Pos::new(0);
         let p = || Some(PathBuf::from("/f"));
         assert_eq!(pos.id("0", OPEN, p()).n, 0);
         assert_eq!(pos.id("0", OPEN, p()).n, 1);
-        assert_eq!(pos.id("0/0", OPEN, p()).n, 0, "per thread");
+        assert_eq!(pos.id("0/0", OPEN, p()).n, 0, "per process");
         assert_eq!(pos.id("0", RENAME, p()).n, 0);
         assert_eq!(pos.id("0", OPEN, None).n, 0);
     }

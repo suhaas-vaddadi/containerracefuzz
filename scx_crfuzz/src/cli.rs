@@ -20,8 +20,8 @@ const USAGE: &str = "usage: scx_crfuzz run DIR --attacker UID:GID [--seeds N] [-
        scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID] [--seeds N] [--time DURATION] [--jobs N] [--resume] [-v]
        scx_crfuzz gated     hold the gate scheduler until SIGINT/SIGTERM
        scx_crfuzz status    sched_ext state and pins
-       scx_crfuzz reset     delete every gate entry of every run
-       scx_crfuzz check     preflight: root, kernel, sched_ext, cgroup v2, bpffs, /var/lib/crfuzz
+       scx_crfuzz reset     ungate every run
+       scx_crfuzz check     preflight: root, kernel, sched_ext, bpffs, /var/lib/crfuzz
        scx_crfuzz --help | --version";
 
 /// `--timeout`'s default, and the containerd target's.
@@ -198,16 +198,15 @@ pub fn preflight() -> Vec<Check> {
     let release = unsafe { CStr::from_ptr(u.release.as_ptr()) }.to_string_lossy().into_owned();
     let mut v = release.split(|c: char| !c.is_ascii_digit()).map(|n| n.parse::<u32>().unwrap_or(0));
     let kernel = (v.next().unwrap_or(0), v.next().unwrap_or(0));
-    // The filesystem mounted at `p` is `magic`.
-    let mounted = |p: &str, magic: u32, what: &str| -> Result<(), String> {
-        let c = CString::new(p).unwrap();
+    let bpffs = || -> Result<(), String> {
+        let (p, c) = ("/sys/fs/bpf", CString::new("/sys/fs/bpf").unwrap());
         let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statfs(c.as_ptr(), &mut sf) } != 0 {
-            return Err(format!("{p}: {}; mount {what} there", std::io::Error::last_os_error()));
+            return Err(format!("{p}: {}; mount bpf there", std::io::Error::last_os_error()));
         }
-        // f_type's type varies by target; the magics fit in a u32.
-        if sf.f_type as u32 != magic {
-            return Err(format!("{p} is not {what}; mount it: mount -t {what} none {p}"));
+        // f_type's type varies by target; the magic fits in a u32.
+        if sf.f_type as u32 != libc::BPF_FS_MAGIC as u32 {
+            return Err(format!("{p} is not bpf; mount it: mount -t bpf none {p}"));
         }
         Ok(())
     };
@@ -221,11 +220,10 @@ pub fn preflight() -> Vec<Check> {
                 Ok(s) if s == "disabled" || gate::running().unwrap_or(false) => Ok(()),
                 // /sys/fs/bpf is root's: the pins can't be seen.
                 Ok(s) if euid != 0 => Err(format!("{s}; only root can tell if it is crfuzz's gate ({})", gate::PIN_DIR)),
-                Ok(s) => Err(format!("{s} with {:?}; needs it disabled, or crfuzz's gate with its pins in {}: stop any other scheduler", gate::ops(), gate::PIN_DIR)),
+                Ok(s) => Err(format!("{s} with {:?}; needs it disabled, or crfuzz's gate with its pins in {} (an older crfuzz's `gated` lacks some: restart it): stop any other scheduler", gate::ops(), gate::PIN_DIR)),
             },
         ),
-        ("cgroup v2", mounted("/sys/fs/cgroup", libc::CGROUP2_SUPER_MAGIC as u32, "cgroup2")),
-        ("bpffs", mounted("/sys/fs/bpf", libc::BPF_FS_MAGIC as u32, "bpf")),
+        ("bpffs", bpffs()),
         ("/var/lib/crfuzz", oracle::root_only().map_err(|e| format!("{e:#}; chown root and chmod go-w it"))),
     ]
 }

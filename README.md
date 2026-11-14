@@ -21,7 +21,7 @@ To run:
 - aarch64. The build refuses any other architecture: the syscalls held are
   the `*at` family, which is every path syscall only there (x86_64 also has
   `open`, `stat`, `rename`, ... and its libcs use them).
-- cgroup v2 at `/sys/fs/cgroup` and bpffs at `/sys/fs/bpf`.
+- bpffs at `/sys/fs/bpf`.
 - Root.
 - `cp` and `chown` (coreutils).
 
@@ -77,7 +77,6 @@ check fails. It checks:
 - root
 - kernel 6.12 or later
 - `sched_ext` is disabled, or the running scheduler is crfuzz's gate
-- cgroup v2 at `/sys/fs/cgroup`
 - bpffs at `/sys/fs/bpf`
 - `/var/lib/crfuzz` and its parents are root-owned and writable only by
   root (where each run's canary lives)
@@ -140,15 +139,15 @@ The one-seed run prints this (abridged):
 ```
 alice: uid=65534 gid=65534 groups=[] capeff=0000000000000000
 plan: 1 seeds, 5 windows in seed 0, ~6 runs, est. 0s (+ confirms)
-[1/1] seed 0: telemetry: 6 decisions (0 partial), 1 threads, 5 mutation targets, 0.0s
+[1/1] seed 0: telemetry: 6 decisions (0 partial, 0 over a timed sleep), 1 processes, 5 mutation targets, 0.0s
 [1/1] seed 0 window 1/5: Clean  0.0s
 ...
 [1/1] seed 0 window 4: Violation, confirming
   confirmed: Violation
   minimize step 3: Violation {Changed { entry: "file" }, Changed { entry: "hard" }}
-  guilty: step 3 EventId { thread: "0", nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
+  guilty: step 3 EventId { process: "0", nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
 left /var/lib/crfuzz/canary-272182-6: changed
-[1/1] seed 0 window 4/5: Violation → confirmed, guilty step 3 (0 79 /tmp/q/alice/p) → finding #1 (new)  0.0s
+[1/1] seed 0 window 4/5: Violation → confirmed, guilty step 3 (79 /tmp/q/alice/p) → finding #1 (new)  0.0s
 ...
 [1/1] seed 0: unsafe
 campaign: 1 seeds, 5 runs, 0 invalid, discovery 0.1s
@@ -156,8 +155,8 @@ seeds: 0 safe, 1 unsafe, 0 incomplete, 0 no windows
 distinct partial orders: 1
 partial decisions: 0/30 (0%)
 findings: 2
-finding #1: 1 runs, guilty (0 79 /tmp/q/alice/p), {Changed { entry: "file" }, Changed { entry: "hard" }}, /tmp/q/one/findings/1
-finding #2: 1 runs, guilty (0 56 /tmp/q/alice/p), {Changed { entry: "file" }, Changed { entry: "hard" }}, /tmp/q/one/findings/2
+finding #1: 1 runs, guilty (79 /tmp/q/alice/p), {Changed { entry: "file" }, Changed { entry: "hard" }}, /tmp/q/one/findings/1
+finding #2: 1 runs, guilty (56 /tmp/q/alice/p), {Changed { entry: "file" }, Changed { entry: "hard" }}, /tmp/q/one/findings/2
 ```
 
 Both holds on `p` let alice's swap through: the `stat` (`newfstatat`, 79 on
@@ -171,13 +170,14 @@ included, so they accumulate over long campaigns; remove them yourself when
 you no longer need them. A SUT can leave a mount inside a canary, so first
 check that `findmnt | grep /var/lib/crfuzz` shows nothing.
 
-If a crash leaves gated tasks behind, `sudo scx_crfuzz reset` clears every
-gate.
+A crfuzz that is killed leaves its SUT's tree behind. The next `run` or
+`replay` kills it. `sudo scx_crfuzz reset` ungates every run at once.
 
 ## The containerd target
 
 `scx_crfuzz containerd` fuzzes a container start. A private containerd runs
-as the SUT's child, so the shim and runc inherit the hold. It starts a
+as the SUT's child, so the shim, runc and the container's init are in the
+SUT's tree, whatever cgroup the runtime moves them to. It starts a
 busybox container from a rootfs that alice owns. The mutator is
 `scx_crfuzz/targets/containerd/mutator_all.c`, embedded in the binary. At each hold under the
 rootfs it applies one of three primitives, picked by the hold's seed:
@@ -202,8 +202,8 @@ ELF64 executable, no interpreter).
 sudo target/release/scx_crfuzz containerd --seeds 2
 ```
 
-A run takes about 8 s and a seed has about 50 windows, so two seeds take
-about 15 minutes (measured on a 6-CPU VM).
+A run takes about 1.5 s and a seed has about 50 windows, so two seeds take
+about 3 minutes (measured on a 6-CPU VM).
 
 ```
 scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID]
@@ -361,6 +361,7 @@ directories, the `CRFUZZ_*` environment and the command. `--seeds`,
   is counted against it. The count of distinct partial orders covers this
   session only.
 - `--time` counts this session only.
+- A campaign with findings from an older schedule version can't be resumed.
 
 The match is on values, after paths are made absolute: `--mutator ./swap.sh`
 and `--mutator /tmp/q/swap.sh` match when they name the same path. A file
@@ -427,7 +428,7 @@ every run's decisions are printed.
 ```
 scx_crfuzz gated    hold the gate scheduler in the foreground (until SIGINT/SIGTERM or ejection)
 scx_crfuzz status   sched_ext state, scheduler and pins
-scx_crfuzz reset    delete every gate entry of every run
+scx_crfuzz reset    ungate every run
 ```
 
 There is one gate scheduler per machine, shared by every crfuzz process.
@@ -436,7 +437,10 @@ is disabled, each loads its own and holds it until it exits. A kill leaves
 stale pins, which are harmless and are removed by the next load.
 
 Start `scx_crfuzz gated` to keep one scheduler up across processes. The
-on-target tests need it.
+on-target tests need it. Besides the scheduler it attaches BTF tracepoints
+(wakeups, fork, task free). Run crfuzz in the initial pid namespace: the
+scheduler keys by global tid and tgid, the seccomp notification by the
+namespace's pid.
 
 If another `sched_ext` scheduler is enabled, crfuzz refuses to start and
 names that scheduler (from `/sys/kernel/sched_ext/root/ops`).
@@ -459,8 +463,9 @@ unfinished seeds.
 | 1 | Any other error, including a failed preflight, a lost gate scheduler, or a `replay` that does not reproduce its schedule. |
 | 130 | Stopped by Ctrl-C or SIGTERM. |
 
-On a stop, the runs then ending are discarded. crfuzz cleans up the gates,
-the run cgroup and the canary, then prints the summary after an
+On a stop, the runs then ending are discarded. crfuzz kills the SUT's tree,
+forgets its run in the gate and removes the canary, then prints the summary
+after an
 `interrupted: <S> seeds complete` line. A second signal kills at once.
 
 ## Output files
@@ -488,7 +493,8 @@ The SUT's stdin is `/dev/null`.
 
 The `status` column is `new`, `repeat`, `unconfirmed` or `invalid` for a
 Violation, and `-` otherwise. Findings are deduped by the guilty hold's
-`(thread, syscall, path)` plus the normalized findings.
+`(syscall, path)` plus the normalized findings: a window fires in any
+process.
 
 The terminal shows:
 
@@ -497,8 +503,8 @@ The terminal shows:
 - a verdict per seed. An invalid baseline gives a `-` window row, and the
   seed is `incomplete`.
 - a summary: seeds, runs, invalid runs, the seeds' verdicts, discovery time,
-  distinct partial orders (runs whose canonical order of dependent events
-  differs), the share of partial decisions, and each finding
+  distinct partial orders (runs whose canonical order of the decisions whose
+  keys conflict differs), the share of partial decisions, and each finding
 
 ### Schedule file
 
@@ -508,12 +514,12 @@ arguments, bytes outside printable ASCII, space and `%` are written as `%XX`.
 An empty string is a lone `%`.
 
 ```
-crfuzz-schedule 1
+crfuzz-schedule 2
 seed 0
 attacker 65534:65534
 mutator /tmp/q/swap.sh            optional
 layout /tmp/q/layout.sh           optional
-timeout 30                        --timeout (60 if missing: files from before it)
+timeout 30                        --timeout
 private /tmp/q/alice              optional, one per --private
 scope /tmp/q/alice                optional, one per --scope
 env CRFUZZ_PRIMITIVE swap         optional, one per CRFUZZ_* variable at run time
@@ -521,40 +527,50 @@ cmd /tmp/q/check_use /tmp/q/alice/p
 outcome Violation
 deadline                          only if discovery ended at the deadline
 finding Changed file              normalized; also Reached <entry> <at>, Copy <at>
-step 1 0 79 0 /tmp/q/alice/p      mutate thread syscall-nr occurrence [path]
+step 1 0 79 0 /tmp/q/alice/p      mutate process syscall-nr occurrence [path]
 ```
 
 The lines from `attacker` to `cmd` are the run's configuration, the same
-lines as `DIR/config`.
+lines as `DIR/config`. Version 1 schedules named events by thread and are
+refused.
 
 ## How it works
 
 ```
  CMD (SUT) ──seccomp-notify──▶ GateBackend ──▶ engine loop ──▶ oracle
    │  held at path syscalls      │ gate tree      │ POS or        │ canary +
-   │  in a run cgroup,           │ (sched_ext)    │ fixed         │ probe as
-   └─ SCHED_EXT                  │ while mutator  │ schedule      │ alice
+   │  its tree tracked           │ (sched_ext)    │ fixed         │ probe as
+   └─ in SCHED_EXT               │ while mutator  │ schedule      │ alice
                                  ▼ runs           ▼               ▼
                            mutator (as alice)   decision log ─▶ schedule file
 ```
 
-1. **Hold** (`backend.rs`, `gate.rs`). The SUT starts in its own cgroup,
-   enrolled in `SCHED_EXT`. A seccomp filter turns each watched path syscall
-   into a user notification, and the thread sleeps until it is answered. The
-   filter is installed without `NO_NEW_PRIVS` (root may), so what the SUT
-   execs keeps its setuid bits, file capabilities and LSM transitions, as
-   outside crfuzz. While the mutator runs, every thread of the SUT tree is gated in the
-   scheduler, so nothing moves.
-2. **Readout** (`sensor.rs`). A decision is taken only when no SUT thread is
-   running (a complete frontier), or after a 200 ms limit (logged as
-   *partial*).
-3. **POS** (`pos.rs`). Each held event is named
-   `(thread, syscall, path, occurrence)`. Threads are named by their place in
-   the creation tree (`0/2/0`), never by tid. Each event gets a seeded
-   priority, and the highest is released. Only the events whose read/write
-   key sets conflict with the released one are redrawn.
+1. **Hold** (`backend.rs`, `gate.rs`, `bpf/main.bpf.c`). The SUT starts as
+   the root of a run's tree in the gate scheduler, enrolled in `SCHED_EXT`.
+   The scheduler adds every process forked below it (a `sched_process_fork`
+   hook), whatever cgroup, session or namespace it moves to. A seccomp
+   filter turns each watched path syscall into a user notification, and the
+   thread sleeps until it is answered. The filter is installed without
+   `NO_NEW_PRIVS` (root may), so what the SUT execs keeps its setuid bits,
+   file capabilities and LSM transitions, as outside crfuzz. While the
+   mutator runs, the scheduler refuses to run any task of the tree, so
+   nothing moves.
+2. **Readout** (`sensor.rs`). The scheduler counts the tree's tasks that are
+   runnable or being woken (`ops.runnable` and `ops.quiescent`, plus the
+   `sched_waking` and `sched_wakeup` tracepoints for a wakeup in flight to
+   another CPU). A decision is taken when the count reads zero, the seccomp
+   listener has been drained, and the count reads zero again (a complete
+   frontier), or after a 200 ms limit (logged as *partial*).
+3. **POS** (`name.rs`, `pos.rs`). Each held event is named
+   `(process, syscall, path, occurrence)`. Processes are named by their
+   place in the process creation tree (`0/2/0`), which the scheduler records
+   at each fork, never by pid or thread. Occurrence counts per
+   (process, syscall, path). Paths have the canary directory normalized.
+   Each event gets a seeded priority, and the highest is released. Only the
+   events whose read/write key sets conflict with the released one are
+   redrawn.
 4. **Mutator** (`engine.rs`). At the first released hold that matches the
-   run's window (by syscall, path and occurrence, in any thread), the tree is
+   run's window (by syscall, path and occurrence, in any process), the tree is
    gated and the mutator runs once, as alice, in the held task's view.
 5. **Oracle** (`oracle.rs`). Each run gets a fresh canary under
    `/var/lib/crfuzz/canary-<pid>-<n>` that alice cannot reach. At the root
@@ -570,14 +586,57 @@ lines as `DIR/config`.
    the findings: the guilty hold.
 7. **Campaign** (`campaign.rs`, `run.rs`). Seeds `S..S+N` run, each with its baseline and
    windows, `--jobs` of them at once. A Violation whose findings and guilty
-   `(thread, syscall, path)` match a known finding is counted against it
+   `(syscall, path)` match a known finding is counted against it
    without being confirmed again. A new one is confirmed and minimized.
 
-**Determinism.** The same seed gives the same partial order for 1:1-threaded
-SUTs whose code between watched syscalls is deterministic. Under M:N
-runtimes (Go), a thread name identifies the OS thread, not the goroutine.
-There, determinism is checked by replay (a divergence) rather than
-guaranteed.
+**Determinism.** An event's name never depends on which OS thread made it
+(Go's M:N runtime moves goroutines between threads, and creates threads as
+timing dictates), only on its process, syscall and path. The same seed
+gives the same partial order of the held events under two conditions:
+
+- The code between held syscalls is deterministic.
+- Every decision is taken on a complete frontier that stays complete. A
+  complete frontier means no task of the tree is runnable or being woken at
+  the read. It does not mean every thread is at a held syscall: a thread
+  asleep on a timer, or on I/O from outside the tree, is quiet at the
+  decision and wakes on its own after it, and what it then issues was not
+  among the decision's choices.
+
+Each baseline's `telemetry` line counts the decisions the second condition
+leaves out: `partial` ones (taken at the 200 ms limit) and those taken `over
+a timed sleep` (some thread of the tree was in a `nanosleep`, or in a
+`ppoll`, `epoll_pwait` or futex wait with a timeout).
+
+Two threads (or goroutines) of one process making the same syscall on one
+path share a counter, so which is occurrence 0 depends on arrival. A
+process forking from two threads at once numbers its children in arrival
+order.
+
+### Why a scheduler and not the cgroup freezer
+
+`cgroup.freeze` also stops a tree of processes. crfuzz stops it with a
+`sched_ext` scheduler instead, for three reasons:
+
+- **The SUT can't tell.** The freezer stops tasks the way a signal does. A
+  task in an interruptible syscall is kicked out of it, and some syscalls
+  (`epoll_wait`, `poll` with a timeout) then return `EINTR` instead of
+  restarting. A gated task is simply not scheduled. Apart from time, it
+  sees nothing.
+- **It stops a task anywhere.** A task being frozen first finishes the
+  kernel work it is in, so a path syscall under way completes after the
+  freeze was asked for. A gated task stops at its next scheduling point.
+- **The scheduler is also the sensor and the tracker.** It is called on
+  every runnable transition and sees every fork, so the frontier is one
+  exact map read, and the tree is whatever was forked below the root. A
+  container runtime moves its processes into cgroups of its own, where a
+  freezer on the run's cgroup would not reach them.
+
+The second point has a cost. A task stopped anywhere can be stopped holding
+kernel locks (a directory's inode lock, a FUSE request in flight), and
+crfuzz must never wait on one. That is why the backend opens with `O_PATH`
+(no filesystem open callback), stats from the cache (`AT_STATX_DONT_SYNC`),
+runs the mutator and the probes under a deadline, and treats `sched_ext`'s
+30 s watchdog as the ceiling on any hold.
 
 ## Repository layout
 
@@ -586,10 +645,10 @@ LICENSE                    GPL-2.0
 .github/workflows/test.yml the pure tests, on every push
 scx_crfuzz/                the scx_crfuzz crate
   build.rs                 builds the BPF skeleton and the static containerd mutator
-  src/bpf/main.bpf.c       the sched_ext gate scheduler
-  src/gate.rs              loads the gate scheduler; GateMap, its client
+  src/bpf/main.bpf.c       the gate scheduler: gates, counts, tracks and names a run's tree
+  src/gate.rs              loads the gate scheduler; GateMap, a run's client for it
   src/backend.rs           seccomp-notify hold, tree gate, mutator and probe
-  src/sensor.rs            /proc double-snapshot readout (complete frontier)
+  src/sensor.rs            the frontier: the scheduler's count, read around a drain
   src/name.rs              event identity: path normalization
   src/pos.rs               conflict keys, POS
   src/engine.rs            the discovery / replay loop
@@ -634,6 +693,15 @@ cli, campaign and gate.
   lets siblings run briefly. A gate set in the kernel would close it.
 - The watch set and the timing (the 200 ms frontier limit, the 15 s mutator
   watchdog) are fixed. `execve` is not watched. aarch64 only.
+- The frontier sees runnable tasks, not sleeping ones: a thread asleep on a
+  timer or on outside I/O can issue an event after a decision that did not
+  wait for it (see Determinism; the telemetry counts such decisions).
+- The gate reaches only tasks in `SCHED_EXT`: a task of the tree that leaves
+  that class (`sched_setscheduler`) is no longer stopped or counted. The
+  scheduler tracks 65536 processes over all runs; past that, a run ends
+  invalid.
+- A process more than 16 generations below the root has no stable name
+  (`?<tgid>`).
 - For `run`, the mutator is yours: no default primitives ship with `run`.
   The mutator is exec'd inside the held task's root.
 - Minimization tries single holds only. A bug that needs two mutations is
@@ -646,6 +714,8 @@ cli, campaign and gate.
   `containerd`, a different `--image` is not detected.
 - `--jobs` isolates only the filesystem. The windows within one seed still
   run one after another.
+- After upgrading crfuzz, restart `gated`: an older one lacks the pins this
+  one opens, and runs fail while it holds `sched_ext`.
 
 ## License
 

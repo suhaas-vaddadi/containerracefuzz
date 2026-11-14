@@ -1,120 +1,48 @@
-//! Readout sensor: is no SUT thread running? A `/proc` double snapshot, not a
-//! BPF tracepoint sensor.
-//!
-//! Two snapshots of the run cgroup's threads with the same tid set, no thread
-//! `R`, and unchanged on-CPU time mean every thread slept through the gap
-//! between them: a moment when no SUT thread ran. Threads we hold are exempt. Per thread, state is read
-//! before cpu time, so a wakeup after the state read shows as `R` or moved time
-//! in the next snapshot.
+//! Readout sensor: is no SUT thread running? The gate scheduler counts the
+//! tree's tasks that are runnable or being woken (`GateMap::quiet`), so the
+//! answer is one map read, exact as of the read.
 
-use crate::backend::{cgroup_dirs, Event, GateBackend, Poll};
+use crate::backend::{Event, GateBackend, Poll};
 use anyhow::Result;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Snapshot spacing (backend poll timeout) while waiting for a frontier.
+/// How long to wait for a syscall to trap while the tree is running, or
+/// while there is nothing to decide on.
 const INTERVAL: Duration = Duration::from_millis(1);
-
-/// tid -> (state char from /proc/<tid>/stat, ns on CPU from schedstat).
-pub type Snap = BTreeMap<u32, (u8, u64)>;
-
-pub fn snapshot(cgroup: &Path) -> Snap {
-    let mut snap = Snap::new();
-    for dir in cgroup_dirs(cgroup) {
-        let Ok(tids) = fs::read_to_string(dir.join("cgroup.threads")) else { continue };
-        for tid in tids.lines().filter_map(|l| l.parse().ok()) {
-            if let Some(t) = read_thread(tid) {
-                snap.insert(tid, t);
-            }
-        }
-    }
-    snap
-}
-
-/// None: the thread is gone (Exited).
-fn read_thread(tid: u32) -> Option<(u8, u64)> {
-    let stat = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
-    // comm may hold spaces and parens; state follows the last ')'.
-    let state = *stat.get(stat.rfind(')')? + 2..)?.as_bytes().first()?;
-    let sched = fs::read_to_string(format!("/proc/{tid}/schedstat")).ok()?;
-    Some((state, sched.split_whitespace().next()?.parse().ok()?))
-}
-
-/// No SUT thread ran between `a` and `b`. `parked` threads (held by us) count
-/// as stopped whatever their state.
-pub fn quiescent(a: &Snap, b: &Snap, parked: &BTreeSet<u32>) -> bool {
-    a.keys().eq(b.keys())
-        && b.iter().all(|(tid, &(st, ns))| parked.contains(tid) || (st != b'R' && a[tid] == (st, ns)))
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frontier {
-    /// No SUT thread ran between two snapshots: everything it will do
-    /// without us is held.
+    /// No SUT thread can run: everything it will do without us is held.
     Complete,
-    /// Some still ran at the deadline.
+    /// Some still could at the deadline.
     Partial,
     /// The SUT tree is gone: there is no frontier to decide on. Not a stall;
     /// a run ends this way.
     Exited,
 }
 
-/// Wait until no SUT thread is running, adding every syscall held meanwhile to
-/// `held` (the frontier), up to `deadline`. Exited once the SUT has no
-/// threads left (an empty snapshot is vacuously quiescent). Only syscalls
-/// received before a snapshot may exempt a thread in it: one received after
-/// was running during the snapshot.
-pub fn wait_frontier(be: &mut GateBackend, held: &mut Vec<Event>, deadline: Instant) -> Result<Frontier> {
-    let mut prev = snapshot(be.cgroup());
+/// Wait until no SUT thread can run, adding every syscall held meanwhile to
+/// `held` (the frontier), up to `deadline`. `idle`: the last frontier was
+/// left as it was, so wait for a trap or a tick before reading again.
+///
+/// Complete means the tree read quiet, then the listener was drained, then
+/// it read quiet again. Quiet first: a thread parks only after its
+/// notification is queued, so everything trapped by then is in the drain.
+/// Quiet after: nothing of the tree woke while it was drained.
+pub fn wait_frontier(be: &mut GateBackend, held: &mut Vec<Event>, deadline: Instant, mut idle: bool) -> Result<Frontier> {
     loop {
-        match be.poll(INTERVAL)? {
+        let quiet = be.quiet()?;
+        match be.poll(if quiet && !idle { Duration::ZERO } else { INTERVAL })? {
             Poll::Events(evs) => held.extend(evs),
             Poll::Closed => return Ok(Frontier::Exited),
             Poll::Idle => {}
         }
-        let now = snapshot(be.cgroup());
-        // Last thread gone before the notify fd reports POLLHUP.
-        if now.is_empty() {
-            return Ok(Frontier::Exited);
-        }
-        if !be.clones_pending() && quiescent(&prev, &now, &held.iter().map(|e| e.tid).collect()) {
+        if quiet && be.quiet()? {
             return Ok(Frontier::Complete);
         }
         if Instant::now() >= deadline {
             return Ok(Frontier::Partial);
         }
-        prev = now;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn snap(ts: &[(u32, u8, u64)]) -> Snap {
-        ts.iter().map(|&(t, s, n)| (t, (s, n))).collect()
-    }
-
-    #[test]
-    fn quiescent_rules() {
-        let none = BTreeSet::new();
-        let a = snap(&[(1, b'S', 10), (2, b'D', 5)]);
-        assert!(quiescent(&a, &a, &none));
-        assert!(!quiescent(&a, &snap(&[(1, b'S', 11), (2, b'D', 5)]), &none), "ran between");
-        assert!(!quiescent(&a, &snap(&[(1, b'R', 10), (2, b'D', 5)]), &none), "runnable");
-        assert!(!quiescent(&a, &snap(&[(1, b'S', 10)]), &none), "exited between");
-        assert!(!quiescent(&a, &snap(&[(1, b'S', 10), (2, b'D', 5), (3, b'S', 0)]), &none), "cloned");
-        let moving = snap(&[(1, b'R', 99), (2, b'D', 5)]);
-        assert!(quiescent(&a, &moving, &BTreeSet::from([1])), "parked overrides");
-    }
-
-    #[test]
-    fn reads_own_thread() {
-        let tid = unsafe { libc::gettid() } as u32;
-        let (st, ns) = read_thread(tid).unwrap();
-        assert_eq!(st, b'R');
-        assert!(ns > 0);
+        idle = false;
     }
 }

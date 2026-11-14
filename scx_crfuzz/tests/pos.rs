@@ -28,7 +28,7 @@ fn once(seed: u64, a: &Path, b: &Path) -> Vec<Decision> {
 }
 
 /// Two racing `cat`s (forked: named by creation tree): the engine decides
-/// every openat on a complete frontier, a seed fixes the whole decision log,
+/// every path syscall on a complete frontier, a seed fixes the whole decision log,
 /// and the seed is what picks which trigger opens first.
 #[test]
 #[ignore]
@@ -41,12 +41,14 @@ fn seed_fixes_trigger_order() {
                 let log = once(seed, &a, &b);
                 // A partial decision is outside the determinism claim.
                 assert!(log.iter().all(|d| !d.partial), "seed {seed}: partial decision");
-                assert!(log.iter().all(|d| !d.id.thread.starts_with('?')), "seed {seed}: unnamed thread");
+                assert!(log.iter().all(|d| !d.id.process.starts_with('?')), "seed {seed}: unnamed process");
                 log.into_iter().map(|d| d.id).collect()
             })
             .collect();
-        let threads: BTreeSet<&str> = logs[0].iter().map(|id| id.thread.as_str()).collect();
-        eprintln!("seed {seed}: {} decisions, threads {threads:?}", logs[0].len());
+        let procs: BTreeSet<&str> = logs[0].iter().map(|id| id.process.as_str()).collect();
+        eprintln!("seed {seed}: {} decisions, processes {procs:?}", logs[0].len());
+        let by = |p: &Path| logs[0].iter().find(|id| id.path.as_deref() == Some(p)).unwrap().process.clone();
+        assert_eq!((by(&a), by(&b)), ("0/0".to_string(), "0/1".to_string()), "sh forks cat a first");
         assert!(logs.iter().all(|l| l == &logs[0]), "seed {seed}: decision logs differ");
         let trig: Vec<&Path> = logs[0].iter().filter_map(|id| id.path.as_deref()).filter(|&p| p == a || p == b).collect();
         assert_eq!(trig.len(), 2, "both triggers decided");

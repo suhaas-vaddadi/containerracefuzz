@@ -7,7 +7,7 @@ use crate::name::EventId;
 use crate::pos::Keys;
 use anyhow::{bail, ensure, Context, Result};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
@@ -66,9 +66,9 @@ pub fn uncanary(p: &Path, canary: &Path) -> Option<PathBuf> {
 }
 
 /// A finding's identity across runs: the canary directory as `<canary>`, the
-/// probed task's /proc handles named by its creation-tree thread name (tids
-/// differ every run), fd numbers dropped.
-/// `task`: the probed event's `(tid, tgid, thread)`; `probe` reads only its
+/// probed task's /proc handles named by its process name (tids differ every
+/// run), fd numbers dropped.
+/// `task`: the probed event's `(tid, tgid, process)`; `probe` reads only its
 /// `/proc/<tid>/{cwd,root}` and `/proc/<tgid>/fd/N`.
 pub fn normalize(f: &Finding, canary: &Path, task: Option<(u32, u32, &str)>) -> Finding {
     let at = |at: &Path| -> PathBuf {
@@ -167,10 +167,6 @@ impl Fixed<'_> {
         }
     }
 }
-
-/// The run deadline, in seconds, of a schedule without a `timeout` line:
-/// files from before `--timeout`. New runs default to 30.
-pub const TIMEOUT: u64 = 60;
 
 /// What a run is given: `run`'s arguments, the `CRFUZZ_*` environment
 /// included. Written to `DIR/config` (what `--resume` must find again) and
@@ -318,7 +314,7 @@ fn unesc_str(s: &str) -> Result<String> {
 
 impl std::fmt::Display for Schedule {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "crfuzz-schedule 1\nseed {}\n{}", self.seed, self.cfg)?;
+        write!(f, "crfuzz-schedule 2\nseed {}\n{}", self.seed, self.cfg)?;
         writeln!(f, "outcome {}", self.class)?;
         if self.deadline {
             writeln!(f, "deadline")?;
@@ -330,9 +326,9 @@ impl std::fmt::Display for Schedule {
                 Finding::Changed { entry } => writeln!(f, "finding Changed {}", esc_path(entry))?,
             }
         }
-        // `mutate thread nr n [path]`, one per POS decision.
+        // `mutate process nr n [path]`, one per POS decision.
         for s in &self.steps {
-            write!(f, "step {} {} {} {}", s.mutate as u8, esc(s.id.thread.as_bytes()), s.id.nr, s.id.n)?;
+            write!(f, "step {} {} {} {}", s.mutate as u8, esc(s.id.process.as_bytes()), s.id.nr, s.id.n)?;
             match &s.id.path {
                 Some(p) => writeln!(f, " {}", esc_path(p))?,
                 None => writeln!(f)?,
@@ -347,9 +343,8 @@ impl std::str::FromStr for Schedule {
 
     fn from_str(text: &str) -> Result<Self> {
         let mut lines = text.lines();
-        ensure!(lines.next() == Some("crfuzz-schedule 1"), "not a crfuzz schedule (version 1)");
-        let cfg = Config { timeout: TIMEOUT, ..Config::default() };
-        let mut s = Schedule { seed: 0, cfg, class: Class::Invalid, deadline: false, findings: BTreeSet::new(), steps: vec![] };
+        ensure!(lines.next() == Some("crfuzz-schedule 2"), "not a crfuzz schedule version 2 (version 1 named events by thread, which differs every run under Go: rerun discovery)");
+        let mut s = Schedule { seed: 0, cfg: Config::default(), class: Class::Invalid, deadline: false, findings: BTreeSet::new(), steps: vec![] };
         for (i, line) in lines.enumerate() {
             let w: Vec<&str> = line.split(' ').collect();
             let bad = || format!("line {}: {line:?}", i + 2);
@@ -366,7 +361,7 @@ impl std::str::FromStr for Schedule {
                 ["step", m, t, nr, n, ref path @ ..] if path.len() <= 1 => s.steps.push(Step {
                     mutate: m == "1",
                     id: EventId {
-                        thread: unesc_str(t)?,
+                        process: unesc_str(t)?,
                         nr: nr.parse().with_context(bad)?,
                         path: path.first().map(|p| unesc_path(p)).transpose()?,
                         n: n.parse().with_context(bad)?,
@@ -381,23 +376,25 @@ impl std::str::FromStr for Schedule {
 }
 
 /// A run's decisions as one canonical member of their partial order (what
-/// "same seed, same order" promises): two are ordered iff on one thread or
-/// their keys conflict, earlier first; ties go to the smallest `EventId`.
+/// "same seed, same order" promises): two are ordered iff their keys
+/// conflict, earlier first; ties go to the smallest `EventId`.
 /// Equal outputs, same partial order.
+/// No program-order edge: a thread's events appear in that order in every
+/// feasible run, so trace equivalence is unchanged for them; under M:N a
+/// process-wide edge would falsely order goroutines.
 /// Edges with the ordered pairs' transitive closure (so the same ready sets),
-/// O(n + keys) of them: the thread's last, the last `all` and (for an `all`)
-/// everything since, each key's last writer and (for a writer) its readers
-/// since; relies on writes ⊆ reads. Then the smallest ready one from a heap.
+/// O(n + keys) of them: the last `all` and (for an `all`) everything since,
+/// each key's last writer and (for a writer) its readers since; relies on
+/// writes ⊆ reads. Then the smallest ready one from a heap.
 pub fn canonical(log: &[(&EventId, &Keys)]) -> Vec<EventId> {
     let mut after = vec![Vec::new(); log.len()];
     let mut waits = vec![0usize; log.len()];
-    let mut threads = HashMap::new();
     let mut last_all = None;
     // Per key: its last writer, and its readers since (that writer included).
     let mut keys: BTreeMap<_, (Option<usize>, Vec<usize>)> = BTreeMap::new();
-    for (j, (id, k)) in log.iter().enumerate() {
+    for (j, (_, k)) in log.iter().enumerate() {
         debug_assert!(k.writes.is_subset(&k.reads));
-        let mut pre: Vec<usize> = threads.insert(&id.thread, j).into_iter().chain(last_all).collect();
+        let mut pre: Vec<usize> = last_all.into_iter().collect();
         if k.all {
             pre.extend(last_all.map_or(0, |a| a + 1)..j);
             last_all = Some(j);
@@ -431,12 +428,13 @@ pub fn canonical(log: &[(&EventId, &Keys)]) -> Vec<EventId> {
     out
 }
 
-/// A deduped finding: the guilty hold's `(thread, nr, path)`,
-/// occurrence dropped (None: needs more than one hold), and the schedule's
-/// normalized findings.
+/// A deduped finding: the guilty hold's `(nr, path)` (None: needs more than
+/// one hold), and the schedule's normalized findings. No occurrence or
+/// process: a window fires in any process, and which sibling takes a fork
+/// index is arrival order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dedup {
-    pub guilty: Option<(String, i64, Option<PathBuf>)>,
+    pub guilty: Option<(i64, Option<PathBuf>)>,
     pub findings: BTreeSet<Finding>,
 }
 
@@ -445,7 +443,7 @@ impl Dedup {
     /// findings, and its mutations include one at the guilty hold.
     pub fn repeated_by(&self, findings: &BTreeSet<Finding>, steps: &[Step]) -> bool {
         *findings == self.findings
-            && self.guilty.as_ref().map_or(true, |(t, nr, p)| steps.iter().any(|s| s.mutate && s.id.thread == *t && s.id.nr == *nr && s.id.path == *p))
+            && self.guilty.as_ref().map_or(true, |(nr, p)| steps.iter().any(|s| s.mutate && s.id.nr == *nr && s.id.path == *p))
     }
 }
 
@@ -477,7 +475,7 @@ mod tests {
 
     #[test]
     fn schedule_round_trip() {
-        let id = |thread: &str, path: Option<&[u8]>, n| EventId { thread: thread.into(), nr: 56, path: path.map(|p| OsString::from_vec(p.to_vec()).into()), n };
+        let id = |process: &str, path: Option<&[u8]>, n| EventId { process: process.into(), nr: 56, path: path.map(|p| OsString::from_vec(p.to_vec()).into()), n };
         let cfg = Config {
             attacker: "65534:65534".into(),
             mutator: Some("/tmp/m m.sh".into()),
@@ -521,12 +519,10 @@ mod tests {
     }
 
     #[test]
-    fn timeout_line_defaults_in_old_schedules() {
-        let old = "crfuzz-schedule 1\nseed 0\nattacker 1:1\ncmd /bin/true\noutcome Clean\n";
-        let s = old.parse::<Schedule>().unwrap();
-        assert_eq!((s.cfg.timeout, s.cfg.private.len(), s.cfg.env.len()), (TIMEOUT, 0, 0), "an old file without the lines");
-        assert!(s.to_string().contains(&format!("\ntimeout {TIMEOUT}\n")), "written from now on");
-        assert_eq!(s.to_string().parse::<Schedule>().unwrap(), s);
+    fn older_schedules_refused() {
+        let e = "crfuzz-schedule 1\nseed 0\nattacker 1:1\ntimeout 30\ncmd /bin/true\noutcome Clean\n".parse::<Schedule>().unwrap_err().to_string();
+        assert!(e.contains("version 2"), "{e}");
+        assert!("crfuzz-schedule 2\nseed 0\nattacker 1:1\ncmd /bin/true\noutcome Clean\n".parse::<Schedule>().is_err(), "no timeout");
     }
 
     #[test]
@@ -540,15 +536,15 @@ mod tests {
 
     #[test]
     fn fixed_past_the_end() {
-        let id = EventId { thread: "0".into(), nr: 56, path: None, n: 0 };
+        let id = EventId { process: "0".into(), nr: 56, path: None, n: 0 };
         let keys = Keys::default();
         let ready = [(&id, &keys)];
         assert_eq!(Fixed { steps: &[], next: 0, deadline: true }.pick(&ready).unwrap(), None);
         assert_eq!(Fixed { steps: &[], next: 0, deadline: false }.pick(&ready).unwrap_err().expected, None);
     }
 
-    fn ev(thread: &str, path: &str) -> EventId {
-        EventId { thread: thread.into(), nr: 257, path: Some(path.into()), n: 0 }
+    fn ev(process: &str, path: &str) -> EventId {
+        EventId { process: process.into(), nr: 257, path: Some(path.into()), n: 0 }
     }
 
     #[test]
@@ -565,8 +561,9 @@ mod tests {
         assert_eq!(order(&[(&b, &kb), (&a, &ka)]), order(&[(&a, &ka), (&b, &kb)]));
         // Conflicting (c rebinds what a reads): a different one.
         assert_ne!(order(&[(&c, &kw), (&a, &ka)]), order(&[(&a, &ka), (&c, &kw)]));
-        // Same thread, independent keys: a different one.
-        assert_ne!(order(&[(&d, &kb), (&a, &ka)]), order(&[(&a, &ka), (&d, &kb)]));
+        // Same process, independent keys: the same one (its events are in
+        // program order in every feasible run).
+        assert_eq!(order(&[(&d, &kb), (&a, &ka)]), order(&[(&a, &ka), (&d, &kb)]));
         // `all` conflicts with everything.
         let all = Keys { all: true, ..Keys::default() };
         assert_ne!(order(&[(&b, &all), (&a, &ka)]), order(&[(&a, &ka), (&b, &all)]));
@@ -577,7 +574,7 @@ mod tests {
         use crate::pos::Key;
         // The old O(n³) rescan: the smallest ready decision, each step.
         let rescan = |log: &[(&EventId, &Keys)]| {
-            let before = |i: usize, j: usize| log[i].0.thread == log[j].0.thread || log[i].1.conflicts(log[j].1);
+            let before = |i: usize, j: usize| log[i].1.conflicts(log[j].1);
             let mut done = vec![false; log.len()];
             let mut out = Vec::new();
             while out.len() < log.len() {
@@ -587,7 +584,7 @@ mod tests {
             }
             out
         };
-        // Deterministic jumbles: 1 to 4 threads, 4 inodes, some writes, some
+        // Deterministic jumbles: 1 to 4 processes, 4 inodes, some writes, some
         // `all` (most, when skewed), and ids that often repeat (the tie-break).
         let mut x = 0x9e3779b97f4a7c15u64;
         let mut next = || {
@@ -597,11 +594,11 @@ mod tests {
             x
         };
         for case in 0..60u64 {
-            let (threads, alls) = (case % 4 + 1, if case % 3 == 0 { 12 } else { 1 });
+            let (procs, alls) = (case % 4 + 1, if case % 3 == 0 { 12 } else { 1 });
             let evs: Vec<(EventId, Keys)> = (0..case * 5)
                 .map(|_| {
                     let r = next();
-                    let id = EventId { thread: format!("0/{}", r % threads), nr: 257, path: Some(format!("/p{}", r >> 8 & 1).into()), n: (r >> 12 & 1) as u32 };
+                    let id = EventId { process: format!("0/{}", r % procs), nr: 257, path: Some(format!("/p{}", r >> 8 & 1).into()), n: (r >> 12 & 1) as u32 };
                     let (a, b) = (Key::Ino(0, r >> 16 & 3), Key::Ino(0, r >> 20 & 3));
                     let keys = match r >> 24 & 15 {
                         n if n < alls => Keys { all: true, ..Keys::default() },
@@ -620,14 +617,14 @@ mod tests {
     fn repeat_needs_same_findings_and_guilty_mutated() {
         let f: BTreeSet<Finding> = [Finding::Changed { entry: "file".into() }].into();
         let g = ev("0", "/p");
-        let key = Dedup { guilty: Some((g.thread.clone(), g.nr, g.path.clone())), findings: f.clone() };
+        let key = Dedup { guilty: Some((g.nr, g.path.clone())), findings: f.clone() };
         // Another occurrence of the guilty hold still matches.
         let steps = |mutate: bool| vec![Step { id: ev("0", "/q"), mutate: true }, Step { id: EventId { n: 3, ..g.clone() }, mutate }];
         assert!(key.repeated_by(&f, &steps(true)));
         assert!(!key.repeated_by(&f, &steps(false)), "guilty hold not mutated");
         assert!(!key.repeated_by(&BTreeSet::new(), &steps(true)), "other findings");
-        let other_thread = vec![Step { id: ev("0/1", "/p"), mutate: true }];
-        assert!(!key.repeated_by(&f, &other_thread), "threads count separately");
+        assert!(key.repeated_by(&f, &[Step { id: ev("0/1", "/p"), mutate: true }]), "any process");
+        assert!(!key.repeated_by(&f, &[Step { id: ev("0", "/q"), mutate: true }]), "another path");
         // Needs more than one hold: the findings alone.
         let multi = Dedup { guilty: None, ..key };
         assert!(multi.repeated_by(&f, &[]));
