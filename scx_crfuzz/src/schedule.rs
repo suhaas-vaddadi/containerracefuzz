@@ -139,10 +139,13 @@ pub struct Fixed<'a> {
 }
 
 impl Fixed<'_> {
-    /// Index in `ready` of the next step's event, as `Pos::pick`. Called once
-    /// the frontier is complete or the limit expired: a nonempty
-    /// frontier without it has left the schedule.
-    pub fn pick(&mut self, ready: &[(&EventId, &Keys)]) -> Result<Option<usize>, Divergence> {
+    /// `(index in ready, step)` of the next step's event, as `Pos::pick`, or
+    /// failing that of one differing only in occurrence: identical goroutines
+    /// (one process, one callsite) arrive, and so are numbered, in any order,
+    /// and either may stand in for the other. Called once the frontier is
+    /// complete or the limit expired: a nonempty frontier without it has left
+    /// the schedule.
+    pub fn pick(&mut self, ready: &[(&EventId, &Keys)]) -> Result<Option<(usize, usize)>, Divergence> {
         if ready.is_empty() {
             return Ok(None);
         }
@@ -150,10 +153,11 @@ impl Fixed<'_> {
         if expected.is_none() && self.deadline {
             return Ok(None);
         }
-        match ready.iter().position(|(id, _)| Some(*id) == expected) {
+        let twin = |id: &EventId| expected.is_some_and(|e| (&id.process, id.callsite, id.nr, &id.path) == (&e.process, e.callsite, e.nr, &e.path));
+        match ready.iter().position(|(id, _)| Some(*id) == expected).or_else(|| ready.iter().position(|(id, _)| twin(id))) {
             Some(i) => {
                 self.next += 1;
-                Ok(Some(i))
+                Ok(Some((i, self.next - 1)))
             }
             None => Err(Divergence { step: self.next, expected: expected.cloned(), held: ready.iter().map(|(id, _)| (*id).clone()).collect() }),
         }
@@ -220,6 +224,11 @@ impl Config {
         Ok(())
     }
 
+    /// The directories whose names differ between campaigns of one scenario:
+    /// `name::event_path` takes them out.
+    pub fn dirs(&self) -> Vec<PathBuf> {
+        self.scope.iter().chain(&self.private).cloned().collect()
+    }
 }
 
 impl std::fmt::Display for Config {
@@ -314,7 +323,7 @@ fn unesc_str(s: &str) -> Result<String> {
 
 impl std::fmt::Display for Schedule {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "crfuzz-schedule 2\nseed {}\n{}", self.seed, self.cfg)?;
+        write!(f, "crfuzz-schedule 3\nseed {}\n{}", self.seed, self.cfg)?;
         writeln!(f, "outcome {}", self.class)?;
         if self.deadline {
             writeln!(f, "deadline")?;
@@ -326,9 +335,9 @@ impl std::fmt::Display for Schedule {
                 Finding::Changed { entry } => writeln!(f, "finding Changed {}", esc_path(entry))?,
             }
         }
-        // `mutate process nr n [path]`, one per POS decision.
+        // `mutate process callsite nr n [path]`, one per POS decision.
         for s in &self.steps {
-            write!(f, "step {} {} {} {}", s.mutate as u8, esc(s.id.process.as_bytes()), s.id.nr, s.id.n)?;
+            write!(f, "step {} {} {:016x} {} {}", s.mutate as u8, esc(s.id.process.as_bytes()), s.id.callsite, s.id.nr, s.id.n)?;
             match &s.id.path {
                 Some(p) => writeln!(f, " {}", esc_path(p))?,
                 None => writeln!(f)?,
@@ -343,7 +352,7 @@ impl std::str::FromStr for Schedule {
 
     fn from_str(text: &str) -> Result<Self> {
         let mut lines = text.lines();
-        ensure!(lines.next() == Some("crfuzz-schedule 2"), "not a crfuzz schedule version 2 (version 1 named events by thread, which differs every run under Go: rerun discovery)");
+        ensure!(lines.next() == Some("crfuzz-schedule 3"), "not a crfuzz schedule version 3 (older versions named events without their callsite: rerun discovery)");
         let mut s = Schedule { seed: 0, cfg: Config::default(), class: Class::Invalid, deadline: false, findings: BTreeSet::new(), steps: vec![] };
         for (i, line) in lines.enumerate() {
             let w: Vec<&str> = line.split(' ').collect();
@@ -358,10 +367,11 @@ impl std::str::FromStr for Schedule {
                 ["finding", "Reached", e, a] => _ = s.findings.insert(Finding::Reached { entry: unesc_path(e)?, at: unesc_path(a)? }),
                 ["finding", "Copy", a] => _ = s.findings.insert(Finding::Copy { at: unesc_path(a)? }),
                 ["finding", "Changed", e] => _ = s.findings.insert(Finding::Changed { entry: unesc_path(e)? }),
-                ["step", m, t, nr, n, ref path @ ..] if path.len() <= 1 => s.steps.push(Step {
+                ["step", m, t, c, nr, n, ref path @ ..] if path.len() <= 1 => s.steps.push(Step {
                     mutate: m == "1",
                     id: EventId {
                         process: unesc_str(t)?,
+                        callsite: u64::from_str_radix(c, 16).with_context(bad)?,
                         nr: nr.parse().with_context(bad)?,
                         path: path.first().map(|p| unesc_path(p)).transpose()?,
                         n: n.parse().with_context(bad)?,
@@ -431,7 +441,7 @@ pub fn canonical(log: &[(&EventId, &Keys)]) -> Vec<EventId> {
 /// A deduped finding: the guilty hold's `(nr, path)` (None: needs more than
 /// one hold), and the schedule's normalized findings. No occurrence or
 /// process: a window fires in any process, and which sibling takes a fork
-/// index is arrival order.
+/// index is arrival order. No callsite: a finding outlives a SUT rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dedup {
     pub guilty: Option<(i64, Option<PathBuf>)>,
@@ -475,7 +485,7 @@ mod tests {
 
     #[test]
     fn schedule_round_trip() {
-        let id = |process: &str, path: Option<&[u8]>, n| EventId { process: process.into(), nr: 56, path: path.map(|p| OsString::from_vec(p.to_vec()).into()), n };
+        let id = |process: &str, path: Option<&[u8]>, n| EventId { process: process.into(), callsite: (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15), nr: 56, path: path.map(|p| OsString::from_vec(p.to_vec()).into()), n };
         let cfg = Config {
             attacker: "65534:65534".into(),
             mutator: Some("/tmp/m m.sh".into()),
@@ -488,6 +498,7 @@ mod tests {
         };
         assert!(cfg.to_string().contains("\nenv CRFUZZ_DIR /tmp/d%20d\nenv CRFUZZ_EMPTY %\nenv CRFUZZ_X a%25%ff%0a\n"));
         assert_eq!(cfg.to_string().parse::<Config>().unwrap(), cfg);
+        assert_eq!(cfg.dirs(), ["/tmp/a/rootfs", "/tmp/a", "/run/x y"].map(PathBuf::from));
         let s = Schedule {
             seed: 7,
             cfg,
@@ -520,9 +531,28 @@ mod tests {
 
     #[test]
     fn older_schedules_refused() {
-        let e = "crfuzz-schedule 1\nseed 0\nattacker 1:1\ntimeout 30\ncmd /bin/true\noutcome Clean\n".parse::<Schedule>().unwrap_err().to_string();
-        assert!(e.contains("version 2"), "{e}");
-        assert!("crfuzz-schedule 2\nseed 0\nattacker 1:1\ncmd /bin/true\noutcome Clean\n".parse::<Schedule>().is_err(), "no timeout");
+        for v in 1..3 {
+            let e = format!("crfuzz-schedule {v}\nseed 0\nattacker 1:1\ntimeout 30\ncmd /bin/true\noutcome Clean\n").parse::<Schedule>().unwrap_err().to_string();
+            assert!(e.contains("version 3"), "{e}");
+        }
+    }
+
+    #[test]
+    fn fixed_matches_symmetric_events_by_position() {
+        let e = |callsite, n| EventId { process: "0".into(), callsite, nr: 56, path: Some("/f".into()), n };
+        let keys = Keys::default();
+        let steps: Vec<Step> = [e(1, 1), e(1, 0), e(2, 0)].into_iter().map(|id| Step { id, mutate: false }).collect();
+        let mut f = Fixed { steps: &steps, next: 0, deadline: false };
+        // Identical goroutines arrive in another order: the first to arrive
+        // stands in for the recorded n=1, the second for n=0.
+        let (a0, b1, other) = (e(1, 0), e(1, 1), e(2, 0));
+        assert_eq!(f.pick(&[(&other, &keys), (&a0, &keys)]).unwrap(), Some((1, 0)));
+        assert_eq!(f.pick(&[(&other, &keys), (&b1, &keys)]).unwrap(), Some((1, 1)));
+        // An exact match wins over a symmetric one; another callsite never matches.
+        let mut f = Fixed { steps: &steps, next: 0, deadline: false };
+        assert_eq!(f.pick(&[(&a0, &keys), (&b1, &keys)]).unwrap(), Some((1, 0)));
+        let mut f = Fixed { steps: &steps[2..], next: 0, deadline: false };
+        assert!(f.pick(&[(&a0, &keys)]).is_err());
     }
 
     #[test]
@@ -536,7 +566,7 @@ mod tests {
 
     #[test]
     fn fixed_past_the_end() {
-        let id = EventId { process: "0".into(), nr: 56, path: None, n: 0 };
+        let id = EventId { process: "0".into(), callsite: 0, nr: 56, path: None, n: 0 };
         let keys = Keys::default();
         let ready = [(&id, &keys)];
         assert_eq!(Fixed { steps: &[], next: 0, deadline: true }.pick(&ready).unwrap(), None);
@@ -544,7 +574,7 @@ mod tests {
     }
 
     fn ev(process: &str, path: &str) -> EventId {
-        EventId { process: process.into(), nr: 257, path: Some(path.into()), n: 0 }
+        EventId { process: process.into(), callsite: 0, nr: 257, path: Some(path.into()), n: 0 }
     }
 
     #[test]
@@ -598,7 +628,7 @@ mod tests {
             let evs: Vec<(EventId, Keys)> = (0..case * 5)
                 .map(|_| {
                     let r = next();
-                    let id = EventId { process: format!("0/{}", r % procs), nr: 257, path: Some(format!("/p{}", r >> 8 & 1).into()), n: (r >> 12 & 1) as u32 };
+                    let id = EventId { process: format!("0/{}", r % procs), callsite: 0, nr: 257, path: Some(format!("/p{}", r >> 8 & 1).into()), n: (r >> 12 & 1) as u32 };
                     let (a, b) = (Key::Ino(0, r >> 16 & 3), Key::Ino(0, r >> 20 & 3));
                     let keys = match r >> 24 & 15 {
                         n if n < alls => Keys { all: true, ..Keys::default() },
@@ -623,7 +653,8 @@ mod tests {
         assert!(key.repeated_by(&f, &steps(true)));
         assert!(!key.repeated_by(&f, &steps(false)), "guilty hold not mutated");
         assert!(!key.repeated_by(&BTreeSet::new(), &steps(true)), "other findings");
-        assert!(key.repeated_by(&f, &[Step { id: ev("0/1", "/p"), mutate: true }]), "any process");
+        let sibling = vec![Step { id: EventId { callsite: 9, ..ev("0/1", "/p") }, mutate: true }];
+        assert!(key.repeated_by(&f, &sibling), "any process, any callsite");
         assert!(!key.repeated_by(&f, &[Step { id: ev("0", "/q"), mutate: true }]), "another path");
         // Needs more than one hold: the findings alone.
         let multi = Dedup { guilty: None, ..key };

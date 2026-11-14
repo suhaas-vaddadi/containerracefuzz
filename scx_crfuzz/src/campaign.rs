@@ -167,10 +167,14 @@ fn partial(log: &[Decision]) -> usize {
     log.iter().filter(|d| d.partial).count()
 }
 
-/// A run's partial order: a hash of its canonical member.
+/// A run's partial order: a hash of its canonical member, each event without
+/// its occurrence. A replay lets two events that differ only there stand in
+/// for each other (which is numbered first is arrival order), so they are
+/// not two orders here either.
 fn order(log: &[Decision]) -> u64 {
     let canon = schedule::canonical(&log.iter().map(|d| (&d.id, &d.keys)).collect::<Vec<_>>());
-    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(canon)
+    let ids: Vec<_> = canon.iter().map(|id| (&id.process, id.callsite, id.nr, &id.path)).collect();
+    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(ids)
 }
 
 /// A file of DIR's, "" if missing (none when not resuming).

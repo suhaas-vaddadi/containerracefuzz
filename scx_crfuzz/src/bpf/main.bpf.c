@@ -19,6 +19,7 @@ char _license[] SEC("license") = "GPL";
 #define MAX_RUNS		1024
 #define MAX_PROCS		65536
 #define MAX_DEPTH		16
+#define SCHED_EXT_POLICY	7
 
 UEI_DEFINE(uei);
 
@@ -63,6 +64,23 @@ struct {
 	__type(key, u32);
 	__type(value, struct proc);
 } procs SEC(".maps");
+
+/* A task's user pc, stack and frame pointers at its latest syscall. */
+struct user_regs {
+	u64 pc;
+	u64 sp;
+	u64 fp;
+	u32 tgid;
+	u32 pad;
+};
+
+/* Key tid. Never cleaned: LRU evicts dead tids. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u32);
+	__type(value, struct user_regs);
+} sys_regs SEC(".maps");
 
 /* What the syscall programs are run on. */
 struct run_arg {
@@ -170,6 +188,38 @@ int BPF_PROG(freed, struct task_struct *p)
 
 	if (p->pid == tgid)
 		bpf_map_delete_elem(&procs, &tgid);
+	return 0;
+}
+
+/*
+ * Runs in the trapping task before seccomp notifies (sys_enter fires only
+ * after the release). Saves where to start the unwind; userspace walks the
+ * frame pointers through /proc/<tid>/mem while the task is held, since an
+ * unwind here can't fault in a cold stack page and stops short. A task of a
+ * tree that is no longer in SCHED_EXT can't be gated or counted: its run is
+ * flagged instead.
+ */
+SEC("kprobe/__secure_computing")
+int BPF_KPROBE(save_regs)
+{
+	struct task_struct *p = bpf_get_current_task_btf();
+	struct run *r = run_of(p);
+	struct user_regs u = {};
+	struct pt_regs *regs;
+	u32 tid = p->pid;
+
+	if (!r)
+		return 0;
+	if (p->policy != SCHED_EXT_POLICY) {
+		r->escaped = 1;
+		return 0;
+	}
+	regs = (struct pt_regs *)bpf_task_pt_regs(p);
+	u.pc = PT_REGS_IP_CORE(regs);
+	u.sp = PT_REGS_SP_CORE(regs);
+	u.fp = PT_REGS_FP_CORE(regs);
+	u.tgid = p->tgid;
+	bpf_map_update_elem(&sys_regs, &tid, &u, BPF_ANY);
 	return 0;
 }
 

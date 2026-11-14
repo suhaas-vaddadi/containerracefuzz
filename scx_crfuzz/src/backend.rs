@@ -4,6 +4,7 @@
 //! older kernels fail every mutation and probe, so every judged run is invalid.
 
 use crate::gate::GateMap;
+use crate::name::{self, Maps};
 use crate::oracle::{self, Alice, Canary, Finding};
 use crate::pos::{Key, Keys};
 use anyhow::{bail, ensure, Context, Result};
@@ -67,6 +68,10 @@ pub struct Event {
     pub tgid: u32,
     /// `GateMap::name` of its process; `?<tgid>` if it has none.
     pub process: String,
+    /// `name::callsite` of the code that issued it, and the stack frames
+    /// that went into it.
+    pub callsite: u64,
+    pub frames: u32,
     pub nr: i64,
     /// Best-effort: a running sibling can rewrite it after the read.
     pub path: Option<PathBuf>,
@@ -209,18 +214,23 @@ impl GateBackend {
             Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::EINTR)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
+        // No `?` from here on unless the syscall has been let go: req.id
+        // exists nowhere else, so its thread would stay parked for good.
         let (tid, nr, args) = (req.pid, req.data.nr as i64, req.data.args);
+        // No registers: it trapped outside SCHED_EXT. The scheduler has
+        // flagged the run (`quiet` fails), so the run ends invalid.
+        let Some((regs, tgid)) = self.gate.sys_regs(tid) else { return self.resume(req.id).map(|()| None) };
         let (path, keys) = observe(tid, nr, &args);
-        let tgid = read_tgid(tid);
+        let dirfd = path_args(nr).first().and_then(|a| a.0).map(|d| args[d] as i32).filter(|&fd| fd != libc::AT_FDCWD);
+        let maps = Maps::parse(&fs::read_to_string(format!("/proc/{tid}/maps")).unwrap_or_default());
+        let (callsite, frames) = name::callsite(&unwind(tid, regs, &maps), &maps);
+        let process = self.gate.name(tgid).unwrap_or_else(|| format!("?{tgid}"));
         // Only a still-valid id proves tid and bytes belonged to the notifying
         // task (it may have died and its tid been reused).
         if !self.id_valid(req.id) {
             return Ok(None);
         }
-        let tgid = tgid?;
-        let process = self.gate.name(tgid).unwrap_or_else(|| format!("?{tgid}"));
-        let dirfd = path_args(nr).first().and_then(|a| a.0).map(|d| args[d] as i32).filter(|&fd| fd != libc::AT_FDCWD);
-        Ok(Some(Event { id: req.id, tid, tgid, process, nr, path, dirfd, keys, args }))
+        Ok(Some(Event { id: req.id, tid, tgid, process, callsite, frames, nr, path, dirfd, keys, args }))
     }
 
     /// Re-walk a held event's keys: a mutation makes its hold-time keys stale,
@@ -241,7 +251,11 @@ impl GateBackend {
     /// gated until `ungate_tree`; answering first means a signal can't restart
     /// the syscall mid-release.
     pub fn release(&mut self, ev: &Event) -> Result<()> {
-        match notif_continue(self.notify.as_raw_fd(), ev.id) {
+        self.resume(ev.id)
+    }
+
+    fn resume(&self, id: u64) -> Result<()> {
+        match notif_continue(self.notify.as_raw_fd(), id) {
             Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Err(e.into()),
             _ => Ok(()), // ENOENT: task died while held
         }
@@ -889,6 +903,44 @@ fn notif_continue(fd: RawFd, id: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `tid`'s user stack, innermost first, from its held syscall's
+/// `[pc, sp, fp]`: the frame-pointer chain (`[fp]` the caller's fp, `[fp + 8]`
+/// the return address) read through /proc/<tid>/mem, which faults pages in.
+/// For Go code only; anything else is its pc alone. The walk is sound only if
+/// every function on the stack keeps a frame pointer. Go's toolchain always
+/// does, and its arm64 frame record sits at sp-8, where no C ABI puts one, so
+/// that is how a Go stack is known. In other code x29 may be a general
+/// register (Rust, C built without frame pointers), and the walk then reads
+/// saved register pairs as frames, differently from run to run (measured:
+/// runc's libpathrs, 1 event in 155 renamed in 12% of runs).
+/// A frame counts only while fp ascends inside sp's mapping and its return
+/// address is in executable code (`maps`: its /proc maps); 32 frames at most.
+/// A saved return address carries a pointer-authentication code in its top
+/// bits: strip it.
+fn unwind(tid: u32, [pc, sp, mut fp]: [u64; 3], maps: &Maps) -> Vec<u64> {
+    let mut ips = vec![pc];
+    if fp != sp.wrapping_sub(8) {
+        return ips;
+    }
+    let (Ok(mem), Some(stack)) = (File::open(format!("/proc/{tid}/mem")), maps.find(sp)) else { return ips };
+    let (bottom, top) = (stack.start, stack.end);
+    let mut rec = [0u8; 16];
+    while ips.len() < 32 && bottom <= fp && fp <= top - 16 && fp % 8 == 0 && mem.read_exact_at(&mut rec, fp).is_ok() {
+        let (next, ret) = (u64::from_ne_bytes(rec[..8].try_into().unwrap()), u64::from_ne_bytes(rec[8..].try_into().unwrap()));
+        // ponytail: 48-bit user VAs; a 52-bit (LVA) mapping's frames end here.
+        let ret = ret & ((1 << 48) - 1);
+        if !maps.find(ret).is_some_and(|m| m.exec) {
+            break;
+        }
+        ips.push(ret);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    ips
+}
+
 /// Classic BPF: USER_NOTIF for `watched` syscalls on our arch, ALLOW otherwise.
 // ponytail: x32 syscall numbers (x86_64 | 0x40000000) are allowed unwatched.
 fn notify_filter(watched: &[i64]) -> Vec<libc::sock_filter> {
@@ -1064,12 +1116,6 @@ fn proc_link(tid: u32, at: &Path, target: PathBuf) -> Option<PathBuf> {
         "thread-self" => Some(format!("{}/task/{}", ns("NStgid:")?, ns("NSpid:")?).into()),
         _ => None,
     }
-}
-
-fn read_tgid(tid: u32) -> Result<u32> {
-    let status = fs::read_to_string(format!("/proc/{tid}/status"))?;
-    let line = status.lines().find_map(|l| l.strip_prefix("Tgid:")).context("no Tgid")?;
-    Ok(line.trim().parse()?)
 }
 
 /// NUL-terminated string at `addr` in `tid`'s memory.
@@ -1290,6 +1336,27 @@ mod tests {
         let (_, k) = observe(tid, libc::SYS_fchmodat, &[at, f.as_ptr() as u64, 0o600, 0, 0, 0]);
         assert!(!k.all && k.writes.contains(&name("f")));
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Frame records `[caller's fp, return address]` at a, a+16 and a+32 of a
+    /// heap buffer, the last pointing back down to a.
+    #[test]
+    fn unwind_follows_frame_records() {
+        // Allocated first: a heap grown after maps is read would leave it unmapped there.
+        let mut s = vec![0u64; 6];
+        let maps = Maps::parse(&fs::read_to_string("/proc/self/maps").unwrap());
+        let (f, g) = (unwind_follows_frame_records as fn() as u64, reads_own_cstr as fn() as u64);
+        let a = s.as_ptr() as u64;
+        let mut walk = |i: usize, v: u64| {
+            s.copy_from_slice(&[a + 16, f, a + 32, g, a, f]);
+            s[i] = v;
+            // sp = fp + 8: a Go stack.
+            unwind(std::process::id(), [1, a + 8, a], &maps)
+        };
+        assert_eq!(walk(0, a + 16), [1, f, g, f], "followed, stopped where fp descends");
+        assert_eq!(walk(2, a + 33), [1, f, g], "misaligned fp");
+        assert_eq!(walk(3, a), [1, f], "return address not executable");
+        assert_eq!(unwind(std::process::id(), [1, a, a], &maps), [1], "not a Go stack: its pc alone");
     }
 
     #[test]

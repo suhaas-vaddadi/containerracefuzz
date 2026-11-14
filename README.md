@@ -145,7 +145,7 @@ plan: 1 seeds, 5 windows in seed 0, ~6 runs, est. 0s (+ confirms)
 [1/1] seed 0 window 4: Violation, confirming
   confirmed: Violation
   minimize step 3: Violation {Changed { entry: "file" }, Changed { entry: "hard" }}
-  guilty: step 3 EventId { process: "0", nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
+  guilty: step 3 EventId { process: "0", callsite: 11313640851957032891, nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
 left /var/lib/crfuzz/canary-272182-6: changed
 [1/1] seed 0 window 4/5: Violation → confirmed, guilty step 3 (79 /tmp/q/alice/p) → finding #1 (new)  0.0s
 ...
@@ -202,8 +202,8 @@ ELF64 executable, no interpreter).
 sudo target/release/scx_crfuzz containerd --seeds 2
 ```
 
-A run takes about 1.5 s and a seed has about 50 windows, so two seeds take
-about 3 minutes (measured on a 6-CPU VM).
+A run takes about 2.5 s and a seed has about 50 windows, so two seeds take
+about 4 minutes (measured on a 6-CPU VM).
 
 ```
 scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID]
@@ -308,7 +308,7 @@ use `run DIR --seeds 1 --first-seed S -v`.
 | Flag | Meaning |
 |---|---|
 | `--attacker UID:GID` | The attacker identity ("alice"): no groups, no capabilities. Required, and never inferred. `4294967295` is refused. |
-| `--seeds N` | How many seeds to sweep (default: until `--time` or a stop). A seed is a POS seed: the same seed gives the same partial order of held events. A seed runs its baseline, then one run per **window**. There is one window per distinct `(syscall, path, occurrence)` hold of the baseline that has a path. |
+| `--seeds N` | How many seeds to sweep (default: until `--time` or a stop). A seed is a POS seed: the same seed gives the same partial order of the held events (the order of decisions whose keys conflict), within the limits under [Determinism](#how-it-works). A seed runs its baseline, then one run per **window**. There is one window per distinct `(callsite, syscall, path, occurrence)` hold of the baseline that has a path. |
 | `--time DURATION` | `90s`, `30m` or `2h` (a bare number is seconds). Once that much time has passed, no new run starts. The current run finishes, its seed is left incomplete, and the summary follows a `time limit: <S> seeds complete` line. Exit 0 or 3. |
 | `--first-seed S` | The first seed (default 0). |
 | `--resume` | Continue the campaign in `DIR`: one that was stopped, ran out of time, or needs more seeds. See [Resuming](#resuming). |
@@ -321,7 +321,10 @@ use `run DIR --seeds 1 --first-seed S -v`.
 | `-v` | Print every run's decision log (baseline, discovery, confirm, minimize). Without it, no decision log is printed, and a `replay` that fails says to rerun with `-v`. |
 
 `--mutator`, `--layout`, `--scope` and `--private` take paths that must
-exist. They are made absolute.
+exist. They are made absolute. In event names (the output, schedules) a path
+under the i-th of the `--scope`, then the `--private` directories prints as
+`<dir{i}>/...`, so two campaigns of one scenario in different directories
+name, and seed, their events alike. The mutator still gets the path as issued.
 
 How a seed runs:
 
@@ -409,7 +412,7 @@ At `--jobs` > 1:
 ### `replay`
 
 `replay FILE` reruns a schedule. Everything comes from the file: the
-command, attacker, mutator, layout, timeout, private directories and the
+command, attacker, mutator, layout, timeout, private and scope directories and the
 `CRFUZZ_*` environment of the `run` that wrote it, which `replay` sets
 again (so a `containerd` finding replays as is; its D must still be there). It does
 three things:
@@ -438,9 +441,10 @@ stale pins, which are harmless and are removed by the next load.
 
 Start `scx_crfuzz gated` to keep one scheduler up across processes. The
 on-target tests need it. Besides the scheduler it attaches BTF tracepoints
-(wakeups, fork, task free). Run crfuzz in the initial pid namespace: the
-scheduler keys by global tid and tgid, the seccomp notification by the
-namespace's pid.
+(wakeups, fork, task free) and a kprobe on `__secure_computing` (for
+callsites), so it fails to start on a kernel without kprobes. Run crfuzz in
+the initial pid namespace: the scheduler keys by global tid and tgid, the
+seccomp notification by the namespace's pid.
 
 If another `sched_ext` scheduler is enabled, crfuzz refuses to start and
 names that scheduler (from `/sys/kernel/sched_ext/root/ops`).
@@ -494,7 +498,7 @@ The SUT's stdin is `/dev/null`.
 The `status` column is `new`, `repeat`, `unconfirmed` or `invalid` for a
 Violation, and `-` otherwise. Findings are deduped by the guilty hold's
 `(syscall, path)` plus the normalized findings: a window fires in any
-process.
+process, and no callsite, so a finding outlives a SUT rebuild.
 
 The terminal shows:
 
@@ -504,7 +508,9 @@ The terminal shows:
   seed is `incomplete`.
 - a summary: seeds, runs, invalid runs, the seeds' verdicts, discovery time,
   distinct partial orders (runs whose canonical order of the decisions whose
-  keys conflict differs), the share of partial decisions, and each finding
+  keys conflict differs; occurrence numbers are left out, so two goroutines
+  of the same code changing places is one order), the share of partial
+  decisions, and each finding
 
 ### Schedule file
 
@@ -514,7 +520,7 @@ arguments, bytes outside printable ASCII, space and `%` are written as `%XX`.
 An empty string is a lone `%`.
 
 ```
-crfuzz-schedule 2
+crfuzz-schedule 3
 seed 0
 attacker 65534:65534
 mutator /tmp/q/swap.sh            optional
@@ -527,12 +533,13 @@ cmd /tmp/q/check_use /tmp/q/alice/p
 outcome Violation
 deadline                          only if discovery ended at the deadline
 finding Changed file              normalized; also Reached <entry> <at>, Copy <at>
-step 1 0 79 0 /tmp/q/alice/p      mutate process syscall-nr occurrence [path]
+step 1 0 9d022069a13f27bb 79 0 /tmp/q/alice/p
+                                  mutate process callsite syscall-nr occurrence [path]
 ```
 
 The lines from `attacker` to `cmd` are the run's configuration, the same
-lines as `DIR/config`. Version 1 schedules named events by thread and are
-refused.
+lines as `DIR/config`. Older versions named events without their callsite
+and are refused.
 
 ## How it works
 
@@ -562,15 +569,25 @@ refused.
    listener has been drained, and the count reads zero again (a complete
    frontier), or after a 200 ms limit (logged as *partial*).
 3. **POS** (`name.rs`, `pos.rs`). Each held event is named
-   `(process, syscall, path, occurrence)`. Processes are named by their
-   place in the process creation tree (`0/2/0`), which the scheduler records
-   at each fork, never by pid or thread. Occurrence counts per
-   (process, syscall, path). Paths have the canary directory normalized.
-   Each event gets a seeded priority, and the highest is released. Only the
-   events whose read/write key sets conflict with the released one are
-   redrawn.
+   `(process, callsite, syscall, path, occurrence)`. Processes are named by
+   their place in the process creation tree (`0/2/0`), which the scheduler
+   records at each fork, never by pid or thread. The callsite is a hash of
+   the issuing code's user stack, as (file, offset) pairs so ASLR doesn't
+   move it: a kprobe on `__secure_computing` saves the trapping task's pc,
+   sp and frame pointer, and the backend walks the frame-pointer chain
+   through `/proc/<tid>/mem` while the task is held. Only a Go stack is
+   walked: Go always keeps frame pointers, and its arm64 frame record sits
+   at sp-8, which is how it is recognized. Go needs the walk, because all
+   its syscalls leave from one instruction. Any other code is named by the
+   pc of its syscall instruction alone. Occurrence counts per
+   (process, callsite, syscall, path). Paths have the canary (and its name
+   wherever it shows, as in a rootfs's mirror of it), the `--scope` and
+   `--private` directories (`<dir0>`, ...) and random digit runs (`<n>`:
+   pids, temp-file suffixes) normalized. Each event gets a seeded priority,
+   and the highest is released. Only the events whose read/write key sets
+   conflict with the released one are redrawn.
 4. **Mutator** (`engine.rs`). At the first released hold that matches the
-   run's window (by syscall, path and occurrence, in any process), the tree is
+   run's window (by callsite, syscall, path and occurrence, in any process), the tree is
    gated and the mutator runs once, as alice, in the held task's view.
 5. **Oracle** (`oracle.rs`). Each run gets a fresh canary under
    `/var/lib/crfuzz/canary-<pid>-<n>` that alice cannot reach. At the root
@@ -578,12 +595,16 @@ refused.
    mount point. Afterwards the canary is compared with its starting state.
 6. **Replay and minimization** (`schedule.rs`). Discovery's decisions become
    a schedule. Replay releases the recorded event at each step instead of
-   POS's pick. A missing or extra event is a **divergence**. A Violation is
-   *confirmed* when the replay gives the same outcome class and the same
-   normalized findings (with the canary directory, pids and fd numbers
-   stripped). Minimization replays once per mutated step, with only that
-   mutation on, and reports the **first** step whose run still flags one of
-   the findings: the guilty hold.
+   POS's pick. An event differing from the step only in occurrence (another
+   goroutine of the same code) stands in for it, under the step's name and
+   mutator seed. A step not yet held when every other thread is waits up to
+   1 s for its thread (asleep in a syscall we don't watch). A missing or
+   extra held event is a **divergence**. A Violation is *confirmed* when the
+   replay gives the same outcome class and the same normalized findings
+   (with the canary directory, pids and fd numbers stripped). Minimization
+   replays once per mutated step, with only that mutation on, and reports
+   the **first** step whose run still flags one of the findings: the guilty
+   hold.
 7. **Campaign** (`campaign.rs`, `run.rs`). Seeds `S..S+N` run, each with its baseline and
    windows, `--jobs` of them at once. A Violation whose findings and guilty
    `(syscall, path)` match a known finding is counted against it
@@ -591,7 +612,7 @@ refused.
 
 **Determinism.** An event's name never depends on which OS thread made it
 (Go's M:N runtime moves goroutines between threads, and creates threads as
-timing dictates), only on its process, syscall and path. The same seed
+timing dictates), only on what code made it on what path. The same seed
 gives the same partial order of the held events under two conditions:
 
 - The code between held syscalls is deterministic.
@@ -607,10 +628,12 @@ leaves out: `partial` ones (taken at the 200 ms limit) and those taken `over
 a timed sleep` (some thread of the tree was in a `nanosleep`, or in a
 `ppoll`, `epoll_pwait` or futex wait with a timeout).
 
-Two threads (or goroutines) of one process making the same syscall on one
-path share a counter, so which is occurrence 0 depends on arrival. A
-process forking from two threads at once numbers its children in arrival
-order.
+Two goroutines running the same code (one callsite) on one path in one
+process share a counter, so which is occurrence 0 depends on arrival; a
+replay lets either stand in for the other. A process forking from two
+threads at once numbers its children in arrival order. POS priorities hash
+the event name (`pos.rs`), so a seed gives a different order than under
+versions before callsites, and their schedules are refused.
 
 ### Why a scheduler and not the cgroup freezer
 
@@ -649,7 +672,7 @@ scx_crfuzz/                the scx_crfuzz crate
   src/gate.rs              loads the gate scheduler; GateMap, a run's client for it
   src/backend.rs           seccomp-notify hold, tree gate, mutator and probe
   src/sensor.rs            the frontier: the scheduler's count, read around a drain
-  src/name.rs              event identity: path normalization
+  src/name.rs              event identity: path normalization, callsite
   src/pos.rs               conflict keys, POS
   src/engine.rs            the discovery / replay loop
   src/oracle.rs            canary, attacker identity, outcome class
@@ -696,10 +719,10 @@ cli, campaign and gate.
 - The frontier sees runnable tasks, not sleeping ones: a thread asleep on a
   timer or on outside I/O can issue an event after a decision that did not
   wait for it (see Determinism; the telemetry counts such decisions).
-- The gate reaches only tasks in `SCHED_EXT`: a task of the tree that leaves
-  that class (`sched_setscheduler`) is no longer stopped or counted. The
-  scheduler tracks 65536 processes over all runs; past that, a run ends
-  invalid.
+- The gate reaches only tasks in `SCHED_EXT`. If a task of the tree leaves
+  that class (`sched_setscheduler`), the run ends invalid when it next
+  traps. The scheduler tracks 65536 processes over all runs; past that, a
+  run ends invalid too.
 - A process more than 16 generations below the root has no stable name
   (`?<tgid>`).
 - For `run`, the mutator is yours: no default primitives ship with `run`.
@@ -714,8 +737,24 @@ cli, campaign and gate.
   `containerd`, a different `--image` is not detected.
 - `--jobs` isolates only the filesystem. The windows within one seed still
   run one after another.
-- After upgrading crfuzz, restart `gated`: an older one lacks the pins this
-  one opens, and runs fail while it holds `sched_ext`.
+- A replay can hand a decision to the other of two goroutines (or threads)
+  that make the same syscall on the same path from the same code in one
+  process. Telling them apart needs the goroutine's creation site
+  (`g.gopc`); not implemented.
+- Only Go stacks are walked for a callsite. C and Rust code is named by the
+  pc of its syscall instruction alone (`-v` prints `frames: 1` for it): its
+  frame-pointer register can hold anything, and a walk through it named the
+  same event differently from run to run (Rust code in runc: 1 event in 155,
+  in 12% of runs). So two threads of one such process that issue the same
+  syscall from the same instruction on the same path are told apart only by
+  arrival, as occurrences. Return addresses are read as 48-bit user
+  addresses.
+- Rebuilding the SUT moves its callsites: saved schedules and seeds no
+  longer line up. After upgrading crfuzz, restart `gated`: an older one
+  lacks the pins this one opens, and runs fail while it holds `sched_ext`.
+- Every all-digit path component is named `<n>` (it may be a pid), so
+  `/dev/pts/0` and `/dev/pts/1` share one name and differ only by
+  occurrence.
 
 ## License
 

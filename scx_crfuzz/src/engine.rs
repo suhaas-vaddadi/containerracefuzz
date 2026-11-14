@@ -11,7 +11,7 @@ use crate::schedule::{self, Divergence, Fixed, Step};
 use crate::sensor::{wait_frontier, Frontier};
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -24,6 +24,11 @@ const MUTATOR_TIMEOUT: Duration = Duration::from_secs(15);
 /// spinning thread or a fast ticker would otherwise stall the run.
 const LIMIT: Duration = Duration::from_millis(200);
 
+/// How long a replay waits for its next step past a complete frontier: the
+/// event's thread may still be asleep in a syscall we don't watch (a
+/// `sleep`, an I/O wait) when every other thread is held.
+const LATE: Duration = Duration::from_secs(1);
+
 /// One POS decision, as the canonical log records it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Decision {
@@ -31,6 +36,9 @@ pub struct Decision {
     /// The event's conflict keys, for its partial order. Inode
     /// numbers: this run only.
     pub keys: Keys,
+    /// Stack frames behind the callsite: 1 for code that is not Go, named
+    /// by its pc alone (`backend::unwind`).
+    pub frames: u32,
     /// Decided at the limit over an incomplete frontier. The determinism
     /// claim covers complete decisions only, and of those the ones no thread
     /// slept through on a timer or on I/O from outside the tree: such a
@@ -48,7 +56,7 @@ pub struct Decision {
 impl std::fmt::Debug for Decision {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut d = f.debug_struct("Decision");
-        d.field("id", &self.id).field("partial", &self.partial);
+        d.field("id", &self.id).field("frames", &self.frames).field("partial", &self.partial);
         d.field("sleepers", &self.sleepers).field("mutation", &self.mutation).finish()
     }
 }
@@ -141,14 +149,18 @@ pub fn stop_on_signals() {
 }
 
 /// Run the SUT under POS until it exits, appending each decision to `log`
-/// (caller-owned, so it survives every ending). With a `mutator`, fire it at
-/// the first hold matching `target`'s syscall, path and occurrence, in any
-/// thread; a replay fires where its schedule says instead. With a `judge`,
-/// the mutator runs as alice, self-checked against the canary, and the root
-/// process's `exit_group` is probed.
+/// (caller-owned, so it survives every ending). Events are named with the
+/// canary and `dirs` taken out of their paths (`name::event_path`). With a
+/// `mutator`, fire it at the first hold matching `target`'s callsite,
+/// syscall, path and occurrence, in any thread; a replay fires where its
+/// schedule says instead. With a `judge`, the mutator runs as alice,
+/// self-checked against the canary, and the root process's `exit_group` is
+/// probed.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     be: &mut GateBackend,
     pos: &mut Pos,
+    dirs: &[PathBuf],
     mutator: Option<&Path>,
     target: Option<&EventId>,
     mut replay: Option<&mut Replay>,
@@ -160,7 +172,9 @@ pub fn run(
     let mut footprint = BTreeSet::new();
     let mut held: Vec<Event> = Vec::new();
     let mut ids: Vec<EventId> = Vec::new();
-    // The last frontier was left as it was (nothing to pick).
+    // Replaying: since the next step was first missing (wall clock, not reset by other releases).
+    let mut late: Option<Instant> = None;
+    // The last frontier was left as it was (nothing to pick, or a late step).
     let mut idle = false;
     loop {
         // Never under a tree hold: each iteration ungates before the next.
@@ -183,8 +197,8 @@ pub fn run(
         // Name events once, as they arrive: occurrence counts history.
         let canary = judge.as_deref().map(|j| j.canary.dir.as_path());
         ids.extend(held[ids.len()..].iter().map(|e| {
-            let path = e.path.as_deref().map(|p| name::event_path(p, canary));
-            pos.id(&e.process, e.nr, path)
+            let path = e.path.as_deref().map(|p| name::event_path(p, canary, dirs));
+            pos.id(&e.process, e.callsite, e.nr, path)
         }));
         // A gated thread already blocked is not busy, so the tree can read
         // quiet when it isn't.
@@ -192,18 +206,21 @@ pub fn run(
             bail!("POS decision under a tree hold");
         }
         let ready: Vec<_> = ids.iter().zip(&held).map(|(id, e)| (id, &e.keys)).collect();
-        // Replaying, the recorded step, and only its mutation (Some).
-        let (mut pick, mut fire) = (None, None);
+        // Replaying, the recorded step, and only its mutation (Some), under
+        // the step's name (a symmetric stand-in takes it, and its seed).
+        let (mut pick, mut fire, mut named) = (None, None, None);
         if let Some(r) = replay.as_deref_mut() {
             if r.diverged.is_none() {
                 match r.fixed.pick(&ready) {
                     Ok(p) => {
-                        fire = p.map(|_| {
-                            let s = r.fixed.next - 1;
-                            r.fixed.steps[s].mutate && r.only.map_or(true, |k| k == s)
-                        });
-                        pick = Some(p);
+                        if let Some((_, s)) = p {
+                            fire = Some(r.fixed.steps[s].mutate && r.only.map_or(true, |k| k == s));
+                            named = Some(r.fixed.steps[s].id.clone());
+                            late = None;
+                        }
+                        pick = Some(p.map(|p| p.0));
                     }
+                    Err(d) if d.expected.is_some() && late.get_or_insert_with(Instant::now).elapsed() < LATE => continue,
                     Err(d) => {
                         if let Some(d) = r.left(d) {
                             return Ok(End::Diverged(d));
@@ -219,15 +236,16 @@ pub fn run(
         // Nothing held: every thread blocked or running free.
         let Some(i) = pick else { continue };
         let (ev, id) = (held.remove(i), ids.remove(i));
+        let id = named.unwrap_or(id);
         let seed = pos.event_seed(&id);
-        // The target in any process: windows are one per (syscall, path,
-        // occurrence). The first such hold fires, once.
+        // The target in any process: windows are one per (callsite, syscall,
+        // path, occurrence). The first such hold fires, once.
         let hit = !ev.keys.all
-            && target.is_some_and(|t| (t.nr, &t.path, t.n) == (id.nr, &id.path, id.n) && !log.iter().any(|d| d.mutation.is_some()));
+            && target.is_some_and(|t| (t.callsite, t.nr, &t.path, t.n) == (id.callsite, id.nr, &id.path, id.n) && !log.iter().any(|d| d.mutation.is_some()));
         let sleepers = if mutator.is_none() { be.sleepers(&held) } else { 0 };
         // Logged at once: every ending from here (deadline, invalid run,
         // error) keeps it.
-        log.push(Decision { id, keys: ev.keys.clone(), partial: !complete, sleepers, mutation: None });
+        log.push(Decision { id, keys: ev.keys.clone(), frames: ev.frames, partial: !complete, sleepers, mutation: None });
         if let Some(p) = &ev.path {
             // Dirfd-relative: the fd number means nothing at the final hold.
             if p.is_absolute() || ev.dirfd.is_none() {

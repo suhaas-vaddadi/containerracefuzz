@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 fn once(cmd: Command, m: Option<&Path>, target: Option<&EventId>, judge: Option<&mut Judge>) -> (End, Vec<Decision>) {
     let mut be = GateBackend::spawn(cmd).unwrap();
     let mut log = Vec::new();
-    let end = run(&mut be, &mut Pos::new(1), m, target, None, judge, Instant::now() + Duration::from_secs(30), &mut log).unwrap();
+    let end = run(&mut be, &mut Pos::new(1), &[], m, target, None, judge, Instant::now() + Duration::from_secs(30), &mut log).unwrap();
     (end, log)
 }
 
