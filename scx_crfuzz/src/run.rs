@@ -80,6 +80,7 @@ pub struct Runner {
     seq: u64,
     /// Canary numbers, one per run: a kept canary is never reused.
     runs: AtomicU32,
+    dirs: Vec<PathBuf>,
     /// The `--private` copies, `work/<worker>/<i>`; removed on drop.
     work: PathBuf,
     /// Ours for this process's life unless crfuzz's already runs.
@@ -157,7 +158,7 @@ impl Runner {
         // A crfuzz killed with our pid left these (sweep keeps a live pid's): never ours yet.
         let _ = std::fs::remove_dir_all(&work);
         let until = time.map(|t| Instant::now() + t);
-        Ok(Runner { cfg, alice, verbose, until, fatal: AtomicBool::new(false), lost: AtomicBool::new(false), seq, runs: AtomicU32::new(0), work, _sched: sched })
+        Ok(Runner { dirs: cfg.dirs(), cfg, alice, verbose, until, fatal: AtomicBool::new(false), lost: AtomicBool::new(false), seq, runs: AtomicU32::new(0), work, _sched: sched })
     }
 
     /// Worker `w` (a thread) gets its own copy of every `--private` directory.
@@ -230,7 +231,7 @@ impl Runner {
         let mut be = GateBackend::spawn(sut)?;
         let mut j = Judge { canary: &canary, alice: self.alice.clone(), reached: None, task: None };
         let until = Instant::now().checked_add(Duration::from_secs(self.cfg.timeout)).context("--timeout too large")?;
-        let end = engine::run(&mut be, &mut Pos::new(seed), mutator, target, replay, Some(&mut j), until, log);
+        let end = engine::run(&mut be, &mut Pos::new(seed), &self.dirs, mutator, target, replay, Some(&mut j), until, log);
         if self.verbose {
             // One block per run, whatever other workers print.
             let mut so = std::io::stdout().lock();
@@ -278,7 +279,7 @@ impl Runner {
 
     /// A seed's baseline, which must leak nothing. Its targets are its holds
     /// with a known path, decoded keys and a named process, with `--scope`
-    /// only those under a scope directory, one per (syscall, path,
+    /// only those under a scope directory, one per (callsite, syscall, path,
     /// occurrence): the engine matches those in any process. None: stopped.
     pub fn baseline(&self, seed: u64, out: Option<&Path>, log: &mut Vec<Decision>) -> Result<Option<Baseline>> {
         log.clear();
@@ -288,13 +289,13 @@ impl Runner {
             b.canary.keep(); // the evidence
             bail!("invalid: the scenario leaks with no mutation: {:?}", b.found);
         }
-        let scope = &self.cfg.scope;
-        let in_scope = |p: &Path| scope.is_empty() || scope.iter().any(|d| p.starts_with(d));
+        // The scope dirs as events name them (`name::event_path`): `<dir{i}>`.
+        let in_scope = |p: &Path| self.cfg.scope.is_empty() || (0..self.cfg.scope.len()).any(|i| p.starts_with(format!("<dir{i}>")));
         let mut seen = HashSet::new();
         let targets = log
             .iter()
             .filter(|d| d.id.path.as_deref().is_some_and(in_scope) && !d.keys.all && !d.id.process.starts_with('?'))
-            .filter(|d| seen.insert((d.id.nr, d.id.path.clone(), d.id.n)))
+            .filter(|d| seen.insert((d.id.callsite, d.id.nr, d.id.path.clone(), d.id.n)))
             .map(|d| d.id.clone())
             .collect();
         Ok(Some(Baseline { end: b.end, targets, secs: t.elapsed().as_secs_f64() }))

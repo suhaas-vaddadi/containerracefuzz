@@ -22,7 +22,7 @@ fn once(seed: u64, a: &Path, b: &Path) -> Vec<Decision> {
     let mut be = GateBackend::spawn(cmd).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut log = Vec::new();
-    run(&mut be, &mut Pos::new(seed), None, None, None, None, deadline, &mut log).unwrap();
+    run(&mut be, &mut Pos::new(seed), &[], None, None, None, None, deadline, &mut log).unwrap();
     assert!(be.child().wait().unwrap().success());
     log
 }

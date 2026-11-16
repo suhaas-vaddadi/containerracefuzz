@@ -43,8 +43,8 @@ impl Keys {
 
 pub struct Pos {
     seed: u64,
-    /// Prior hits per `(process, nr, path)` this run.
-    seen: HashMap<(String, i64, Option<PathBuf>), u32>,
+    /// Prior hits per `(process, callsite, nr, path)` this run.
+    seen: HashMap<(String, u64, i64, Option<PathBuf>), u32>,
     /// Times each ready event's priority was redrawn.
     redraws: HashMap<EventId, u32>,
 }
@@ -55,10 +55,10 @@ impl Pos {
     }
 
     /// Name a newly held event: call once per held syscall, as it arrives.
-    pub fn id(&mut self, process: &str, nr: i64, path: Option<PathBuf>) -> EventId {
-        let n = self.seen.entry((process.into(), nr, path.clone())).or_default();
+    pub fn id(&mut self, process: &str, callsite: u64, nr: i64, path: Option<PathBuf>) -> EventId {
+        let n = self.seen.entry((process.into(), callsite, nr, path.clone())).or_default();
         *n += 1;
-        EventId { process: process.into(), nr, path, n: *n - 1 }
+        EventId { process: process.into(), callsite, nr, path, n: *n - 1 }
     }
 
     /// Priority from the seed and the event alone, never its ready-set position
@@ -78,6 +78,7 @@ impl Pos {
         // Length-prefixed so (process, path) splits can't collide.
         h.write(&(id.process.len() as u64).to_le_bytes());
         h.write(id.process.as_bytes());
+        h.write(&id.callsite.to_le_bytes());
         h.write(&id.nr.to_le_bytes());
         match &id.path {
             Some(p) => {
@@ -148,7 +149,7 @@ mod tests {
             arrival(k, &mut newly);
             for t in newly {
                 let (nr, p, _) = &threads[t][next[t]];
-                held.push((t, pos.id(&t.to_string(), *nr, Some(p.into()))));
+                held.push((t, pos.id(&t.to_string(), 0, *nr, Some(p.into()))));
             }
             let ready: Vec<_> = held.iter().map(|(t, id)| (id, &threads[*t][next[*t]].2)).collect();
             let Some(i) = pick(pos, &ready)? else { break };
@@ -267,7 +268,7 @@ mod tests {
         assert!(unknown.conflicts(&c) && c.conflicts(&unknown));
 
         let mut pos = Pos::new(7);
-        let ids: Vec<EventId> = ["/a", "/b", "/c"].iter().map(|p| pos.id("0", OPEN, Some(p.into()))).collect();
+        let ids: Vec<EventId> = ["/a", "/b", "/c"].iter().map(|p| pos.id("0", 0, OPEN, Some(p.into()))).collect();
         let before: Vec<u64> = ids.iter().map(|id| pos.prio(id)).collect();
         // Give the rebind to whichever event wins; one other walks what it renames.
         let top = (0..3).max_by_key(|&i| before[i]).unwrap();
@@ -282,14 +283,15 @@ mod tests {
     }
 
     #[test]
-    fn occurrence_counts_per_process_syscall_and_path() {
+    fn occurrence_counts_per_process_callsite_syscall_and_path() {
         let mut pos = Pos::new(0);
         let p = || Some(PathBuf::from("/f"));
-        assert_eq!(pos.id("0", OPEN, p()).n, 0);
-        assert_eq!(pos.id("0", OPEN, p()).n, 1);
-        assert_eq!(pos.id("0/0", OPEN, p()).n, 0, "per process");
-        assert_eq!(pos.id("0", RENAME, p()).n, 0);
-        assert_eq!(pos.id("0", OPEN, None).n, 0);
+        assert_eq!(pos.id("0", 0, OPEN, p()).n, 0);
+        assert_eq!(pos.id("0", 0, OPEN, p()).n, 1);
+        assert_eq!(pos.id("0/0", 0, OPEN, p()).n, 0, "per process");
+        assert_eq!(pos.id("0", 1, OPEN, p()).n, 0, "per callsite");
+        assert_eq!(pos.id("0", 0, RENAME, p()).n, 0);
+        assert_eq!(pos.id("0", 0, OPEN, None).n, 0);
     }
 
     /// The fixed-schedule pick releases the recorded order whatever
@@ -310,13 +312,15 @@ mod tests {
             let replay = |steps: &[Step]| {
                 let mut f = Fixed { steps, next: 0, deadline: false };
                 // Another seed: only the naming comes from POS.
-                let r = run_with(&mut Pos::new(seed + 100), &ts, shuffle, |_, r| f.pick(r));
+                let r = run_with(&mut Pos::new(seed + 100), &ts, shuffle, |_, r| f.pick(r).map(|p| p.map(|p| p.0)));
                 r.and_then(|got| f.finish().map(|()| got))
             };
             assert_eq!(replay(&steps).unwrap(), log, "seed {seed}");
-            // A step the run never offers: the frontier is complete without it.
+            // A step the run never offers (a callsite it never reaches; an
+            // occurrence alone would match symmetrically): the frontier is
+            // complete without it.
             let mut wrong = steps.clone();
-            wrong[3].id.n = 9;
+            wrong[3].id.callsite = 9;
             let d = replay(&wrong).unwrap_err();
             assert_eq!((d.step, d.expected.as_ref()), (3, Some(&wrong[3].id)));
             assert!(!d.held.is_empty() && !d.held.contains(&wrong[3].id));

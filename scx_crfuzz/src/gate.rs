@@ -27,7 +27,7 @@ use std::time::Duration;
 pub const PIN_DIR: &str = "/sys/fs/bpf/scx_crfuzz";
 pub const LOCK_PATH: &str = "/run/scx_crfuzz_gate.lock";
 /// Maps, then the `SEC("syscall")` programs.
-pub const PINS: [&str; 5] = ["runs", "procs", "new_run", "join", "set_gate"];
+pub const PINS: [&str; 6] = ["runs", "procs", "sys_regs", "new_run", "join", "set_gate"];
 /// The enabled scheduler's name; ours is `crfuzz_gate_<version>_...`.
 const OPS: &str = "/sys/kernel/sched_ext/root/ops";
 
@@ -62,7 +62,7 @@ pub fn serve(stop: &dyn Fn() -> bool, ready: impl FnOnce(u64)) -> Result<()> {
     let mut skel = scx_ops_load!(skel, crfuzz_gate_ops, uei)?;
     // Not pinned: the links die with this process, so the kernel detaches
     // the scheduler and a new one can attach. Attaches the tree's
-    // tracepoints too (by their SEC names).
+    // tracepoints and the callsite kprobe too (by their SEC names).
     let _link = scx_ops_attach!(skel, crfuzz_gate_ops)?;
 
     // Dropped before the link: unpin, then detach.
@@ -76,6 +76,7 @@ pub fn serve(stop: &dyn Fn() -> bool, ready: impl FnOnce(u64)) -> Result<()> {
     fs::create_dir_all(PIN_DIR)?;
     skel.maps.runs.pin(pin_path("runs"))?;
     skel.maps.procs.pin(pin_path("procs"))?;
+    skel.maps.sys_regs.pin(pin_path("sys_regs"))?;
     skel.progs.new_run.pin(pin_path("new_run"))?;
     skel.progs.join.pin(pin_path("join"))?;
     skel.progs.set_gate.pin(pin_path("set_gate"))?;
@@ -234,6 +235,7 @@ fn kill(procs: &MapHandle, run: u32) -> bool {
 pub struct GateMap {
     runs: MapHandle,
     procs: MapHandle,
+    sys_regs: MapHandle,
     join: OwnedFd,
     set_gate: OwnedFd,
     enable_seq: u64,
@@ -253,6 +255,7 @@ impl GateMap {
         let gm = Self {
             runs: open_map("runs")?,
             procs: open_map("procs")?,
+            sys_regs: open_map("sys_regs")?,
             join: open_prog("join")?,
             set_gate: open_prog("set_gate")?,
             enable_seq,
@@ -285,11 +288,11 @@ impl GateMap {
     /// No task of the tree can run: none is runnable, none is being woken.
     /// Exact as of the read; a thread asleep on a timer or on I/O from
     /// outside the tree still wakes on its own later. Fails if part of the
-    /// tree is out of the gate's reach (the process table is full).
+    /// tree is out of the gate's reach, which no later read can see.
     pub fn quiet(&self) -> Result<bool> {
         self.check()?;
         let r = words(&self.runs.lookup(&self.run.to_ne_bytes(), MapFlags::ANY)?.context("the run is gone from the gate")?);
-        ensure!(r[2] == 0, "the gate's process table is full: the gate can no longer stop the tree");
+        ensure!(r[2] == 0, "a task of the SUT tree left SCHED_EXT, or the gate's process table is full: the gate can no longer stop the tree");
         Ok(r[4] == 0 && r[5] == 0)
     }
 
@@ -300,6 +303,15 @@ impl GateMap {
         self.check()?;
         ensure!(test_run(self.set_gate.as_raw_fd(), [self.run, on as u32])? == 0, "the run is gone from the gate");
         Ok(())
+    }
+
+    /// `tid`'s user `[pc, sp, fp]` at its latest syscall (read while it is
+    /// held there, that syscall's) and its tgid. None: it trapped outside
+    /// SCHED_EXT or outside every tree; `quiet` then fails.
+    pub fn sys_regs(&self, tid: u32) -> Option<([u64; 3], u32)> {
+        let v = self.sys_regs.lookup(&tid.to_ne_bytes(), MapFlags::ANY).ok().flatten()?;
+        let w = |i: usize| Some(u64::from_ne_bytes(v.get(i * 8..i * 8 + 8)?.try_into().ok()?));
+        Some(([w(0)?, w(1)?, w(2)?], w(3)? as u32))
     }
 
     /// `tgid`'s place in this run's process creation tree (stable across
