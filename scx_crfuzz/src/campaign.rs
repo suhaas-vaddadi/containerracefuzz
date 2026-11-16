@@ -242,12 +242,18 @@ impl<'a> Sweep<'a> {
             verdicts: BTreeMap::new(),
             planned: false,
         };
-        for v in complete.values() {
+        // Every complete seed stays on disk, but only this range's count
+        // (`--first-seed` may move on a resume).
+        let range = c.first..c.seeds.map_or(u64::MAX, |n| c.first + n);
+        for v in complete.range(range.clone()).map(|e| e.1) {
             *tally.verdicts.entry(*v).or_default() += 1;
         }
         for row in &rows {
             let bad = || format!("{}: bad row {row:?}", dir.join("runs.tsv").display());
-            tally.count(&row.parse().with_context(bad)?).with_context(bad)?;
+            let row: Row = row.parse().with_context(bad)?;
+            if range.contains(&row.seed) {
+                tally.count(&row).with_context(bad)?;
+            }
         }
         // The findings so far, their seed:k lines of complete seeds only: a
         // repeat counts against them.
@@ -269,6 +275,7 @@ impl<'a> Sweep<'a> {
             fs::write(f.join("seeds"), seeds.iter().map(|s| format!("{s}\n")).collect::<String>())?;
             found.push((Dedup { guilty, findings: s.findings }, seeds));
         }
+        complete.retain(|s, _| range.contains(s));
         // No worker (or private copy) without a seed.
         let jobs = c.seeds.map_or(c.jobs, |n| n.min(c.jobs as u64) as usize);
         let tty = !c.verbose && std::io::stderr().is_terminal();
