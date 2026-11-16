@@ -1,0 +1,41 @@
+% The blank page environment allows you to insert
+% pages into your thesis for specific things
+
+\begin{blankpage}
+    \chapterTitle{A blank page}
+    \addChapterToTOC{A blank page}
+    
+    \todo{Note that you can use the \textbackslash \kbd{todo} command to add notes like these.}
+    
+	Here is an optional page environment you could use for things like:
+	\begin{itemize}
+		\item Your own custom preamble chapters (use \texttt{\textbackslash chapterTitle} for titles!). If you want to add these to your table of contents, use the \texttt{\textbackslash addChapterToTOC\{text\} } command and enable manual TOC entries in \texttt{preamble/thesis-details.tex} with \texttt{\textbackslash enableManualTOCEntries}.
+		\item \emph{``This work is dedicated to...''}
+		\item A copyright notice
+		\item A declaration of authorship
+		\item Additional notes
+		\item Quotes
+		\item List of publications
+		\item An actual blank page
+	\end{itemize}
+	You can pass an optional parameter to this environment with the value \texttt{c} to centre this text vertically on the page.
+\end{blankpage}
+
+
+% Here is a sample statement of originality you can use and tweak
+% -----
+
+\begin{blankpage}[h]
+	\section*{Statement of Originality}
+	The work presented in this thesis/dissertation is entirely from the studies of the individual student, except where otherwise stated. Where	derivations are presented and the origin of the work is either wholly or in part from other sources, then full reference is given to the original author. This work has not been presented previously for any degree, nor is it at present under consideration by any other degree awarding body.
+	
+	\section*{Statement of Availability}
+	I hereby acknowledge the availability of any part of this thesis/dissertation for viewing, photocopying or incorporation into future studies, providing	that full reference is given to the origins of any information contained herein. I further give permission for a copy of this work to be deposited to any repository authorised for use by {\getUniversity}. I acknowledge that {\getUniversity} may make the title and a summary of this thesis/dissertation freely available.
+	
+	\rule{\textwidth}{0.5pt}
+	
+	\textbf{Signed:} {\getAuthor} \vspace{5mm}
+	
+	\includegraphics[height=0.4in]{figures/signature.png}
+	
+\end{blankpage}

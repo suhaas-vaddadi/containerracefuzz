@@ -673,7 +673,8 @@ runs the mutator and the probes under a deadline, and treats `sched_ext`'s
 
 ```
 LICENSE                    GPL-2.0
-.github/workflows/test.yml the pure tests, on every push
+.github/workflows/test.yml the pure tests, on every push outside thesis/
+.github/workflows/thesis.yml builds thesis/ into a PDF, only when thesis/ changes
 scx_crfuzz/                the scx_crfuzz crate
   build.rs                 builds the BPF skeleton and the static containerd mutator
   src/bpf/main.bpf.c       the gate scheduler: gates, counts, tracks and names a run's tree
@@ -694,6 +695,7 @@ scx_crfuzz/                the scx_crfuzz crate
   targets/containerd/      its sut.sh, layout.sh and mutator_all.c
   scripts/vm_containerd.sh build in the Lima VM and run the containerd target
   tests/                   on-target tests and C/Go fixtures
+thesis/                    the senior thesis (LaTeX); main.tex is the root
 ```
 
 ## Testing
@@ -767,6 +769,13 @@ cli, campaign and gate.
 - Every all-digit path component is named `<n>` (it may be a pid), so
   `/dev/pts/0` and `/dev/pts/1` share one name and differ only by
   occurrence.
+
+## Thesis
+
+The senior thesis on this work is in [`thesis/`](thesis/). GitHub Actions
+builds it on every push to `main` that changes `thesis/`. The latest PDF is at
+[releases/download/thesis-pdf/main.pdf](https://github.com/suhaas-vaddadi/containerracefuzz/releases/download/thesis-pdf/main.pdf).
+To build it locally, run `latexmk -pdf main.tex` in `thesis/`.
 
 ## License
 

@@ -1,0 +1,18 @@
+% Write your abstract here.
+
+
+    Time-of-check time-of-use bugs or TOCTOU bugs are correctness errors in a program 
+in which a mutator intentionally or not exploits a gap between when a program checks the validity of a resource and when it starts using 
+said resource. These bugs often take the shape of checks in which the state of data is verified, then used assuming 
+the verified state. A well timed or lucky mutator is able to exploit gaps caused by non-atomic operations or scheduling and change the state of the data,
+causing the program to act in an unintended and potentially malicious way. 
+
+This paper will explore crfuzz, a systematic concurrency fuzzer that uses Linux primitives and frameworks to find file system object TOCTOU bugs with higher probability than random concurrency fuzzing. Concurrency fuzzing is a method that combines traditional fuzzing techniques in which programs are 
+run with a variety of inputs and concurrency techniques to control interleavings of threads and operating system schedules.
+
+Crfuzz performs these checks by running the program alongside a mutator across a large campaign of seeds. Each of the seeds represents a possible scheduler interleaving.
+A 'mutator window' is defined as a period in which none of the threads of the victim program are running. This is achieved by installing a gate for the system calls that could touch 
+shared file system objects. Once all threads in a process have been stopped, a partial ordered scheduler decides thread  $t_i$ to continue execution based on a priority system 
+explored further later. Once $t_i$ either hits another gated system call or exits, the priority system again picks the thread with the highest priority to continue execution.
+For each seed, the mutator runs at every window on a different run. If a program, while running on seed $s$ has $n$ mutator windows, the engine runs the program on seed $s$ at least $n$ times to have the mutator execute on every window. At the end, crfuzz claims that, against a certain mutator $m$, the victim program is safe on every possible execution with partial order $p_i$, where $s$ corresponds to a $p_i$. Initial focus of crfuzz is on container runtimes to refine a small subset of file system operation heavy applications, however 
+the mechanism is universal to be able to explore any user-space program.
