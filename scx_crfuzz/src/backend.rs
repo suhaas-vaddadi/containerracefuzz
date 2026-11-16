@@ -1065,6 +1065,22 @@ fn walk(tid: u32, dirfd: Option<i32>, path: &Path, reads: &mut BTreeSet<Key>) ->
         Some(fd) if fd != libc::AT_FDCWD => format!("/proc/{tid}/fd/{fd}"),
         _ => format!("/proc/{tid}/cwd"),
     });
+    // A walk from a cwd or dirfd is below each directory above it, up to
+    // tid's root: a `--scope` directory there must match. (Over-conflicts
+    // with a rebind of one: safe.)
+    if !path.is_absolute() {
+        let id = |p: &Path| fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+        let root = id(Path::new(&format!("/proc/{tid}/root")));
+        let (mut up, mut last) = (at.clone(), None);
+        while let Some(d) = id(&up).filter(|&d| Some(d) != last) {
+            reads.insert(Key::Ino(d.0, d.1));
+            if Some(d) == root {
+                break;
+            }
+            last = Some(d);
+            up.push("..");
+        }
+    }
     let mut links = 0;
     let tail = walk_at(tid, at, path, reads, &mut links)?.1;
     reads.extend(tail.iter().cloned());

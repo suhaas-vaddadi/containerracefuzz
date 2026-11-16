@@ -128,3 +128,21 @@ fn scoped_replay_waits_for_late_steps() {
     assert!(matches!(end, End::Diverged(_)), "unscoped, everything else is held and diverges: {end:?}");
     fs::remove_dir_all(d).unwrap();
 }
+
+/// A relative path from a cwd below a scope directory is in scope.
+#[test]
+#[ignore]
+fn scope_holds_relative_paths_below_it() {
+    let d = Path::new(S);
+    let _ = fs::remove_dir_all(d);
+    fs::create_dir_all(d.join("in/sub")).unwrap();
+    fs::write(d.join("in/sub/f"), "").unwrap();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "cd $0/in/sub && cat f", S]);
+    let mut be = GateBackend::spawn(cmd, &[d.join("in")]).unwrap();
+    let mut log = Vec::new();
+    let end = run(&mut be, &mut Pos::new(0), &[], None, None, None, None, Instant::now() + Duration::from_secs(10), &mut log).unwrap();
+    assert!(matches!(end, End::Exited), "{end:?}");
+    assert!(log.iter().any(|e| e.id.path.as_deref() == Some(Path::new("f"))), "cat's open of f is held");
+    fs::remove_dir_all(d).unwrap();
+}
