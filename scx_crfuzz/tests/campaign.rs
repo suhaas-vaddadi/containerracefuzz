@@ -249,7 +249,7 @@ fn campaign_resume() {
     assert!(c.join("runs/1").exists(), "nothing of seed 1 to drop");
 
     // 1: other arguments, or a non-empty DIR without --resume.
-    campaign(&c, &["--resume", "--seeds", "3", "--timeout", "30"], &cmd, &m, &layout, 1);
+    campaign(&c, &["--resume", "--seeds", "3", "--timeout", "29"], &cmd, &m, &layout, 1);
     campaign(&c, &["--seeds", "3"], &cmd, &m, &layout, 1);
     let got = campaign(&c, &["--resume", "--seeds", "3"], &cmd, &m, &layout, 3);
 

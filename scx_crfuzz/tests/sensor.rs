@@ -7,7 +7,7 @@ mod common;
 use common::{go_bin, trigger_file};
 
 use scx_crfuzz::backend::{Event, GateBackend};
-use scx_crfuzz::sensor::{quiescent, snapshot, wait_frontier};
+use scx_crfuzz::sensor::{quiescent, snapshot, wait_frontier, Frontier};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,13 +24,13 @@ fn c_bin() -> PathBuf {
 fn spawn_c(mode: &str, trigger: &Path, arg: &str) -> GateBackend {
     let mut cmd = Command::new(c_bin());
     cmd.arg(mode).arg(trigger).arg(arg);
-    GateBackend::spawn(cmd, &[libc::SYS_openat]).unwrap()
+    GateBackend::spawn(cmd).unwrap()
 }
 
 struct Reach {
-    /// Rounds of the deciding wait_frontier call; None = deadline hit.
-    rounds: Option<u32>,
-    /// Wall time of the last wait_frontier call (the decision latency).
+    /// How the deciding wait_frontier call ended.
+    end: Frontier,
+    /// Its wall time (the decision latency).
     last: Duration,
     held: Vec<Event>,
 }
@@ -47,9 +47,9 @@ fn reach(be: &mut GateBackend, trigger: &Path, deadline: Duration) -> Reach {
     let mut held = Vec::new();
     loop {
         let t = Instant::now();
-        let rounds = wait_frontier(be, &mut held, deadline).unwrap();
-        let r = Reach { rounds, last: t.elapsed(), held: std::mem::take(&mut held) };
-        if rounds.is_none() || r.trigger_held(trigger) {
+        let end = wait_frontier(be, &mut held, deadline).unwrap();
+        let r = Reach { end, last: t.elapsed(), held: std::mem::take(&mut held) };
+        if r.end != Frontier::Complete || r.trigger_held(trigger) {
             return r;
         }
         r.held.iter().for_each(|e| be.release(e).unwrap());
@@ -69,8 +69,8 @@ fn futex_blocked_thread_reaches_decision() {
     let r = reach(&mut be, &trigger, Duration::from_secs(2));
     let (snap, p) = (snapshot(be.cgroup()), parked(&r));
     let states: Vec<(char, bool)> = snap.iter().map(|(t, &(s, _))| (s as char, p.contains(t))).collect();
-    eprintln!("block: rounds {:?} in {:?}; (state, parked) per thread {states:?}", r.rounds, r.last);
-    assert!(r.rounds.is_some(), "stalled with a futex-blocked thread");
+    eprintln!("block: {:?} in {:?}; (state, parked) per thread {states:?}", r.end, r.last);
+    assert_eq!(r.end, Frontier::Complete, "stalled with a futex-blocked thread");
     assert!(r.trigger_held(&trigger));
 }
 
@@ -81,8 +81,8 @@ fn spinning_thread_never_decides() {
     let trigger = trigger_file("crfuzz_sensor_spin");
     let mut be = spawn_c("spin", &trigger, "");
     let r = reach(&mut be, &trigger, Duration::from_secs(1));
-    eprintln!("spin: rounds {:?}, trigger held {}", r.rounds, r.trigger_held(&trigger));
-    assert!(r.rounds.is_none(), "decided while a thread was spinning");
+    eprintln!("spin: {:?}, trigger held {}", r.end, r.trigger_held(&trigger));
+    assert_eq!(r.end, Frontier::Partial, "decided while a thread was spinning");
     assert!(r.trigger_held(&trigger), "trigger never trapped");
 }
 
@@ -94,7 +94,7 @@ fn pingpong_never_quiescent() {
     let trigger = trigger_file("crfuzz_sensor_pingpong");
     let mut be = spawn_c("pingpong", &trigger, "");
     let r = reach(&mut be, &trigger, Duration::from_secs(1));
-    assert!(r.rounds.is_none(), "decided during ping-pong");
+    assert_eq!(r.end, Frontier::Partial, "decided during ping-pong");
     let p = parked(&r);
     let n = 20_000;
     let mut prev = snapshot(be.cgroup());
@@ -126,7 +126,7 @@ fn periodic_ticker_settle() {
                 (wait_frontier(&mut be, &mut held, deadline).unwrap(), t.elapsed().as_micros())
             })
             .collect();
-        eprintln!("tick {us}us: 20 decisions (rounds, µs) {samples:?}");
+        eprintln!("tick {us}us: 20 decisions (frontier, µs) {samples:?}");
     }
 }
 
@@ -141,9 +141,9 @@ fn go_channel_blocked_reaches_decision() {
         let trigger = trigger_file("crfuzz_sensor_go");
         let mut cmd = Command::new(&bin);
         cmd.arg(&trigger);
-        let mut be = GateBackend::spawn(cmd, &[libc::SYS_openat]).unwrap();
+        let mut be = GateBackend::spawn(cmd).unwrap();
         let r = reach(&mut be, &trigger, Duration::from_secs(2));
-        assert!(r.rounds.is_some(), "run {i}: Go stalled the readout");
+        assert_eq!(r.end, Frontier::Complete, "run {i}: Go stalled the readout");
         assert!(r.trigger_held(&trigger));
         let snap = snapshot(be.cgroup());
         if i == 0 {
@@ -154,10 +154,10 @@ fn go_channel_blocked_reaches_decision() {
             }
             eprintln!("go: {} threads, states {states}; snapshot cost {:?}", snap.len(), t.elapsed() / 1000);
         }
-        lat.push((r.rounds.unwrap(), r.last.as_micros()));
+        lat.push(r.last.as_micros());
     }
-    lat.sort_by_key(|l| l.1);
-    eprintln!("go: 20 runs (rounds, µs) sorted {lat:?}");
+    lat.sort();
+    eprintln!("go: 20 runs, µs sorted {lat:?}");
 }
 
 /// What a gated runnable thread looks like: the design assumed a tree-gated

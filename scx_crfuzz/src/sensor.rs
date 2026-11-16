@@ -49,50 +49,44 @@ pub fn quiescent(a: &Snap, b: &Snap, parked: &BTreeSet<u32>) -> bool {
         && b.iter().all(|(tid, &(st, ns))| parked.contains(tid) || (st != b'R' && a[tid] == (st, ns)))
 }
 
-/// The SUT tree is gone: there is no frontier to decide on. Not a stall; a run
-/// ends this way. Check with `err.is::<Exited>()`.
-#[derive(Debug)]
-pub struct Exited;
-
-impl std::fmt::Display for Exited {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("SUT exited")
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub enum Frontier {
+    /// No SUT thread ran between two snapshots: everything it will do
+    /// without us is held.
+    Complete,
+    /// Some still ran at the deadline.
+    Partial,
+    /// The SUT tree is gone: there is no frontier to decide on. Not a stall;
+    /// a run ends this way.
+    Exited,
 }
 
-impl std::error::Error for Exited {}
-
 /// Wait until no SUT thread is running, adding every syscall held meanwhile to
-/// `held` (the frontier). Returns the snapshot rounds it took, None at
-/// `deadline`, or `Exited` once the SUT has no threads left (an empty snapshot
-/// is vacuously quiescent). Only syscalls received before a snapshot may
-/// exempt a thread in it: one received after was running during the snapshot.
-pub fn wait_frontier(
-    be: &mut GateBackend,
-    held: &mut Vec<Event>,
-    deadline: Instant,
-) -> Result<Option<u32>> {
+/// `held` (the frontier), up to `deadline`. Exited once the SUT has no
+/// threads left (an empty snapshot is vacuously quiescent). Only syscalls
+/// received before a snapshot may exempt a thread in it: one received after
+/// was running during the snapshot.
+pub fn wait_frontier(be: &mut GateBackend, held: &mut Vec<Event>, deadline: Instant) -> Result<Frontier> {
     let mut prev = snapshot(be.cgroup());
-    for round in 1.. {
+    loop {
         match be.poll(INTERVAL)? {
             Poll::Events(evs) => held.extend(evs),
-            Poll::Closed => return Err(Exited.into()),
+            Poll::Closed => return Ok(Frontier::Exited),
             Poll::Idle => {}
         }
         let now = snapshot(be.cgroup());
         // Last thread gone before the notify fd reports POLLHUP.
         if now.is_empty() {
-            return Err(Exited.into());
+            return Ok(Frontier::Exited);
         }
         if !be.clones_pending() && quiescent(&prev, &now, &held.iter().map(|e| e.tid).collect()) {
-            return Ok(Some(round));
+            return Ok(Frontier::Complete);
         }
         if Instant::now() >= deadline {
-            return Ok(None);
+            return Ok(Frontier::Partial);
         }
         prev = now;
     }
-    unreachable!()
 }
 
 #[cfg(test)]

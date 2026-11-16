@@ -3,8 +3,9 @@
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
-use scx_crfuzz::backend::{GateBackend, Poll, SelfCheckFailed};
-use scx_crfuzz::engine::{run, Judge};
+use scx_crfuzz::backend::{GateBackend, Poll};
+use scx_crfuzz::engine::{run, Decision, End, Judge};
+use scx_crfuzz::name::EventId;
 use scx_crfuzz::oracle::{Alice, Canary};
 use scx_crfuzz::pos::Pos;
 use std::fs;
@@ -12,6 +13,21 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+/// One run of `cmd`, the mutator firing at `target`: how it ended, and its log.
+fn once(cmd: Command, m: Option<&Path>, target: Option<&EventId>, judge: Option<&mut Judge>) -> (End, Vec<Decision>) {
+    let mut be = GateBackend::spawn(cmd).unwrap();
+    let mut log = Vec::new();
+    let end = run(&mut be, &mut Pos::new(1), m, target, None, judge, Instant::now() + Duration::from_secs(30), &mut log).unwrap();
+    (end, log)
+}
+
+/// The name of `cmd`'s first `nr` on `path`, from an unmutated run: the
+/// mutator fires at one named hold, never at every one.
+fn target(cmd: Command, path: &Path, nr: i64) -> EventId {
+    let log = once(cmd, None, None, None).1;
+    log.iter().find(|d| d.id.path.as_deref() == Some(path) && d.id.nr == nr).unwrap_or_else(|| panic!("no hold on {path:?}: {log:?}")).id.clone()
+}
 
 /// The SUT drops to nobody in its own mount namespace, then opens a relative
 /// path from its cwd: the mutator at that hold must see the same uid, gid,
@@ -30,24 +46,21 @@ fn mutator_runs_as_held_task() {
     fs::write(&m, "#!/bin/sh\necho \"$1 $(id -u) $(id -g) $(pwd) $(readlink /proc/self/ns/mnt) $(awk '/^Seccomp:/ {print $2}' /proc/self/status) $CRFUZZ_SEED\" >> /tmp/crfuzz_mut/log\n").unwrap();
     fs::set_permissions(&m, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut cmd = Command::new("unshare");
-    cmd.args(["-m", "setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "sh", "-c"])
-        .arg("readlink /proc/self/ns/mnt > /tmp/crfuzz_mut/ns; cd /tmp/crfuzz_mut && cat f");
-    let mut be = GateBackend::spawn(cmd, &[libc::SYS_openat]).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut log = Vec::new();
-    run(&mut be, &mut Pos::new(1), Some(&m), None, None, None, deadline, &mut log).unwrap();
-    assert!(be.child().wait().unwrap().success());
+    let sut = || {
+        let mut cmd = Command::new("unshare");
+        cmd.args(["-m", "setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "sh", "-c"])
+            .arg("readlink /proc/self/ns/mnt > /tmp/crfuzz_mut/ns; cd /tmp/crfuzz_mut && cat f");
+        cmd
+    };
+    let f = target(sut(), Path::new("f"), libc::SYS_openat);
+    let (end, log) = once(sut(), Some(&m), Some(&f), None);
+    assert!(matches!(end, End::Exited), "{end:?}");
 
-    let hold = log.iter().find(|d| d.id.path.as_deref() == Some(Path::new("f"))).expect("cat's open of f decided");
-    assert!(hold.mutation.as_ref().is_some_and(|r| r.as_ref().is_ok_and(|s| s.success())), "{:?}", hold.mutation);
-    let failed: Vec<_> = log.iter().filter(|d| d.mutation.as_ref().is_some_and(|m| !m.as_ref().is_ok_and(|s| s.success()))).collect();
-    assert!(failed.is_empty(), "mutations failed: {failed:?}");
+    let fired: Vec<_> = log.iter().filter(|d| d.mutation.is_some()).collect();
+    assert_eq!(fired.len(), 1, "once, at the target: {fired:?}");
+    assert!(fired[0].id == f && fired[0].mutation.as_ref().is_some_and(|r| r.as_ref().is_ok_and(|s| s.success())), "{fired:?}");
     let lines = fs::read_to_string(d.join("log")).unwrap();
-    let fired = log.iter().filter(|d| d.mutation.is_some()).count();
-    assert_eq!(lines.lines().count(), fired, "one mutator run per hold it fired at");
-    assert!(log.iter().all(|d| d.mutation.is_none() || d.id.path.is_some()), "fired without a path");
-    eprintln!("{} mutator runs, {} decisions", lines.lines().count(), log.len());
+    assert_eq!(lines.lines().count(), 1, "one mutator run");
     let line = lines.lines().find(|l| l.starts_with("f ")).expect("mutator ran on f");
     let f: Vec<&str> = line.split(' ').collect();
     let ns = fs::read_to_string(d.join("ns")).unwrap();
@@ -72,7 +85,7 @@ fn mutator_timeout_returns() {
     fs::set_permissions(&m, fs::Permissions::from_mode(0o755)).unwrap();
     let mut cmd = Command::new("cat");
     cmd.arg(&f);
-    let mut be = GateBackend::spawn(cmd, &[libc::SYS_openat]).unwrap();
+    let mut be = GateBackend::spawn(cmd).unwrap();
     let end = Instant::now() + Duration::from_secs(5);
     let ev = loop {
         assert!(Instant::now() < end, "open of f never trapped");
@@ -96,6 +109,14 @@ fn mutator_timeout_returns() {
     // "not started" if the exec itself outlived the timeout (a loaded VM).
     assert!(["still running", "not started"].iter().any(|m| format!("{err:#}").contains(m)), "{err:#}");
     be.release(&ev).unwrap();
+    // Its exit_group is held too.
+    loop {
+        match be.poll(Duration::from_millis(100)).unwrap() {
+            Poll::Events(evs) => evs.iter().for_each(|e| be.release(e).unwrap()),
+            Poll::Idle => {}
+            Poll::Closed => break,
+        }
+    }
     assert!(be.child().wait().unwrap().success());
     fs::remove_dir_all(d).unwrap();
 }
@@ -118,26 +139,42 @@ fn observer(d: &Path) -> std::path::PathBuf {
     m
 }
 
-/// Run `cmd` judged against `alice` with `canary`, the mutator `m` firing.
-fn judged_run(cmd: Command, watched: &[i64], m: &Path, canary: &Canary, alice: &str) -> anyhow::Result<()> {
-    let mut be = GateBackend::spawn(cmd, watched).unwrap();
+/// Run `sut()` judged against `alice` with `canary`, the mutator `m` firing
+/// at its `nr` on `<d>/f` (recreated after the unmutated run that names it).
+fn judged_run(sut: &dyn Fn() -> Command, d: &Path, nr: i64, m: &Path, canary: &Canary, alice: &str) -> End {
+    let at = target(sut(), &d.join("f"), nr);
+    fs::write(d.join("f"), "").unwrap();
     let mut j = Judge { canary, alice: Alice::parse(alice).unwrap(), reached: None, task: None };
-    run(&mut be, &mut Pos::new(1), Some(m), None, None, Some(&mut j), Instant::now() + Duration::from_secs(30), &mut Vec::new())
+    once(sut(), Some(m), Some(&at), Some(&mut j)).0
+}
+
+fn sh(script: String) -> impl Fn() -> Command {
+    move || {
+        let mut cmd = Command::new("unshare");
+        cmd.args(["-m", "sh", "-c", &script]);
+        cmd
+    }
+}
+
+fn cat(d: &Path) -> impl Fn() -> Command {
+    let f = d.join("f");
+    move || {
+        let mut cmd = Command::new("cat");
+        cmd.arg(&f);
+        cmd
+    }
 }
 
 /// The self-check aborts: alice as uid 0 (no caps) owns the gate, so it
-/// doesn't stop her: the run fails with SelfCheckFailed before the mutator
-/// starts.
+/// doesn't stop her: the run ends with `SelfCheck` before the mutator starts.
 #[test]
 #[ignore]
 fn self_check_aborts_root() {
     let d = Path::new("/tmp/crfuzz_mut_abort");
     let m = observer(d);
     let c = Canary::create(300).unwrap();
-    let mut cmd = Command::new("cat");
-    cmd.arg(d.join("f"));
-    let e = judged_run(cmd, &[libc::SYS_openat], &m, &c, "0:0").unwrap_err();
-    assert!(e.is::<SelfCheckFailed>(), "{e:#}");
+    let end = judged_run(&cat(d), d, libc::SYS_openat, &m, &c, "0:0");
+    assert!(matches!(end, End::SelfCheck), "{end:?}");
     assert_eq!(fs::read_to_string(d.join("log")).unwrap(), "", "the mutator never started");
     fs::remove_dir_all(d).unwrap();
 }
@@ -150,9 +187,9 @@ fn self_check_enoent_passes() {
     let d = Path::new("/tmp/crfuzz_mut_enoent");
     let m = observer(d);
     let c = Canary::create(301).unwrap();
-    let mut cmd = Command::new("unshare");
-    cmd.args(["-m", "sh", "-c"]).arg(format!("mount -t tmpfs none /var/lib/crfuzz && rm {}/f", d.display()));
-    judged_run(cmd, &[libc::SYS_unlinkat], &m, &c, "65534:65534").unwrap();
+    let sut = sh(format!("mount -t tmpfs none /var/lib/crfuzz && rm {}/f", d.display()));
+    let end = judged_run(&sut, d, libc::SYS_unlinkat, &m, &c, "65534:65534");
+    assert!(matches!(end, End::Exited), "{end:?}");
     let log = fs::read_to_string(d.join("log")).unwrap();
     assert!(log.lines().any(|l| l.starts_with(&format!("{}/f ", d.display()))), "mutator ran: {log:?}");
     assert_eq!(fs::read_to_string(d.join("canary")).unwrap(), "\n", "no canary in this view to name");
@@ -167,9 +204,9 @@ fn self_check_other_dir_passes() {
     let d = Path::new("/tmp/crfuzz_mut_other");
     let m = observer(d);
     let c = Canary::create(304).unwrap();
-    let mut cmd = Command::new("unshare");
-    cmd.args(["-m", "sh", "-c"]).arg(format!("mount -t tmpfs none /var/lib/crfuzz && mkdir -p {} && rm {}/f", c.dir.display(), d.display()));
-    judged_run(cmd, &[libc::SYS_unlinkat], &m, &c, "65534:65534").unwrap();
+    let sut = sh(format!("mount -t tmpfs none /var/lib/crfuzz && mkdir -p {} && rm {}/f", c.dir.display(), d.display()));
+    let end = judged_run(&sut, d, libc::SYS_unlinkat, &m, &c, "65534:65534");
+    assert!(matches!(end, End::Exited), "{end:?}");
     let log = fs::read_to_string(d.join("log")).unwrap();
     assert!(log.lines().any(|l| l.starts_with(&format!("{}/f ", d.display()))), "mutator ran: {log:?}");
     assert_eq!(fs::read_to_string(d.join("canary")).unwrap(), "\n", "not the canary there to name");
@@ -184,9 +221,8 @@ fn mutator_runs_as_alice() {
     let d = Path::new("/tmp/crfuzz_mut_alice");
     let m = observer(d);
     let c = Canary::create(302).unwrap();
-    let mut cmd = Command::new("cat");
-    cmd.arg(d.join("f"));
-    judged_run(cmd, &[libc::SYS_openat, libc::SYS_exit_group], &m, &c, "65534:65534").unwrap();
+    let end = judged_run(&cat(d), d, libc::SYS_openat, &m, &c, "65534:65534");
+    assert!(matches!(end, End::Exited), "{end:?}");
     let log = fs::read_to_string(d.join("log")).unwrap();
     let line = log.lines().find(|l| l.starts_with(&format!("{}/f ", d.display()))).expect("mutator ran on f, a root hold");
     let f: Vec<&str> = line.split(' ').collect();

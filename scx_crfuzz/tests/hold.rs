@@ -22,7 +22,7 @@ fn ms(n: u64) -> Duration {
 /// Spawn the SUT with stdout counted byte-by-byte.
 fn spawn_counted(mut cmd: Command) -> (GateBackend, Arc<AtomicU64>) {
     cmd.stdout(Stdio::piped());
-    let mut be = GateBackend::spawn(cmd, &[libc::SYS_openat]).unwrap();
+    let mut be = GateBackend::spawn(cmd).unwrap();
     let mut out = be.child().stdout.take().unwrap();
     let bytes = Arc::new(AtomicU64::new(0));
     let b = bytes.clone();
@@ -148,29 +148,6 @@ fn tree_hold_stops_sibling_processes() {
     cmd.args(["-c", &script]);
     let (mut be, bytes) = spawn_counted(cmd);
     check(&mut be, &bytes, &trigger, "sh tree");
-}
-
-/// With execve watched, spawn returns (the SUT's own exec is let through) and
-/// the SUT's next exec traps, held, with its path.
-#[test]
-#[ignore]
-fn watched_execve_spawns_and_holds_next_exec() {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.args(["-c", "exec /bin/true"]);
-    let mut be = GateBackend::spawn(cmd, &[libc::SYS_execve]).unwrap();
-    let ev = match be.poll(ms(1000)).unwrap() {
-        Poll::Events(mut evs) => evs.remove(0),
-        Poll::Idle => panic!("sh's exec never trapped"),
-        Poll::Closed => panic!("SUT exited unheld"),
-    };
-    assert_eq!(ev.path.as_deref(), Some(Path::new("/bin/true")));
-    sleep(ms(100));
-    assert!(be.child().try_wait().unwrap().is_none(), "exec ran while held");
-    be.release(&ev).unwrap();
-    assert!(be.child().wait().unwrap().success());
-
-    let bare = GateBackend::spawn(Command::new("sh"), &[libc::SYS_execve]);
-    assert!(bare.is_err(), "bare program name accepted with execve watched");
 }
 
 /// runc moves `runc init` into the container cgroup, which crfuzz's targets

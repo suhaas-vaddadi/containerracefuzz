@@ -1,0 +1,10 @@
+name: test
+on: [push, pull_request]
+jobs:
+  pure:
+    # The pure layer (naming, POS, schedule). Everything else needs root on an
+    # aarch64 Linux with sched_ext: run by hand in a VM (README, Testing).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked -p scx_crfuzz --lib

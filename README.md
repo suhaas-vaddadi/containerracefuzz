@@ -145,7 +145,7 @@ plan: 1 seeds, 5 windows in seed 0, ~6 runs, est. 0s (+ confirms)
 ...
 [1/1] seed 0 window 4: Violation, confirming
   confirmed: Violation
-  minimize step 3: Violation([Changed { entry: "file" }, Changed { entry: "hard" }])
+  minimize step 3: Violation {Changed { entry: "file" }, Changed { entry: "hard" }}
   guilty: step 3 EventId { thread: "0", nr: 79, path: Some("/tmp/q/alice/p"), n: 0 }
 left /var/lib/crfuzz/canary-272182-6: changed
 [1/1] seed 0 window 4/5: Violation → confirmed, guilty step 3 (0 79 /tmp/q/alice/p) → finding #1 (new)  0.0s
@@ -179,7 +179,7 @@ gate.
 `scx_crfuzz containerd` fuzzes a container start. A private containerd runs
 as the SUT's child, so the shim and runc inherit the hold. It starts a
 busybox container from a rootfs that alice owns. The mutator is
-`tests/fixtures/mutator_all.c`, embedded in the binary. At each hold under the
+`scx_crfuzz/targets/containerd/mutator_all.c`, embedded in the binary. At each hold under the
 rootfs it applies one of three primitives, picked by the hold's seed:
 
 - a symlink exchange, modelled on runc's mount bug CVE-2021-30465
@@ -349,9 +349,10 @@ ends with a verdict:
 
 #### Resuming
 
-`--resume` continues the campaign in `DIR`. Its arguments must match
-`DIR/args`, except `--seeds`, `--time`, `--jobs` and `-v`, which may change,
-and `--resume` itself.
+`--resume` continues the campaign in `DIR`. What its runs share must equal
+`DIR/config`: the attacker, mutator, layout, timeout, private and scope
+directories, the `CRFUZZ_*` environment and the command. `--seeds`,
+`--first-seed`, `--time`, `--jobs` and `-v` may change.
 
 - A seed with a line in `seeds.tsv` is complete and is skipped.
 - Every other seed's `runs.tsv` rows, `runs/<seed>/` and `findings/*/seeds`
@@ -361,10 +362,10 @@ and `--resume` itself.
   session only.
 - `--time` counts this session only.
 
-The match is textual. `--mutator ./swap.sh` and `--mutator /tmp/q/swap.sh`
-differ, even when they name the same file. A file whose contents changed since the first
-session still matches, so keep the mutator, the layout and the SUT unchanged
-across a resume.
+The match is on values, after paths are made absolute: `--mutator ./swap.sh`
+and `--mutator /tmp/q/swap.sh` match when they name the same path. A file
+whose contents changed since the first session still matches, so keep the
+mutator, the layout and the SUT unchanged across a resume.
 
 #### Parallel seeds
 
@@ -467,7 +468,7 @@ the run cgroup and the canary, then prints the summary after an
 ### Campaign directory
 
 ```
-DIR/args                    run's arguments after DIR, one per line, escaped as in schedules
+DIR/config                  what every run shares, as a schedule's lines (attacker ... cmd)
 DIR/seeds.tsv               one row per seed (seed, verdict), written as the seed ends
 DIR/runs.tsv                one row per window, written as it ends:
                             seed window class status finding decisions partial secs note
@@ -512,15 +513,19 @@ seed 0
 attacker 65534:65534
 mutator /tmp/q/swap.sh            optional
 layout /tmp/q/layout.sh           optional
-timeout 30                        optional: --timeout, only if not 60
+timeout 30                        --timeout (60 if missing: files from before it)
 private /tmp/q/alice              optional, one per --private
+scope /tmp/q/alice                optional, one per --scope
 env CRFUZZ_PRIMITIVE swap         optional, one per CRFUZZ_* variable at run time
-deadline                          only if discovery ended at the deadline
 cmd /tmp/q/check_use /tmp/q/alice/p
 outcome Violation
+deadline                          only if discovery ended at the deadline
 finding Changed file              normalized; also Reached <entry> <at>, Copy <at>
 step 1 0 79 0 /tmp/q/alice/p      mutate thread syscall-nr occurrence [path]
 ```
+
+The lines from `attacker` to `cmd` are the run's configuration, the same
+lines as `DIR/config`.
 
 ## How it works
 
@@ -563,7 +568,7 @@ step 1 0 79 0 /tmp/q/alice/p      mutate thread syscall-nr occurrence [path]
    stripped). Minimization replays once per mutated step, with only that
    mutation on, and reports the **first** step whose run still flags one of
    the findings: the guilty hold.
-7. **Campaign** (`main.rs`). Seeds `S..S+N` run, each with its baseline and
+7. **Campaign** (`campaign.rs`, `run.rs`). Seeds `S..S+N` run, each with its baseline and
    windows, `--jobs` of them at once. A Violation whose findings and guilty
    `(thread, syscall, path)` match a known finding is counted against it
    without being confirmed again. A new one is confirmed and minimized.
@@ -578,27 +583,33 @@ guaranteed.
 
 ```
 LICENSE                    GPL-2.0
-scx_crfuzz/                the scx_crfuzz crate: engine, backend, POS, oracle, schedule, CLI
+.github/workflows/test.yml the pure tests, on every push
+scx_crfuzz/                the scx_crfuzz crate
   build.rs                 builds the BPF skeleton and the static containerd mutator
+  src/bpf/main.bpf.c       the sched_ext gate scheduler
+  src/gate.rs              loads the gate scheduler; GateMap, its client
   src/backend.rs           seccomp-notify hold, tree gate, mutator and probe
   src/sensor.rs            /proc double-snapshot readout (complete frontier)
-  src/pos.rs               event identity, conflict keys, POS
+  src/name.rs              event identity: path normalization
+  src/pos.rs               conflict keys, POS
   src/engine.rs            the discovery / replay loop
   src/oracle.rs            canary, attacker identity, outcome class
-  src/schedule.rs          schedule file, fixed-schedule policy, finding
+  src/schedule.rs          Config, schedule file, fixed-schedule policy, finding
                            normalization, dedup, canonical partial order
-  src/gate.rs              loads the gate scheduler; GateMap, its client
-  src/bpf/main.bpf.c       the sched_ext gate scheduler
-  src/main.rs              CLI: run, replay, containerd, campaign, gated/status/reset/check
-  targets/containerd/      the containerd target's sut.sh and layout.sh
+  src/main.rs              the binary's modules
+  src/cli.rs               usage, argument parsing, preflight
+  src/run.rs               one worker's runs: baseline, windows, confirm, minimize; replay
+  src/campaign.rs          the sweep over seeds, its files, resume, the summary
+  src/targets/containerd.rs  the containerd target's setup
+  targets/containerd/      its sut.sh, layout.sh and mutator_all.c
   scripts/vm_containerd.sh build in the Lima VM and run the containerd target
-  tests/                   on-target tests and C/Go fixtures (mutator_all.c included)
+  tests/                   on-target tests and C/Go fixtures
 ```
 
 ## Testing
 
 ```sh
-cargo test -p scx_crfuzz      # pure tests (POS, schedule, CLI parsing); also runs on macOS
+cargo test -p scx_crfuzz      # pure tests (naming, POS, schedule); also runs on macOS, and in CI
 ```
 
 The on-target tests are `#[ignore]`d. They need root and a running
@@ -630,9 +641,9 @@ cli, campaign and gate.
 - Only canaries are watched. A leak of any other file is not seen. An
   exposure undone before the final hold is missed, and a SUT killed by a
   signal is judged on the canary's changes alone.
-- `--resume` reruns a seed that was stopped partway from its start. Its
-  argument match is textual (see [Resuming](#resuming)). For `containerd`,
-  a different `--image` is not detected.
+- `--resume` reruns a seed that was stopped partway from its start. It
+  compares paths, not file contents (see [Resuming](#resuming)). For
+  `containerd`, a different `--image` is not detected.
 - `--jobs` isolates only the filesystem. The windows within one seed still
   run one after another.
 

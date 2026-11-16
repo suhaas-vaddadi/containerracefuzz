@@ -248,7 +248,7 @@ impl std::fmt::Display for Alice {
     }
 }
 
-pub use crate::schedule::Finding;
+pub use crate::schedule::{Class, Finding};
 
 /// Mount points in a mountinfo (field 5), as that task sees them, octal
 /// escapes (`\040`) undone. Bytes: a mount point need not be UTF-8.
@@ -266,38 +266,20 @@ pub fn mount_points(mountinfo: &[u8]) -> Vec<PathBuf> {
     mountinfo.split(|&c| c == b'\n').filter_map(|l| l.split(|&c| c == b' ').nth(4)).map(unescape).collect()
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Outcome {
-    Violation(Vec<Finding>),
-    RuntimeRefused,
-    RuntimeError,
-    Clean,
-}
-
-impl Outcome {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Outcome::Violation(_) => "Violation",
-            Outcome::RuntimeRefused => "RuntimeRefused",
-            Outcome::RuntimeError => "RuntimeError",
-            Outcome::Clean => "Clean",
-        }
-    }
-}
-
-/// The outcome class, first match wins. An ending of None: the deadline.
-pub fn outcome(findings: Vec<Finding>, sut: Option<ExitStatus>, baseline: Option<ExitStatus>) -> Outcome {
+/// The outcome class of a valid run, first match wins. An ending of None:
+/// the deadline.
+pub fn outcome(findings: &[Finding], sut: Option<ExitStatus>, baseline: Option<ExitStatus>) -> Class {
     let ok = |s: Option<ExitStatus>| s.is_some_and(|s| s.success());
     if !findings.is_empty() {
-        Outcome::Violation(findings)
+        Class::Violation
     } else if !ok(baseline) {
-        Outcome::RuntimeError // the scenario is broken
+        Class::RuntimeError // the scenario is broken
     } else if ok(sut) {
-        Outcome::Clean
+        Class::Clean
     } else if sut.is_some_and(|s| s.code().is_some()) {
-        Outcome::RuntimeRefused // exited nonzero: refused
+        Class::RuntimeRefused // exited nonzero: refused
     } else {
-        Outcome::RuntimeError // signal or deadline
+        Class::RuntimeError // signal or deadline
     }
 }
 
@@ -309,13 +291,13 @@ mod tests {
     #[test]
     fn outcome_order() {
         let (ok, fail, killed) = (Some(ExitStatus::from_raw(0)), Some(ExitStatus::from_raw(1 << 8)), Some(ExitStatus::from_raw(9)));
-        let f = || vec![Finding::Changed { entry: "file".into() }];
-        assert_eq!(outcome(f(), fail, ok), Outcome::Violation(f()));
-        assert_eq!(outcome(vec![], fail, ok), Outcome::RuntimeRefused);
-        assert_eq!(outcome(vec![], ok, fail), Outcome::RuntimeError);
-        assert_eq!(outcome(vec![], killed, ok), Outcome::RuntimeError);
-        assert_eq!(outcome(vec![], None, ok), Outcome::RuntimeError);
-        assert_eq!(outcome(vec![], ok, ok), Outcome::Clean);
+        let f = [Finding::Changed { entry: "file".into() }];
+        assert_eq!(outcome(&f, fail, ok), Class::Violation);
+        assert_eq!(outcome(&[], fail, ok), Class::RuntimeRefused);
+        assert_eq!(outcome(&[], ok, fail), Class::RuntimeError);
+        assert_eq!(outcome(&[], killed, ok), Class::RuntimeError);
+        assert_eq!(outcome(&[], None, ok), Class::RuntimeError);
+        assert_eq!(outcome(&[], ok, ok), Class::Clean);
     }
 
     #[test]

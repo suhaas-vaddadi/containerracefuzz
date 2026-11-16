@@ -40,6 +40,33 @@ type Call = (u32, u64, [u64; 6]);
 
 const AUDIT_ARCH: u32 = 0xC000_00B7;
 
+/// The syscalls held, besides `CLONES`: the path syscalls `observe` decodes,
+/// and `exit_group`, the final hold (the probe's; its keys are `all`, so no
+/// mutator fires there).
+// ponytail: not held: execve and execveat, mount, open_tree, move_mount,
+// fchmodat2 (glibc 2.39's fchmodat with flags), utimensat, truncate, the
+// xattr family. The preceding path syscall is still a hold just before one;
+// add them here and to `path_args` when a target races there.
+pub const WATCHED: &[i64] = &[
+    libc::SYS_openat,
+    libc::SYS_openat2,
+    libc::SYS_newfstatat,
+    libc::SYS_statx,
+    libc::SYS_faccessat,
+    libc::SYS_faccessat2,
+    libc::SYS_readlinkat,
+    libc::SYS_fchmodat,
+    libc::SYS_fchownat,
+    libc::SYS_unlinkat,
+    libc::SYS_mkdirat,
+    libc::SYS_mknodat,
+    libc::SYS_renameat2,
+    libc::SYS_linkat,
+    libc::SYS_symlinkat,
+    libc::SYS_chdir,
+    libc::SYS_exit_group,
+];
+
 /// One syscall held by seccomp-notify.
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -90,17 +117,11 @@ pub struct GateBackend {
 
 impl GateBackend {
     /// Spawn `cmd` as the SUT: in the run cgroup, enrolled in SCHED_EXT, with
-    /// `watched` syscalls trapping to us. Fails if the gate daemon isn't up
+    /// its `CLONES` and `WATCHED` syscalls trapping to us. Fails if the gate daemon isn't up
     /// (never fall back to seccomp-only: without the gate the tree can't be
     /// stopped while the mutator runs).
-    pub fn spawn(mut cmd: Command, watched: &[i64]) -> Result<Self> {
-        let exec_watched = watched.contains(&libc::SYS_execve);
-        let watched: Vec<i64> = CLONES.iter().chain(watched).copied().collect::<BTreeSet<_>>().into_iter().collect();
-        // A bare name makes execvp try one execve per PATH entry, and we can't
-        // tell which try will succeed, so the helper below can't stop on it.
-        if exec_watched && !cmd.get_program().as_bytes().contains(&b'/') {
-            bail!("watching execve needs a program path, not a bare name: {:?}", cmd.get_program());
-        }
+    pub fn spawn(mut cmd: Command) -> Result<Self> {
+        let watched: Vec<i64> = CLONES.iter().chain(WATCHED).copied().collect();
         let gate = GateMap::open()?;
         // `run-<pid>-<epoch>`: epochs restart with the daemon, so the pid keeps
         // a dead crfuzz's leftover run (see `sweep`) from being reused.
@@ -155,32 +176,13 @@ impl GateBackend {
                 Ok(())
             });
         }
-        // spawn() returns only once the child's exec completes, and with execve
-        // watched that exec traps. Take the listener before spawning and let the
-        // child's own exec through: nothing of the SUT has run yet, so it orders
-        // against nothing (same as a different starting layout). Later execs trap
-        // normally. Closing `theirs` unblocks the helper if the child dies first.
-        // ponytail: glibc's ENOEXEC retry via /bin/sh is a second execve, which
-        // then traps unanswered; unsupported (give scripts a #!).
-        let helper = std::thread::spawn(move || -> Result<OwnedFd> {
-            let fd = recv_fd(ours.as_raw_fd()).context("receive seccomp listener")?;
-            // Before the child's exec, anything trapped is spawn plumbing.
-            if exec_watched {
-                loop {
-                    let req = notif_recv(fd.as_raw_fd())?;
-                    notif_continue(fd.as_raw_fd(), req.id)?;
-                    if req.data.nr as i64 == libc::SYS_execve {
-                        break;
-                    }
-                }
-            }
-            Ok(fd)
-        });
+        // spawn() returns once the child's exec is done; the listener is in
+        // the socket by then, and whatever the SUT has trapped at since waits
+        // for us there.
         let child = cmd.spawn();
         drop(theirs);
-        let notify = helper.join().expect("listener helper panicked");
         let child = child.context("spawn SUT")?;
-        let notify = notify?;
+        let notify = recv_fd(ours.as_raw_fd()).context("receive seccomp listener")?;
         let names = HashMap::from([(child.id(), ("0".into(), 0))]);
         Ok(Self {
             gate,
@@ -369,15 +371,6 @@ impl GateBackend {
     /// gated until `ungate_tree`; answering first means a signal can't restart
     /// the syscall mid-release.
     pub fn release(&mut self, ev: &Event) -> Result<()> {
-        // A non-leader's execve takes over the leader's tid.
-        // ponytail: moved on release, so a failed execve misnames both;
-        // move it once the old tid is gone if that matters.
-        if ev.nr == libc::SYS_execve && ev.tid != ev.tgid {
-            if let Some(n) = self.names.remove(&ev.tid) {
-                self.names.insert(ev.tgid, n);
-            }
-            self.retry.remove(&ev.tgid);
-        }
         match notif_continue(self.notify.as_raw_fd(), ev.id) {
             Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Err(e.into()),
             _ => Ok(()), // ENOENT: task died while held
@@ -497,7 +490,7 @@ pub fn sweep() {
     if left > 0 {
         eprintln!("{left} stale run cgroups left in {CGROUP_ROOT}");
     }
-    // A dead crfuzz's `--private` copies (main.rs: work/<pid>): no evidence there.
+    // A dead crfuzz's `--private` copies (run.rs: work/<pid>): no evidence there.
     let work = format!("{}/work", oracle::ROOT);
     for n in names(&work).filter(|n| n.parse::<u32>().is_ok_and(|p| !Path::new(&format!("/proc/{p}")).exists())) {
         let _ = fs::remove_dir_all(Path::new(&work).join(n));
@@ -508,37 +501,10 @@ pub fn sweep() {
     }
 }
 
-/// Alice's credentials got past the canary gate (the self-check): the setup
-/// is wrong and
-/// the run is invalid. Not a primitive failure. Check with
-/// `err.is::<SelfCheckFailed>()`.
-#[derive(Debug)]
-pub struct SelfCheckFailed;
-
-impl std::fmt::Display for SelfCheckFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("self-check: alice's credentials are not stopped by the canary gate")
-    }
-}
-
-impl std::error::Error for SelfCheckFailed {}
-
-/// The held task's root is a canary entry: the SUT put it there, so no view
-/// alice could have starts from it. A primitive failure for the mutator; for
-/// the probe, only the handle check judges it.
-#[derive(Debug)]
-pub struct RootInCanary;
-
-impl std::fmt::Display for RootInCanary {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("the held task's root is inside the canary")
-    }
-}
-
-impl std::error::Error for RootInCanary {}
-
 // No step before the self-check (setns, chroot, fchdir, setgroups, setres*id,
-// capset, prctl) returns it, so from pre_exec it names the self-check alone.
+// capset, prctl) returns it, so from pre_exec it names the self-check alone:
+// alice's credentials got past the canary gate, so nothing run with them is
+// really alice's doing.
 const SELF_CHECK: i32 = libc::ENOTRECOVERABLE;
 
 /// Who a child becomes in the held task's view.
@@ -573,8 +539,11 @@ struct View {
 
 impl GateBackend {
     /// The held task's user and mount namespaces, its root, its cwd (or the
-    /// dirfd its path is relative to), and the ids `who` takes there.
-    fn view(&self, ev: &Event, canary: Option<&Canary>, who: As) -> Result<View> {
+    /// dirfd its path is relative to), and the ids `who` takes there. None:
+    /// the task's root is a canary entry. The SUT put it there, so no view
+    /// alice could have starts from it: a primitive failure for the mutator;
+    /// for the probe, only the handle check judges it.
+    fn view(&self, ev: &Event, canary: Option<&Canary>, who: As) -> Result<Option<View>> {
         let tid = ev.tid;
         // None: already ours (setns into our own user namespace fails).
         let ns = |n: &str| -> Result<Option<File>> {
@@ -641,31 +610,29 @@ impl GateBackend {
             bail!("held task gone");
         }
         let view = View { user, mnt, root, cwd, uid, gid, groups, caps, gate, ids: canary.map(|c| c.ids().into_keys().collect()).unwrap_or_default() };
-        if canary.is_some() && unsafe { view.inside(&view.root) } {
-            bail!(RootInCanary);
-        }
-        Ok(view)
+        Ok((canary.is_none() || !unsafe { view.inside(&view.root) }).then_some(view))
     }
 
     /// Run the mutator `prog` on held event `ev` in its task's view (`view`).
     /// Judged, as alice (not the held task: wherever it outranks her, the
     /// self-check would fail, and that is every hold a race matters at): her
     /// ids mapped into the task's user namespace, her caps, NO_NEW_PRIVS,
-    /// self-checked against the canary at the given path; unjudged, with the
-    /// task's own ids. `prog` gets the path
-    /// as issued; killed after `timeout`. CRFUZZ_CANARY names a fresh
+    /// self-checked against the canary at the given path (None: the check
+    /// failed, she got past the gate); unjudged, with the task's own ids.
+    /// `prog` gets the path as issued; killed after `timeout`. CRFUZZ_CANARY names a fresh
     /// directory each run (and replay): choices must come from CRFUZZ_SEED,
     /// never from that name, or replay can't fire the same mutation.
     // ponytail: `prog` is exec'd after the chroot, so it (and a script's
     // interpreter) must exist inside the task's root; exec it from an fd opened
     // beforehand once a target has its own root (runc).
     // ponytail: kill() reaches only `prog`, not processes it forked.
-    pub fn mutate(&self, ev: &Event, prog: &Path, judge: Option<(&Alice, &Canary)>, seed: u64, timeout: Duration) -> Result<ExitStatus> {
+    pub fn mutate(&self, ev: &Event, prog: &Path, judge: Option<(&Alice, &Canary)>, seed: u64, timeout: Duration) -> Result<Option<ExitStatus>> {
         let path = ev.path.as_ref().context("event has no path")?;
         let view = match judge {
             Some((alice, canary)) => self.view(ev, Some(canary), As::Alice(alice))?,
             None => self.view(ev, None, As::Held)?,
         };
+        let view = view.context("the held task's root is inside the canary")?;
         let mut cmd = Command::new(prog);
         cmd.arg(path)
             .env("CRFUZZ_PATH", path)
@@ -707,7 +674,7 @@ impl GateBackend {
             }
         });
         let mut child = match rx.recv_timeout(timeout) {
-            Ok(Err(e)) if e.raw_os_error() == Some(SELF_CHECK) => return Err(SelfCheckFailed.into()),
+            Ok(Err(e)) if e.raw_os_error() == Some(SELF_CHECK) => return Ok(None),
             Ok(r) => r.with_context(|| format!("spawn mutator {}", prog.display()))?,
             Err(_) => {
                 *abandoned.lock().unwrap() = true;
@@ -721,7 +688,7 @@ impl GateBackend {
         };
         loop {
             if let Some(st) = child.try_wait()? {
-                return Ok(st);
+                return Ok(Some(st));
             }
             if Instant::now() >= end {
                 let _ = child.kill();
@@ -738,13 +705,11 @@ impl GateBackend {
     /// The read half at the final hold `ev`: as alice in its view, `stat`
     /// the footprint and every mount point, and look for the token in each
     /// regular file she can open; then, as root, the task's own handles if it
-    /// runs as alice. Killed after `timeout`; any failure makes the run invalid.
-    pub fn probe(&self, ev: &Event, alice: &Alice, canary: &Canary, footprint: &BTreeSet<PathBuf>, timeout: Duration) -> Result<Vec<Finding>> {
+    /// runs as alice. None: the self-check failed. Killed after `timeout`; any
+    /// failure makes the run invalid.
+    pub fn probe(&self, ev: &Event, alice: &Alice, canary: &Canary, footprint: &BTreeSet<PathBuf>, timeout: Duration) -> Result<Option<Vec<Finding>>> {
         let mut found = 'view: {
-            let view = match self.view(ev, Some(canary), As::Alice(alice)) {
-                Err(e) if e.is::<RootInCanary>() => break 'view Vec::new(),
-                r => r?,
-            };
+            let Some(view) = self.view(ev, Some(canary), As::Alice(alice))? else { break 'view Vec::new() };
             let mut paths: Vec<PathBuf> = footprint.iter().cloned().collect();
             paths.extend(oracle::mount_points(&fs::read(format!("/proc/{}/mountinfo", ev.tid))?));
             let cpaths = paths.iter().map(|p| CString::new(p.as_os_str().as_bytes())).collect::<Result<Vec<_>, _>>()?;
@@ -836,7 +801,7 @@ impl GateBackend {
             ensure!(unsafe { libc::waitpid(pid, &mut status, 0) } == pid, "waitpid: {}", Error::last_os_error());
             match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
                 Some(0) => {}
-                Some(2) => return Err(SelfCheckFailed.into()),
+                Some(2) => return Ok(None),
                 _ => bail!("probe could not enter the view (status {status:#x})"),
             }
 
@@ -881,7 +846,7 @@ impl GateBackend {
         }
         found.sort();
         found.dedup();
-        Ok(found)
+        Ok(Some(found))
     }
 }
 
@@ -916,8 +881,8 @@ fn absent(root: &File, path: &CStr, flags: i32) -> bool {
 /// Read before: before the SUT, alice must be stopped at every canary
 /// entry: EACCES, or ENOENT where root can't find it in this view either.
 /// Catches a gate she can search but not read, which the self-check's open
-/// passes.
-pub fn read_before(canary: &Canary, alice: &Alice) -> Result<()> {
+/// passes. False: she is not stopped.
+pub fn read_before(canary: &Canary, alice: &Alice) -> Result<bool> {
     let dir = |p: &str| File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY).open(p);
     let root = dir("/")?;
     let entries = canary
@@ -974,8 +939,8 @@ pub fn read_before(canary: &Canary, alice: &Alice) -> Result<()> {
     // A failed wait leaves status 0, which would read as a pass.
     ensure!(unsafe { libc::waitpid(pid, &mut status, 0) } == pid, "waitpid: {}", Error::last_os_error());
     match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
-        Some(0) => Ok(()),
-        Some(2) => Err(SelfCheckFailed.into()),
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
         _ => bail!("read before: could not become alice (status {status:#x})"),
     }
 }
@@ -1150,7 +1115,7 @@ fn path_args(nr: i64) -> &'static [(Option<usize>, usize, bool)] {
         libc::SYS_linkat => &[(Some(0), 1, false), (Some(2), 3, true)],
         // The target string (arg 0) is stored, not resolved.
         libc::SYS_symlinkat => &[(Some(1), 2, true)],
-        libc::SYS_chdir | libc::SYS_execve => &[(None, 0, false)],
+        libc::SYS_chdir => &[(None, 0, false)],
         _ => &[],
     }
 }
@@ -1160,9 +1125,8 @@ fn path_args(nr: i64) -> &'static [(Option<usize>, usize, bool)] {
 fn observe(tid: u32, nr: i64, args: &[u64; 6]) -> (Option<PathBuf>, Keys) {
     let mut k = Keys::default();
     // Undecoded: footprint unknown. chdir moves the base of every relative
-    // path in the process, and a multithreaded execve kills the siblings, so
-    // either is ordered against everything.
-    k.all = matches!(nr, libc::SYS_chdir | libc::SYS_execve) || path_args(nr).is_empty();
+    // path in the process, so it is ordered against everything.
+    k.all = nr == libc::SYS_chdir || path_args(nr).is_empty();
     let mut first = None;
     for (i, &(dirfd, arg, rebind)) in path_args(nr).iter().enumerate() {
         let Some(path) = read_cstr(tid, args[arg]) else {

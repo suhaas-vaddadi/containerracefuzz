@@ -3,8 +3,8 @@
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
-use scx_crfuzz::backend::{read_before, GateBackend, SelfCheckFailed};
-use scx_crfuzz::engine::{run, Deadline, Judge};
+use scx_crfuzz::backend::{read_before, GateBackend};
+use scx_crfuzz::engine::{run, End, Judge};
 use scx_crfuzz::oracle::{Alice, Canary, Finding};
 use scx_crfuzz::pos::Pos;
 use std::fs;
@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const WATCHED: &[i64] = &[libc::SYS_openat, libc::SYS_chdir, libc::SYS_exit_group];
 const NOBODY: &str = "setpriv --reuid=65534 --regid=65534 --clear-groups";
 
 fn nobody() -> Alice {
@@ -24,9 +23,10 @@ fn nobody() -> Alice {
 fn judged(canary: &Canary, script: &str) -> Vec<Finding> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(script);
-    let mut be = GateBackend::spawn(cmd, WATCHED).unwrap();
+    let mut be = GateBackend::spawn(cmd).unwrap();
     let mut j = Judge { canary, alice: nobody(), reached: None, task: None };
-    run(&mut be, &mut Pos::new(1), None, None, None, Some(&mut j), Instant::now() + Duration::from_secs(30), &mut Vec::new()).unwrap();
+    let end = run(&mut be, &mut Pos::new(1), None, None, None, Some(&mut j), Instant::now() + Duration::from_secs(30), &mut Vec::new()).unwrap();
+    assert!(matches!(end, End::Exited), "{end:?}");
     assert!(be.child().wait().unwrap().success());
     j.reached.expect("final hold probed")
 }
@@ -113,15 +113,14 @@ fn root_sut_attacker_nobody() {
 #[ignore]
 fn read_before_catches_searchable_gate() {
     let c = Canary::create(203).unwrap();
-    read_before(&c, &nobody()).unwrap();
+    assert!(read_before(&c, &nobody()).unwrap());
     fs::set_permissions(&c.dir, fs::Permissions::from_mode(0o711)).unwrap();
-    let e = read_before(&c, &nobody()).unwrap_err();
-    assert!(e.is::<SelfCheckFailed>(), "{e:#}");
+    assert!(!read_before(&c, &nobody()).unwrap(), "a searchable gate stopped her");
     // Unchanged again, or drop leaves it.
     fs::set_permissions(&c.dir, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// A SUT that sleeps past the deadline fails with `Deadline`, and the
+/// A SUT that sleeps past the deadline ends with `Deadline`, and the
 /// decisions made before it are kept.
 #[test]
 #[ignore]
@@ -129,10 +128,10 @@ fn deadline_keeps_log() {
     let c = Canary::create(205).unwrap();
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg("cat /dev/null; sleep 10");
-    let mut be = GateBackend::spawn(cmd, WATCHED).unwrap();
+    let mut be = GateBackend::spawn(cmd).unwrap();
     let mut j = Judge { canary: &c, alice: nobody(), reached: None, task: None };
     let mut log = Vec::new();
-    let e = run(&mut be, &mut Pos::new(1), None, None, None, Some(&mut j), Instant::now() + Duration::from_secs(2), &mut log).unwrap_err();
-    assert!(e.is::<Deadline>(), "{e:#}");
+    let end = run(&mut be, &mut Pos::new(1), None, None, None, Some(&mut j), Instant::now() + Duration::from_secs(2), &mut log).unwrap();
+    assert!(matches!(end, End::Deadline), "{end:?}");
     assert!(log.iter().any(|d| d.id.path.as_deref() == Some(Path::new("/dev/null"))), "{log:?}");
 }
