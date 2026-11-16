@@ -8,7 +8,7 @@ use common::{go_bin, trigger_file};
 
 use scx_crfuzz::backend::{Event, GateBackend, Poll};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -82,7 +82,6 @@ struct Hold {
     /// Bytes from notification receipt to tree gate + settle (the residual window).
     residual: u64,
     leak: u64,
-    tree: usize,
 }
 
 /// Hold the trigger for 300 ms, with or without the tree gate, then release.
@@ -95,12 +94,11 @@ fn hold(be: &mut GateBackend, bytes: &AtomicU64, trigger: &Path, tree: bool) -> 
     sleep(ms(50));
     let residual = bytes.load(Ordering::Relaxed) - at_recv;
     let leak = bytes_over(bytes, ms(300));
-    let tree_size = be.tree().len();
     be.release(&ev).unwrap();
     if tree {
         be.ungate_tree().unwrap();
     }
-    Hold { residual, leak, tree: tree_size }
+    Hold { residual, leak }
 }
 
 fn check(be: &mut GateBackend, bytes: &AtomicU64, trigger: &Path, label: &str) {
@@ -111,11 +109,10 @@ fn check(be: &mut GateBackend, bytes: &AtomicU64, trigger: &Path, label: &str) {
     let after = pump(be, bytes, ms(300));
     eprintln!(
         "{label}: bytes/300ms free {free}; seccomp-only hold leak {}; tree hold leaks {:?} \
-         (residual window {:?}, tree sizes {:?}); after {after}",
+         (residual window {:?}); after {after}",
         control.leak,
         gated.iter().map(|h| h.leak).collect::<Vec<_>>(),
         gated.iter().map(|h| h.residual).collect::<Vec<_>>(),
-        gated.iter().map(|h| h.tree).collect::<Vec<_>>(),
     );
     assert!(control.leak > 0, "control: siblings should run under a seccomp-only hold");
     assert!(gated.iter().all(|h| h.leak == 0), "sibling bytes leaked during a tree hold");
@@ -133,7 +130,7 @@ fn tree_hold_stops_go_siblings() {
     check(&mut be, &bytes, &trigger, "go");
 }
 
-/// The tree is every process in the run cgroup: here the trapping `cat` and a
+/// The tree is every process forked below the root: here the trapping `cat` and a
 /// forked subshell writing to stdout are different tgids. The subshell loop is
 /// builtins only: an exec would trap on the loader's openat.
 #[test]
@@ -150,63 +147,72 @@ fn tree_hold_stops_sibling_processes() {
     check(&mut be, &bytes, &trigger, "sh tree");
 }
 
-/// runc moves `runc init` into the container cgroup, which crfuzz's targets
-/// place under ours.
-/// Here a subshell moves itself into a child cgroup and writes; the tree hold
-/// must still stop it, and Drop must remove both cgroups.
+/// runc moves `runc init` into the container's cgroup, wherever the runtime
+/// puts it. Here a subshell moves itself into another cgroup and writes; the
+/// tree hold must still stop it, and Drop must kill it there.
 #[test]
 #[ignore]
-fn tree_hold_stops_child_cgroup() {
+fn tree_hold_follows_a_process_to_another_cgroup() {
     let trigger = trigger_file("crfuzz_cg_trigger");
+    let cg = Path::new("/sys/fs/cgroup/crfuzz-test-moved");
+    let _ = std::fs::create_dir(cg);
     let script = format!(
-        "cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); mkdir $cg/ctr; \
-         (echo 0 > $cg/ctr/cgroup.procs; while :; do printf x; done) & \
-         while :; do cat {} >/dev/null; sleep 0.1; done",
+        "(echo 0 > {}/cgroup.procs; while :; do printf x; done) & while :; do cat {} >/dev/null; sleep 0.1; done",
+        cg.display(),
         trigger.display()
     );
     let mut cmd = Command::new("sh");
     cmd.args(["-c", &script]);
     let (mut be, bytes) = spawn_counted(cmd);
-    let pid = be.child().id();
-    let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
-    let run = PathBuf::from(format!("/sys/fs/cgroup{}", cg.trim().rsplit(':').next().unwrap()));
-    check(&mut be, &bytes, &trigger, "child cgroup");
-    assert!(run.join("ctr").exists(), "subshell never made its cgroup");
+    check(&mut be, &bytes, &trigger, "moved cgroup");
+    let procs = || std::fs::read_to_string(cg.join("cgroup.procs")).unwrap();
+    assert!(!procs().is_empty(), "the subshell never moved");
     drop(be);
-    assert!(!run.exists(), "run cgroup left behind");
+    assert!(procs().is_empty(), "Drop left a process of the tree alive: {}", procs());
+    std::fs::remove_dir(cg).unwrap();
 }
 
-/// At startup a dead crfuzz's run cgroup is killed and removed, even with its
-/// process still gated (the owner died in a tree hold); one whose owner is
-/// alive (here, us) is left alone.
+/// At startup the tree of a crfuzz that died (here by SIGKILL, so no Drop
+/// ran) is killed; a live owner's (ours) is left alone.
 #[test]
 #[ignore]
-fn sweep_removes_only_dead_owners_runs() {
-    use std::os::unix::process::ExitStatusExt;
-    let mut gone = Command::new("true").spawn().unwrap();
-    let dead = gone.id();
-    gone.wait().unwrap();
-    let root = Path::new("/sys/fs/cgroup/crfuzz");
-    let stale = root.join(format!("run-{dead}-1"));
-    let live = root.join(format!("run-{}-{}", std::process::id(), u32::MAX));
-    for cg in [&stale, &live] {
-        std::fs::create_dir_all(cg.join("sut")).unwrap();
-    }
-    // In SCHED_EXT, as the SUT is: the gate holds only its own tasks.
-    let mut sleeper = Command::new("sleep");
-    let param = libc::sched_param { sched_priority: 0 };
-    unsafe { std::os::unix::process::CommandExt::pre_exec(&mut sleeper, move || if libc::sched_setscheduler(0, 7, &param) == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }) };
-    let mut sleeper = sleeper.arg("60").spawn().unwrap();
-    std::fs::write(stale.join("sut/cgroup.procs"), sleeper.id().to_string()).unwrap();
-    // The dead owner's gate entry: forgotten, so no Drop clears it.
-    let gate = scx_crfuzz::gate::GateMap::open().unwrap();
-    gate.gate_tgid(sleeper.id()).unwrap();
-    gate.kick().unwrap();
-    std::mem::forget(gate);
+fn sweep_kills_only_dead_owners_runs() {
+    let d = Path::new("/tmp/crfuzz_sweep");
+    let _ = std::fs::remove_dir_all(d);
+    std::fs::create_dir(d).unwrap();
+    let pidfile = d.join("pid");
+    let script = format!("echo $$ > {}; exec sleep 60", pidfile.display());
+    let mut owner = Command::new(env!("CARGO_BIN_EXE_scx_crfuzz"))
+        .args(["run", d.join("out").to_str().unwrap(), "--seeds", "1", "--attacker", "65534:65534", "--", "sh", "-c", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    let sut = loop {
+        assert!(Instant::now() < end, "the SUT never started");
+        if let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+            break pid;
+        }
+        sleep(ms(50));
+    };
+    // Into its sleep: a syscall held when the listener closes fails, and
+    // `sleep` would die of it on its own.
+    sleep(ms(500));
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    let alive = |pid: u32| Path::new(&format!("/proc/{pid}")).exists();
+    assert!(alive(sut), "the SUT died with its owner: nothing to sweep");
+    let mut cmd = Command::new("sleep");
+    cmd.arg("60");
+    let mut live = GateBackend::spawn(cmd).unwrap();
     scx_crfuzz::backend::sweep();
-    let (stale_left, live_left) = (stale.exists(), live.exists());
-    let _ = (std::fs::remove_dir(live.join("sut")), std::fs::remove_dir(&live));
-    assert!(!stale_left, "stale run cgroup left behind");
-    assert_eq!(sleeper.wait().unwrap().signal(), Some(libc::SIGKILL), "stale run's process not killed");
-    assert!(live_left, "a live owner's run cgroup was swept");
+    assert!(!alive(sut), "a dead owner's SUT survived the sweep");
+    assert!(live.child().try_wait().unwrap().is_none(), "a live owner's SUT was swept");
+    for e in std::fs::read_dir("/var/lib/crfuzz").unwrap().flatten() {
+        if e.file_name().to_string_lossy().starts_with(&format!("canary-{}-", owner.id())) {
+            std::fs::remove_dir_all(e.path()).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(d).unwrap();
 }

@@ -1,4 +1,4 @@
-//! Discovery loop: wait for a complete frontier (no SUT thread running) up to
+//! Discovery loop: wait for a complete frontier (no SUT thread can run) up to
 //! a limit, let POS pick, fire the mutator, release, repeat until the SUT
 //! exits. With a judge, probe as alice at the final hold. Replaying, the
 //! recorded step is released instead of POS's pick.
@@ -31,9 +31,14 @@ pub struct Decision {
     /// The event's conflict keys, for its partial order. Inode
     /// numbers: this run only.
     pub keys: Keys,
-    /// Decided at the limit over an incomplete frontier; replay and the
-    /// determinism claim cover complete decisions only.
+    /// Decided at the limit over an incomplete frontier. The determinism
+    /// claim covers complete decisions only, and of those the ones no thread
+    /// slept through on a timer or on I/O from outside the tree: such a
+    /// thread is quiet at the decision and wakes on its own after it.
     pub partial: bool,
+    /// Threads asleep on a timer at this decision (`GateBackend::sleepers`).
+    /// Counted in unmutated runs only: a baseline's telemetry reports it.
+    pub sleepers: u32,
     /// The mutator fired at this hold: its exit status, or why it has none
     /// (a primitive failure, never a finding).
     pub mutation: Option<Result<ExitStatus, String>>,
@@ -42,7 +47,9 @@ pub struct Decision {
 /// Without `keys`: one line per decision in the printed log.
 impl std::fmt::Debug for Decision {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("Decision").field("id", &self.id).field("partial", &self.partial).field("mutation", &self.mutation).finish()
+        let mut d = f.debug_struct("Decision");
+        d.field("id", &self.id).field("partial", &self.partial);
+        d.field("sleepers", &self.sleepers).field("mutation", &self.mutation).finish()
     }
 }
 
@@ -82,7 +89,7 @@ pub struct Judge<'a> {
     pub alice: Alice,
     /// What the probe found. None: no final hold (the SUT died by a signal).
     pub reached: Option<Vec<Finding>>,
-    /// The probed task: `(tid, tgid, thread)`, to normalize its handles.
+    /// The probed task: `(tid, tgid, process)`, to normalize its handles.
     pub task: Option<(u32, u32, String)>,
 }
 
@@ -153,18 +160,21 @@ pub fn run(
     let mut footprint = BTreeSet::new();
     let mut held: Vec<Event> = Vec::new();
     let mut ids: Vec<EventId> = Vec::new();
+    // The last frontier was left as it was (nothing to pick).
+    let mut idle = false;
     loop {
         // Never under a tree hold: each iteration ungates before the next.
         if stopped() {
             return Ok(End::Interrupted);
         }
-        let complete = match wait_frontier(be, &mut held, deadline.min(Instant::now() + LIMIT))? {
+        let complete = match wait_frontier(be, &mut held, deadline.min(Instant::now() + LIMIT), idle)? {
             Frontier::Exited => {
                 let left = replay.filter(|r| r.diverged.is_none()).and_then(|r| r.fixed.finish().err().and_then(|d| r.left(d)));
                 return Ok(left.map_or(End::Exited, End::Diverged));
             }
             f => f == Frontier::Complete,
         };
+        idle = true;
         // Checked after the wait, not before: a frontier cut short by the
         // deadline is never picked from (a replay would read it as a divergence).
         if Instant::now() >= deadline {
@@ -173,12 +183,12 @@ pub fn run(
         // Name events once, as they arrive: occurrence counts history.
         let canary = judge.as_deref().map(|j| j.canary.dir.as_path());
         ids.extend(held[ids.len()..].iter().map(|e| {
-            let path = e.path.as_deref().map(|p| name::event_path(p, canary, be.cgroup()));
-            pos.id(&e.thread, e.nr, path)
+            let path = e.path.as_deref().map(|p| name::event_path(p, canary));
+            pos.id(&e.process, e.nr, path)
         }));
-        // A tree-gated thread already blocked reads `S`, so the readout
-        // can look complete when it isn't.
-        if !be.tree().is_empty() {
+        // A gated thread already blocked is not busy, so the tree can read
+        // quiet when it isn't.
+        if be.gated() {
             bail!("POS decision under a tree hold");
         }
         let ready: Vec<_> = ids.iter().zip(&held).map(|(id, e)| (id, &e.keys)).collect();
@@ -210,15 +220,14 @@ pub fn run(
         let Some(i) = pick else { continue };
         let (ev, id) = (held.remove(i), ids.remove(i));
         let seed = pos.event_seed(&id);
-        // The target by what it does, not by thread: under M:N runtimes (Go) a
-        // thread's name changes between runs. The first such hold fires, once.
+        // The target in any process: windows are one per (syscall, path,
+        // occurrence). The first such hold fires, once.
         let hit = !ev.keys.all
             && target.is_some_and(|t| (t.nr, &t.path, t.n) == (id.nr, &id.path, id.n) && !log.iter().any(|d| d.mutation.is_some()));
+        let sleepers = if mutator.is_none() { be.sleepers(&held) } else { 0 };
         // Logged at once: every ending from here (deadline, invalid run,
         // error) keeps it.
-        log.push(Decision { id, keys: ev.keys.clone(), partial: !complete, mutation: None });
-        // The whole tree stays put while the mutator runs; answer before
-        // ungating, so a signal can't restart the syscall mid-release.
+        log.push(Decision { id, keys: ev.keys.clone(), partial: !complete, sleepers, mutation: None });
         if let Some(p) = &ev.path {
             // Dirfd-relative: the fd number means nothing at the final hold.
             if p.is_absolute() || ev.dirfd.is_none() {
@@ -226,6 +235,7 @@ pub fn run(
             }
         }
         let judged = judge.as_deref().map(|j| (&j.alice, j.canary));
+        // The whole tree stays put while the mutator runs.
         let mutated = match mutator {
             Some(prog) if ev.path.is_some() && fire.unwrap_or(hit) => {
                 be.gate_tree()?;
@@ -249,16 +259,19 @@ pub fn run(
         let probe = match judge.as_deref_mut() {
             Some(j) if ev.nr == libc::SYS_exit_group && ev.tgid == root => {
                 be.gate_tree()?;
-                j.task = Some((ev.tid, ev.tgid, ev.thread.clone()));
+                j.task = Some((ev.tid, ev.tgid, ev.process.clone()));
                 Some(be.probe(&ev, &j.alice, j.canary, &footprint, MUTATOR_TIMEOUT))
             }
             _ => None,
         };
+        // Answer before ungating, so a signal can't restart the syscall
+        // mid-release.
         let released = be.release(&ev);
         if mutated || probe.is_some() {
             be.ungate_tree()?;
         }
         released?;
+        idle = false;
         // A failed probe: the run is invalid.
         match (probe.transpose()?, judge.as_deref_mut()) {
             (Some(Some(found)), Some(j)) => j.reached = Some(found),

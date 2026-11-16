@@ -129,15 +129,17 @@ fn isolate(dirs: &[PathBuf], work: &Path) -> Result<()> {
     std::env::set_current_dir(&cwd).with_context(|| cwd.display().to_string())
 }
 
-/// Telemetry from a baseline: the size of one run and how much there is for
-/// the mutator to hit. It sizes the campaign's estimate.
+/// Telemetry from a baseline: the size of one run, how much of it the
+/// determinism claim leaves out (partial decisions, and those taken while a
+/// thread slept on a timer), and how much there is for the mutator to hit.
 pub fn telemetry(log: &[Decision], targets: usize, secs: f64) -> String {
-    let threads: BTreeSet<&str> = log.iter().map(|d| d.id.thread.as_str()).collect();
+    let procs: BTreeSet<&str> = log.iter().map(|d| d.id.process.as_str()).collect();
     format!(
-        "telemetry: {} decisions ({} partial), {} threads, {targets} mutation targets, {secs:.1}s",
+        "telemetry: {} decisions ({} partial, {} over a timed sleep), {} processes, {targets} mutation targets, {secs:.1}s",
         log.len(),
         log.iter().filter(|d| d.partial).count(),
-        threads.len(),
+        log.iter().filter(|d| d.sleepers > 0).count(),
+        procs.len(),
     )
 }
 
@@ -235,8 +237,8 @@ impl Runner {
             log.iter().try_for_each(|d| writeln!(so, "{d:?}"))?;
         }
         let status = if matches!(end, Ok(End::Exited)) { Some(be.child().wait()?) } else { None };
-        // Clears gates and cgroup, ending what is left of the SUT, before the
-        // write half: a gated task may serve a mount inside the canary.
+        // Ends what is left of the SUT, before the write half: a gated task
+        // may serve a mount inside the canary.
         drop(be);
         // Ended without the final hold (no read half), or judged on the write half alone.
         let deadline = match end? {
@@ -275,9 +277,9 @@ impl Runner {
     }
 
     /// A seed's baseline, which must leak nothing. Its targets are its holds
-    /// with a known path, decoded keys and a named thread (not `?tid`), with
-    /// `--scope` only those under a scope directory, one per (syscall, path,
-    /// occurrence): the engine matches those in any thread. None: stopped.
+    /// with a known path, decoded keys and a named process, with `--scope`
+    /// only those under a scope directory, one per (syscall, path,
+    /// occurrence): the engine matches those in any process. None: stopped.
     pub fn baseline(&self, seed: u64, out: Option<&Path>, log: &mut Vec<Decision>) -> Result<Option<Baseline>> {
         log.clear();
         let t = Instant::now();
@@ -291,7 +293,7 @@ impl Runner {
         let mut seen = HashSet::new();
         let targets = log
             .iter()
-            .filter(|d| d.id.path.as_deref().is_some_and(in_scope) && !d.keys.all && !d.id.thread.starts_with('?'))
+            .filter(|d| d.id.path.as_deref().is_some_and(in_scope) && !d.keys.all && !d.id.process.starts_with('?'))
             .filter(|d| seen.insert((d.id.nr, d.id.path.clone(), d.id.n)))
             .map(|d| d.id.clone())
             .collect();

@@ -1,34 +1,183 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * crfuzz_gate: a sched_ext scheduler that refuses to run gated tasks.
- * A gated tgid is enqueued on HOLD_DSQ, which the kernel never drains, until
- * it is ungated; kick_all catches tasks already on a CPU. Only tasks enrolled
- * in SCHED_EXT are affected.
+ * crfuzz_gate: a sched_ext scheduler that knows each run's task tree.
+ *
+ * A run's tree is its root, which joins before it enrolls in SCHED_EXT, and
+ * every process forked below it, whatever cgroup, session or namespace it
+ * moves to. For that tree the scheduler
+ *   - counts the tasks that can run (`busy`): zero is the engine's frontier;
+ *   - refuses to run any of them while the run is gated: they are enqueued
+ *     on HOLD_DSQ, which the kernel never drains;
+ *   - names each process by its place in the creation tree.
+ * Only tasks enrolled in SCHED_EXT are scheduled here.
  */
 #include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 
-#define HOLD_DSQ	0x0c4f
-#define MAX_GATES	4096
+#define HOLD_DSQ		0x0c4f
+#define MAX_RUNS		1024
+#define MAX_PROCS		65536
+#define MAX_DEPTH		16
 
 UEI_DEFINE(uei);
 
-/* Gate entries: key tgid, value the owning run's epoch. */
+/* Userspace only reads and deletes these: every write is a program's. */
+struct run {
+	u32 owner;	/* the crfuzz that made it; dead: the run is stale */
+	u32 gated;
+	u32 escaped;	/* part of the tree is out of the gate's reach */
+	u32 pad;
+	s64 busy;	/* tasks runnable or being woken */
+};
+
+/* Key: the run's id, from new_run. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_GATES);
+	__uint(max_entries, MAX_RUNS);
 	__type(key, u32);
-	__type(value, u32);
-} gate_tgid SEC(".maps");
+	__type(value, struct run);
+} runs SEC(".maps");
 
-u32 epoch_seq;
+u32 run_seq;
 
-static bool is_held(struct task_struct *p)
+/*
+ * A process of a run's tree. Its name is its path from the root: the
+ * idx[0]-th process the root forked, that one's idx[1]-th, and so on.
+ * depth > MAX_DEPTH: too deep to name.
+ */
+struct proc {
+	u32 run;
+	u32 kids;	/* processes it has forked */
+	u32 depth;
+	u32 idx[MAX_DEPTH];
+};
+
+/*
+ * Key: tgid. Membership is per process, so threads the kernel makes without
+ * a fork event (io_uring workers) are in.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PROCS);
+	__type(key, u32);
+	__type(value, struct proc);
+} procs SEC(".maps");
+
+/* What the syscall programs are run on. */
+struct run_arg {
+	u32 run;
+	u32 on;
+};
+
+static struct run *run_of(struct task_struct *p)
+{
+	u32 tgid = p->tgid;
+	struct proc *pr = bpf_map_lookup_elem(&procs, &tgid);
+
+	return pr ? bpf_map_lookup_elem(&runs, &pr->run) : NULL;
+}
+
+static void busy(struct task_struct *p, s64 by)
+{
+	struct run *r = run_of(p);
+
+	if (r)
+		__sync_fetch_and_add(&r->busy, by);
+}
+
+/*
+ * `busy` counts a task from the moment something starts to wake it until it
+ * is off its runqueue again. runnable/quiescent alone would miss a wakeup in
+ * flight: one queued to another CPU reaches runnable only when that CPU
+ * takes the IPI, and the waker can be asleep by then. sched_waking fires in
+ * the waker, sched_wakeup once the wakee is on its runqueue (after runnable,
+ * if there is one), so the two cover exactly that gap.
+ */
+/* ponytail: changing a queued task's class, priority or affinity dequeues
+ * and re-enqueues it, so the count passes through zero for an instant; the
+ * frontier reads it twice around a drain. Skip such pairs by their enqueue
+ * and dequeue flags if a SUT that does this to its running threads ever
+ * reads quiet. */
+void BPF_STRUCT_OPS(crfuzz_gate_runnable, struct task_struct *p, u64 enq_flags)
+{
+	busy(p, 1);
+}
+
+void BPF_STRUCT_OPS(crfuzz_gate_quiescent, struct task_struct *p, u64 deq_flags)
+{
+	busy(p, -1);
+}
+
+SEC("tp_btf/sched_waking")
+int BPF_PROG(waking, struct task_struct *p)
+{
+	busy(p, 1);
+	return 0;
+}
+
+SEC("tp_btf/sched_wakeup")
+int BPF_PROG(woken, struct task_struct *p)
+{
+	busy(p, -1);
+	return 0;
+}
+
+/*
+ * A process forked in a run's tree joins it, before it first runs, named
+ * after its parent. Threads need nothing: their process is already in.
+ */
+SEC("tp_btf/sched_process_fork")
+int BPF_PROG(forked, struct task_struct *parent, struct task_struct *child)
+{
+	u32 ptgid = parent->tgid, tgid = child->tgid, depth;
+	struct proc *pp, *cp;
+	struct run *r;
+
+	if (child->pid != tgid)
+		return 0;
+	pp = bpf_map_lookup_elem(&procs, &ptgid);
+	if (!pp)
+		return 0;
+	/* The parent's run and path, then our own step. */
+	if (bpf_map_update_elem(&procs, &tgid, pp, BPF_ANY) ||
+	    !(cp = bpf_map_lookup_elem(&procs, &tgid))) {
+		/* Table full: the child runs untracked. */
+		r = bpf_map_lookup_elem(&runs, &pp->run);
+		if (r)
+			r->escaped = 1;
+		return 0;
+	}
+	depth = cp->depth;
+	if (depth < MAX_DEPTH)
+		cp->idx[depth] = __sync_fetch_and_add(&pp->kids, 1);
+	cp->depth = depth + 1;
+	cp->kids = 0;
+	return 0;
+}
+
+/*
+ * The process is gone once its leader is freed: every thread is dead by
+ * then. An exec from another thread hands the leader's pid to that thread
+ * first, so the old leader no longer matches.
+ */
+/* ponytail: a tgid reused before the RCU-delayed free of its last owner
+ * loses the newcomer's entry; compare start_time if pids ever wrap that fast. */
+SEC("tp_btf/sched_process_free")
+int BPF_PROG(freed, struct task_struct *p)
 {
 	u32 tgid = p->tgid;
 
-	return bpf_map_lookup_elem(&gate_tgid, &tgid);
+	if (p->pid == tgid)
+		bpf_map_delete_elem(&procs, &tgid);
+	return 0;
+}
+
+static bool is_held(struct task_struct *p)
+{
+	struct run *r = run_of(p);
+
+	return r && r->gated;
 }
 
 /* Must exist and insert nothing, or wakeups to idle CPUs skip enqueue. */
@@ -57,15 +206,6 @@ void BPF_STRUCT_OPS(crfuzz_gate_dispatch, s32 cpu, struct task_struct *prev)
 	}
 }
 
-void BPF_STRUCT_OPS(crfuzz_gate_exit_task, struct task_struct *p,
-		    struct scx_exit_task_args *args)
-{
-	u32 tgid = p->tgid;
-
-	if (p->pid == tgid)
-		bpf_map_delete_elem(&gate_tgid, &tgid);
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(crfuzz_gate_init)
 {
 	return scx_bpf_create_dsq(HOLD_DSQ, -1);
@@ -76,23 +216,46 @@ void BPF_STRUCT_OPS(crfuzz_gate_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
-/* Preempt every CPU so on-CPU tasks re-enqueue and dispatch runs. Returns nr. */
+/* A new run, owned by the caller: its id, or 0 if the table is full. */
 SEC("syscall")
-int kick_all(void *ctx)
+int new_run(void *ctx)
 {
-	u32 nr = scx_bpf_nr_cpu_ids();
-	s32 cpu;
+	struct run r = { .owner = bpf_get_current_pid_tgid() >> 32 };
+	u32 id = __sync_add_and_fetch(&run_seq, 1);
 
-	bpf_for(cpu, 0, nr)
-		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-	return nr;
+	return bpf_map_update_elem(&runs, &id, &r, BPF_NOEXIST) ? 0 : id;
 }
 
-/* Minted in BPF so two runs can't draw the same epoch. */
+/*
+ * The caller becomes the root of ctx->run's tree. Called before it enrolls
+ * in SCHED_EXT, so every runnable transition it makes there is counted.
+ */
 SEC("syscall")
-int new_epoch(void *ctx)
+int join(struct run_arg *ctx)
 {
-	return __sync_add_and_fetch(&epoch_seq, 1);
+	struct proc p = { .run = ctx->run };
+	u32 tgid = bpf_get_current_pid_tgid() >> 32;
+
+	return bpf_map_update_elem(&procs, &tgid, &p, BPF_ANY);
+}
+
+/*
+ * Gate or ungate ctx->run, then preempt every CPU, so its on-CPU tasks pass
+ * through enqueue and dispatch runs. The preemption is an IPI: not a barrier.
+ */
+SEC("syscall")
+int set_gate(struct run_arg *ctx)
+{
+	u32 id = ctx->run, nr = scx_bpf_nr_cpu_ids();
+	struct run *r = bpf_map_lookup_elem(&runs, &id);
+	s32 cpu;
+
+	if (!r)
+		return 1;
+	r->gated = ctx->on;
+	bpf_for(cpu, 0, nr)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	return 0;
 }
 
 /*
@@ -103,7 +266,8 @@ SCX_OPS_DEFINE(crfuzz_gate_ops,
 	       .select_cpu	= (void *)crfuzz_gate_select_cpu,
 	       .enqueue		= (void *)crfuzz_gate_enqueue,
 	       .dispatch	= (void *)crfuzz_gate_dispatch,
-	       .exit_task	= (void *)crfuzz_gate_exit_task,
+	       .runnable	= (void *)crfuzz_gate_runnable,
+	       .quiescent	= (void *)crfuzz_gate_quiescent,
 	       .init		= (void *)crfuzz_gate_init,
 	       .exit		= (void *)crfuzz_gate_exit,
 	       .flags		= SCX_OPS_SWITCH_PARTIAL | SCX_OPS_ENQ_LAST,

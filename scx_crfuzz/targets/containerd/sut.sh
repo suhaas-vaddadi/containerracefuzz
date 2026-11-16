@@ -24,7 +24,9 @@ while IFS= read -r l <&3; do
 done
 [ -n "$up" ] || { echo "containerd exited before booting" >&2; exit 1; }
 cat <&3 >&4 &
-# --cgroup: beside ours (run-<pid>-<epoch>/sut) under the run cgroup, so runc init stays tracked.
-cg=$(cut -d: -f3 /proc/self/cgroup)
-"$CRFUZZ_CTR" --address "$d/sock" run --rm --cgroup "${cg%/*}/busy" --runc-root "$d/runc" --rootfs "$CRFUZZ_ROOTFS" busy \
+# A cgroup of this worker's own (the mount namespace is the worker's): one
+# name for all would be shared at --jobs > 1, one per run would pile up.
+ns=$(readlink /proc/self/ns/mnt) # mnt:[4026531841]
+ns=${ns#mnt:?}
+"$CRFUZZ_CTR" --address "$d/sock" run --rm --cgroup "/crfuzz-busy-${ns%?}" --runc-root "$d/runc" --rootfs "$CRFUZZ_ROOTFS" busy \
 	/bin/busybox sh -c '/bin/busybox echo busy; /bin/busybox sleep 0.5'

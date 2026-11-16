@@ -3,11 +3,11 @@
 //! Becoming alice needs Linux 5.11 (close_range CLOEXEC) and openat2 (5.6);
 //! older kernels fail every mutation and probe, so every judged run is invalid.
 
+use crate::gate::GateMap;
 use crate::oracle::{self, Alice, Canary, Finding};
 use crate::pos::{Key, Keys};
 use anyhow::{bail, ensure, Context, Result};
-use crate::gate::GateMap;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File};
 use std::io::{Error, Read};
@@ -22,27 +22,18 @@ use std::time::{Duration, Instant};
 
 const SCHED_EXT: i32 = 7;
 
-// The watch set is the `*at` family, which is every path syscall there is on
-// aarch64. x86_64 also has the legacy ones (`open`, `stat`, `rename`,
+// The watch set below is the `*at` family, which is every path syscall there
+// is on aarch64. x86_64 also has the legacy ones (`open`, `stat`, `rename`,
 // `unlink`, `mkdir`, ...) and its libcs use them, so there the filter would
 // let most path work through unseen.
 #[cfg(not(target_arch = "aarch64"))]
-compile_error!("scx_crfuzz holds only the *at path syscalls, which is all of them on aarch64 alone: add the legacy ones to the watch set and path_args before building for another architecture");
-
-/// Syscalls that create a task; always watched, to name threads by their
-/// place in the creation tree.
-const CLONES: &[i64] = &[libc::SYS_clone, libc::SYS_clone3];
-/// A released clone with no child in the cgroup by then failed.
-const CLONE_WAIT: Duration = Duration::from_millis(100);
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/crfuzz";
-/// A trapped clone: (parent tid, instruction pointer, args).
-type Call = (u32, u64, [u64; 6]);
+compile_error!("scx_crfuzz holds only the *at path syscalls, which is all of them on aarch64 alone: add the legacy ones to WATCHED and path_args before building for another architecture");
 
 const AUDIT_ARCH: u32 = 0xC000_00B7;
 
-/// The syscalls held, besides `CLONES`: the path syscalls `observe` decodes,
-/// and `exit_group`, the final hold (the probe's; its keys are `all`, so no
-/// mutator fires there).
+/// The syscalls held: the path syscalls `observe` decodes, and `exit_group`,
+/// the final hold (the probe's; its keys are `all`, so no mutator fires
+/// there).
 // ponytail: not held: execve and execveat, mount, open_tree, move_mount,
 // fchmodat2 (glibc 2.39's fchmodat with flags), utimensat, truncate, the
 // xattr family. The preceding path syscall is still a hold just before one;
@@ -74,10 +65,8 @@ pub struct Event {
     pub id: u64,
     pub tid: u32,
     pub tgid: u32,
-    /// The thread's place in the creation tree (stable across runs, unlike a
-    /// tid): the root is `0`, the
-    /// k-th task a thread creates is `<its name>/k`. `?<tid>` if unknown.
-    pub thread: String,
+    /// `GateMap::name` of its process; `?<tgid>` if it has none.
+    pub process: String,
     pub nr: i64,
     /// Best-effort: a running sibling can rewrite it after the read.
     pub path: Option<PathBuf>,
@@ -101,39 +90,19 @@ pub struct GateBackend {
     gate: GateMap,
     child: Child,
     notify: OwnedFd,
-    cgroup: PathBuf,
-    tree_gated: BTreeSet<u32>,
-    /// tid -> (name, tasks it has created so far).
-    names: HashMap<u32, (String, u32)>,
-    /// Held clones, (notification id, call), released one at a time.
-    clones: VecDeque<(u64, Call)>,
-    /// The released clone: its call, its child's name (None: unknown
-    /// parent), the cgroup's tids before, released at.
-    in_flight: Option<(Call, Option<String>, BTreeSet<u32>, Instant)>,
-    /// tid -> its last released clone, until it makes a child seen or the
-    /// thread traps anything else: the same call next is that attempt again.
-    retry: HashMap<u32, Call>,
+    gated: bool,
 }
 
 impl GateBackend {
-    /// Spawn `cmd` as the SUT: in the run cgroup, enrolled in SCHED_EXT, with
-    /// its `CLONES` and `WATCHED` syscalls trapping to us. Fails if the gate daemon isn't up
-    /// (never fall back to seccomp-only: without the gate the tree can't be
-    /// stopped while the mutator runs).
+    /// Spawn `cmd` as the SUT: the root of a fresh run's tree in the gate
+    /// scheduler, enrolled in SCHED_EXT, its `WATCHED` syscalls trapping to
+    /// us. Fails if the gate scheduler isn't up (never fall back to
+    /// seccomp-only: without the gate the tree can't be stopped while the
+    /// mutator runs).
     pub fn spawn(mut cmd: Command) -> Result<Self> {
-        let watched: Vec<i64> = CLONES.iter().chain(WATCHED).copied().collect();
         let gate = GateMap::open()?;
-        // `run-<pid>-<epoch>`: epochs restart with the daemon, so the pid keeps
-        // a dead crfuzz's leftover run (see `sweep`) from being reused.
-        let cgroup = PathBuf::from(format!("{CGROUP_ROOT}/run-{}-{}", std::process::id(), gate.epoch));
-        // The SUT in a leaf, `run/sut`: cgroup v2 forbids processes in a cgroup
-        // whose children have controllers, so a container cgroup can then sit
-        // beside it under `run` (runc's `--cgroup`), tracked with the tree.
-        // create_dir: an existing run cgroup is an error, never reused.
-        fs::create_dir_all(CGROUP_ROOT).with_context(|| CGROUP_ROOT)?;
-        fs::create_dir(&cgroup).and_then(|_| fs::create_dir(cgroup.join("sut"))).with_context(|| cgroup.display().to_string())?;
-        let procs = File::options().write(true).open(cgroup.join("sut/cgroup.procs"))?;
-        let filter = notify_filter(&watched);
+        let filter = notify_filter(WATCHED);
+        let join = gate.joiner();
 
         let mut socks = [0; 2];
         let flags = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
@@ -141,20 +110,19 @@ impl GateBackend {
             return Err(Error::last_os_error().into());
         }
         let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(socks[0]), OwnedFd::from_raw_fd(socks[1])) };
-        let (procs_fd, sock_fd) = (procs.as_raw_fd(), theirs.as_raw_fd());
+        let sock_fd = theirs.as_raw_fd();
 
         // Between fork and exec: raw syscalls only, no allocation.
         unsafe {
             cmd.pre_exec(move || {
-                // Order matters: the run cgroup first, so everything the SUT
-                // forks is tracked; the filter last. No NO_NEW_PRIVS: root
-                // may install a filter without it, and the SUT would hand it
-                // down to everything it execs (no setuid or file
-                // capabilities, restricted LSM transitions), which is not how
-                // it runs outside crfuzz.
-                if libc::write(procs_fd, b"0".as_ptr().cast(), 1) != 1 {
-                    return Err(Error::last_os_error());
-                }
+                // Order matters: the run first, so the scheduler counts us
+                // from our first moment in SCHED_EXT and everything we fork
+                // is tracked; the filter last. No NO_NEW_PRIVS: root may
+                // install a filter without it, and the SUT would hand it down
+                // to everything it execs (no setuid or file capabilities,
+                // restricted LSM transitions), which is not how it runs
+                // outside crfuzz.
+                join()?;
                 let param = libc::sched_param { sched_priority: 0 };
                 if libc::sched_setscheduler(0, SCHED_EXT, &param) != 0 {
                     return Err(Error::last_os_error());
@@ -183,48 +151,27 @@ impl GateBackend {
         drop(theirs);
         let child = child.context("spawn SUT")?;
         let notify = recv_fd(ours.as_raw_fd()).context("receive seccomp listener")?;
-        let names = HashMap::from([(child.id(), ("0".into(), 0))]);
-        Ok(Self {
-            gate,
-            child,
-            notify,
-            cgroup,
-            tree_gated: BTreeSet::new(),
-            names,
-            clones: VecDeque::new(),
-            in_flight: None,
-            retry: HashMap::new(),
-        })
+        Ok(Self { gate, child, notify, gated: false })
     }
 
     pub fn child(&mut self) -> &mut Child {
         &mut self.child
     }
 
-    /// The run cgroup; the SUT tree lives in it and its children.
-    pub fn cgroup(&self) -> &Path {
-        &self.cgroup
+    /// The tree is under a hold (`gate_tree`).
+    pub fn gated(&self) -> bool {
+        self.gated
     }
 
-    /// A clone is held or awaiting its child. Its parent reads as asleep, but
-    /// its next syscall isn't in the frontier yet.
-    pub fn clones_pending(&self) -> bool {
-        !self.clones.is_empty() || self.in_flight.is_some()
-    }
-
-    /// Tgids currently gated by `gate_tree`.
-    pub fn tree(&self) -> &BTreeSet<u32> {
-        &self.tree_gated
+    /// No task of the SUT tree can run (`GateMap::quiet`).
+    pub fn quiet(&self) -> Result<bool> {
+        self.gate.quiet()
     }
 
     /// Wait up to `timeout` for held syscalls; returns every one ready now.
-    /// Clones never show up: they touch no path, so they conflict with
-    /// nothing and are released here, one at a time to name the child.
     pub fn poll(&mut self, timeout: Duration) -> Result<Poll> {
-        self.advance_clones()?;
         let mut events = Vec::new();
-        // While a clone is in flight, come back soon to attribute its child.
-        let mut wait = if self.in_flight.is_some() { 1 } else { timeout.as_millis() as i32 };
+        let mut wait = timeout.as_millis() as i32;
         loop {
             let mut pfd = libc::pollfd { fd: self.notify.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             if unsafe { libc::poll(&mut pfd, 1, wait) } < 0 {
@@ -251,77 +198,10 @@ impl GateBackend {
             }
             break;
         }
-        self.advance_clones()?;
         Ok(if events.is_empty() { Poll::Idle } else { Poll::Events(events) })
     }
 
-    /// Attribute the in-flight clone's child, then release the next held clone.
-    fn advance_clones(&mut self) -> Result<()> {
-        loop {
-            if let Some((call, name, before, at)) = &self.in_flight {
-                let new: Vec<u32> = self.cgroup_ids("cgroup.threads")?.difference(before).copied().collect();
-                if !new.is_empty() {
-                    self.retry.remove(&call.0);
-                }
-                match new[..] {
-                    // The parent trapped another clone, so this one returned,
-                    // without a child. Move on now: if it's a restart
-                    // (ERESTARTNOINTR), holding it for CLONE_WAIT lets the next
-                    // signal land too (Go's sysmon sends SIGURG every ~10 ms to
-                    // a thread in its raw vfork) and the parent restarts forever.
-                    [] if self.clones.iter().any(|c| c.1 .0 == call.0) => {}
-                    [] if at.elapsed() < CLONE_WAIT => return Ok(()),
-                    // Unknown parent: the child stays unknown too.
-                    [child] => {
-                        self.retry.remove(&child);
-                        if let Some(name) = name {
-                            self.names.insert(child, (name.clone(), 0));
-                        }
-                    }
-                    // [] past CLONE_WAIT: failed, or the child already exited.
-                    // Several: only clones make tasks and all are held, so
-                    // none; leave them unnamed rather than guess.
-                    // ponytail: a child that shows up after CLONE_WAIT lands
-                    // in the next clone's window and, if that clone's child
-                    // never shows, takes its name; and the parent's next
-                    // identical clone reads as a redo, so its child reuses this
-                    // index. Track unseen clones if parents stall that long.
-                    _ => {}
-                }
-                self.in_flight = None;
-            }
-            let Some((id, call)) = self.clones.pop_front() else { return Ok(()) };
-            let before = self.cgroup_ids("cgroup.threads")?;
-            // A dead thread's tid can be reused by a new one; drop its name so
-            // the newcomer never inherits it.
-            self.names.retain(|t, _| before.contains(t));
-            self.retry.retain(|t, _| before.contains(t));
-            match notif_continue(self.notify.as_raw_fd(), id) {
-                // The index counts clone attempts, so a failed clone still
-                // uses its index. A childless clone redone as the parent's very
-                // next trap is the same attempt: a signal restart
-                // (ERESTARTNOINTR) or a retry (EAGAIN). That is decided by
-                // the parent's syscall order, not by when the redo traps, so
-                // names stay stable.
-                // ponytail: a child that exits before we look reads as no
-                // child, so an identical clone right after it (no watched
-                // syscall between) shares its index, e.g. a pthread_create
-                // loop of short-lived compute threads (glibc's clone3 args
-                // repeat; mmap isn't watched); watch exit to see it.
-                Ok(()) => {
-                    let again = self.retry.insert(call.0, call) == Some(call);
-                    let name = self.names.get_mut(&call.0).map(|(name, kids)| {
-                        *kids += !again as u32;
-                        format!("{name}/{}", *kids - 1)
-                    });
-                    self.in_flight = Some((call, name, before, Instant::now()));
-                }
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {} // parent died while held
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-
+    /// The next trapped syscall: None if its task is gone.
     fn recv(&mut self) -> Result<Option<Event>> {
         let req = match notif_recv(self.notify.as_raw_fd()) {
             Ok(req) => req,
@@ -329,28 +209,18 @@ impl GateBackend {
             Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::EINTR)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let (tid, nr) = (req.pid, req.data.nr as i64);
-        if CLONES.contains(&nr) {
-            self.clones.push_back((req.id, (tid, req.data.instruction_pointer, req.data.args)));
-            return Ok(None);
-        }
-        self.retry.remove(&tid);
-        // A child of the in-flight clone can trap before we've seen it appear.
-        // Don't fail here: req.id exists nowhere else, so its thread would
-        // stay parked for good. The error resurfaces at the next poll.
-        if !self.names.contains_key(&tid) {
-            let _ = self.advance_clones();
-        }
-        let (path, keys) = observe(tid, nr, &req.data.args);
+        let (tid, nr, args) = (req.pid, req.data.nr as i64, req.data.args);
+        let (path, keys) = observe(tid, nr, &args);
         let tgid = read_tgid(tid);
         // Only a still-valid id proves tid and bytes belonged to the notifying
         // task (it may have died and its tid been reused).
         if !self.id_valid(req.id) {
             return Ok(None);
         }
-        let thread = self.names.get(&tid).map_or_else(|| format!("?{tid}"), |n| n.0.clone());
-        let dirfd = path_args(nr).first().and_then(|a| a.0).map(|d| req.data.args[d] as i32).filter(|&fd| fd != libc::AT_FDCWD);
-        Ok(Some(Event { id: req.id, tid, tgid: tgid?, thread, nr, path, dirfd, keys, args: req.data.args }))
+        let tgid = tgid?;
+        let process = self.gate.name(tgid).unwrap_or_else(|| format!("?{tgid}"));
+        let dirfd = path_args(nr).first().and_then(|a| a.0).map(|d| args[d] as i32).filter(|&fd| fd != libc::AT_FDCWD);
+        Ok(Some(Event { id: req.id, tid, tgid, process, nr, path, dirfd, keys, args }))
     }
 
     /// Re-walk a held event's keys: a mutation makes its hold-time keys stale,
@@ -377,81 +247,63 @@ impl GateBackend {
         }
     }
 
-    /// Gate every process in the SUT tree (runc and runc init are two tgids),
-    /// child cgroups included (runc init moves into the container's cgroup,
-    /// placed under ours). A gated process can't fork, so re-reading the
-    /// cgroup until no new tgid shows up catches children forked mid-sweep.
-    // ponytail: a tgid forking in the kick's IPI latency after the final read
-    // escapes, like the userspace round trip between a trap and its gate; a
-    // gate set in-kernel, in the trapping task's own context, would close both.
+    /// Stop every task of the SUT tree: every process it has forked (runc and
+    /// runc init), in whatever cgroup, and every one it forks from here on.
+    // ponytail: a task on a CPU runs on until its CPU takes the preempting
+    // IPI, like the userspace round trip between a trap and this call; a gate
+    // set in the trapping task's own context would close both.
     pub fn gate_tree(&mut self) -> Result<()> {
-        loop {
-            let new: Vec<u32> = self.cgroup_ids("cgroup.procs")?.into_iter().filter(|t| !self.tree_gated.contains(t)).collect();
-            if new.is_empty() {
-                return Ok(());
-            }
-            for t in new {
-                self.gate.gate_tgid(t)?;
-                self.tree_gated.insert(t);
-            }
-            self.gate.kick()?;
-        }
+        self.gated = true;
+        self.gate.set_gate(true)
     }
 
     pub fn ungate_tree(&mut self) -> Result<()> {
-        // A clone in flight couldn't run while gated: restart its wait, or a
-        // long hold would make it look failed and leave its child unnamed.
-        if let Some((_, _, _, at)) = &mut self.in_flight {
-            *at = Instant::now();
-        }
-        for t in std::mem::take(&mut self.tree_gated) {
-            self.gate.ungate_tgid(t)?;
-        }
-        self.gate.kick()?;
+        self.gate.set_gate(false)?;
+        self.gated = false;
         Ok(())
     }
 
-    /// Tgids (`cgroup.procs`) or tids (`cgroup.threads`) of the SUT tree. Each
-    /// lists only its own cgroup's members, so read every cgroup in the subtree.
-    fn cgroup_ids(&self, file: &str) -> Result<BTreeSet<u32>> {
-        let mut ids = BTreeSet::new();
-        for dir in cgroup_dirs(&self.cgroup) {
-            match fs::read_to_string(dir.join(file)) {
-                Ok(list) => ids.extend(list.lines().filter_map(|l| l.parse::<u32>().ok())),
-                // A child cgroup removed mid-walk had no members left.
-                Err(e) if dir != self.cgroup && e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(ids)
+    /// Threads of the tree, `held` aside, asleep in a syscall that ends on a
+    /// timer: they wake on their own, so a frontier that is complete now need
+    /// not stay so (the determinism claim leaves them out).
+    pub fn sleepers(&self, held: &[Event]) -> u32 {
+        let tasks = |tgid: u32| fs::read_dir(format!("/proc/{tgid}/task")).into_iter().flatten().flatten();
+        let tids = self.gate.members().into_iter().flat_map(tasks).filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok());
+        tids.filter(|t| !held.iter().any(|e| e.tid == *t) && fs::read_to_string(format!("/proc/{t}/syscall")).is_ok_and(|s| timed(&s))).count() as u32
+    }
+}
+
+/// `/proc/<tid>/syscall` (`nr arg0..arg5 sp pc`, or `running`, or `-1 ...`
+/// outside a syscall) is a sleep that a timer ends: a nanosleep, or a ppoll,
+/// epoll wait or futex wait (how Go parks a timed sleep) with a timeout.
+fn timed(syscall: &str) -> bool {
+    let mut f = syscall.split_whitespace();
+    let Some(nr) = f.next().and_then(|n| n.parse::<i64>().ok()) else { return false };
+    let a: Vec<u64> = f.take(6).filter_map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok()).collect();
+    let arg = |i: usize| a.get(i).copied().unwrap_or(0);
+    match nr {
+        libc::SYS_nanosleep | libc::SYS_clock_nanosleep => true,
+        libc::SYS_ppoll => arg(2) != 0,
+        // A timeout in ms; -1 waits forever.
+        libc::SYS_epoll_pwait => arg(3) as i32 >= 0,
+        libc::SYS_epoll_pwait2 => arg(3) != 0,
+        // FUTEX_WAIT (0) or FUTEX_WAIT_BITSET (9), under the PRIVATE and
+        // CLOCK_REALTIME flags.
+        libc::SYS_futex => matches!(arg(1) & 0x7f, 0 | 9) && arg(3) != 0,
+        _ => false,
     }
 }
 
 impl Drop for GateBackend {
     fn drop(&mut self) {
-        // Ungate before killing: a gated task can't run to act on SIGKILL, and
-        // would stall into sched_ext's 30 s watchdog.
-        let _ = self.gate.clear();
-        let _ = fs::write(self.cgroup.join("cgroup.kill"), "1");
+        // The root first, so it is ours to reap; then the rest of its tree.
+        let _ = self.gate.set_gate(false);
+        let _ = self.child.kill();
         let _ = self.child.wait();
-        remove_cgroup(&self.cgroup);
-    }
-}
-
-/// Wait up to 1 s for a killed `cgroup` to drain and remove it: reparented
-/// descendants are reaped by init. Children first: a cgroup with child
-/// cgroups can't be removed. False if it's still there.
-fn remove_cgroup(cgroup: &Path) -> bool {
-    for _ in 0..100 {
-        for dir in cgroup_dirs(cgroup).iter().rev() {
-            let _ = fs::remove_dir(dir);
+        if !self.gate.kill() {
+            eprintln!("run {}: tasks of the SUT tree are still alive", self.gate.run);
         }
-        if !cgroup.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    false
 }
 
 /// `<prefix><pid>-<n>` whose pid is gone: left by a crfuzz that died.
@@ -460,35 +312,14 @@ fn stale(name: &str, prefix: &str) -> bool {
     pid.is_some_and(|p| !Path::new(&format!("/proc/{p}")).exists())
 }
 
-/// At startup: kill and remove the run cgroups of crfuzz processes that died
-/// without dropping their GateBackend; report, never remove, their canaries
-/// (evidence, and maybe mounts: see `Canary`'s Drop). Old-format `run-<epoch>`
-/// dirs are left alone. A live owner's runs are never touched: several crfuzz
-/// processes can share one daemon.
-// ponytail: a dead owner's pid reused by a live process keeps its stale
-// cgroup until that pid exits.
+/// At startup: end the runs of crfuzz processes that died without dropping
+/// their GateBackend (`gate::sweep`; no scheduler: nothing to end) and remove
+/// their private copies; report, never remove, their canaries (evidence, and
+/// maybe mounts: see `Canary`'s Drop).
 pub fn sweep() {
     let names = |dir: &str| fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok());
-    let mut left = 0;
-    for n in names(CGROUP_ROOT).filter(|n| stale(n, "run-")) {
-        let cg = Path::new(CGROUP_ROOT).join(n);
-        // Ungate before killing, as Drop does: a run that died in a tree hold
-        // left its gate entries, and cgroup.kill can't take a gated task. By
-        // member tgid, not by epoch: epochs restart with each load, so a live
-        // run may share the name's. No scheduler: no pins, nothing gated.
-        let tgids: Vec<u32> = cgroup_dirs(&cg)
-            .iter()
-            .filter_map(|d| fs::read_to_string(d.join("cgroup.procs")).ok())
-            .flat_map(|l| l.lines().filter_map(|t| t.parse().ok()).collect::<Vec<_>>())
-            .collect();
-        let _ = crate::gate::ungate_tgids(&tgids);
-        let _ = fs::write(cg.join("cgroup.kill"), "1");
-        if !remove_cgroup(&cg) {
-            left += 1;
-        }
-    }
-    if left > 0 {
-        eprintln!("{left} stale run cgroups left in {CGROUP_ROOT}");
+    if let Ok(left @ 1..) = crate::gate::sweep() {
+        eprintln!("{left} stale runs still have tasks alive");
     }
     // A dead crfuzz's `--private` copies (run.rs: work/<pid>): no evidence there.
     let work = format!("{}/work", oracle::ROOT);
@@ -1058,19 +889,6 @@ fn notif_continue(fd: RawFd, id: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `root` and every cgroup below it, parents before children.
-pub(crate) fn cgroup_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![root.to_path_buf()];
-    let mut i = 0;
-    while i < dirs.len() {
-        if let Ok(rd) = fs::read_dir(&dirs[i]) {
-            dirs.extend(rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()));
-        }
-        i += 1;
-    }
-    dirs
-}
-
 /// Classic BPF: USER_NOTIF for `watched` syscalls on our arch, ALLOW otherwise.
 // ponytail: x32 syscall numbers (x86_64 | 0x40000000) are allowed unwatched.
 fn notify_filter(watched: &[i64]) -> Vec<libc::sock_filter> {
@@ -1248,6 +1066,12 @@ fn proc_link(tid: u32, at: &Path, target: PathBuf) -> Option<PathBuf> {
     }
 }
 
+fn read_tgid(tid: u32) -> Result<u32> {
+    let status = fs::read_to_string(format!("/proc/{tid}/status"))?;
+    let line = status.lines().find_map(|l| l.strip_prefix("Tgid:")).context("no Tgid")?;
+    Ok(line.trim().parse()?)
+}
+
 /// NUL-terminated string at `addr` in `tid`'s memory.
 fn read_cstr(tid: u32, addr: u64) -> Option<PathBuf> {
     const PAGE: u64 = 4096;
@@ -1270,12 +1094,6 @@ fn read_cstr(tid: u32, addr: u64) -> Option<PathBuf> {
         at += n as u64;
     }
     None
-}
-
-fn read_tgid(tid: u32) -> Result<u32> {
-    let status = fs::read_to_string(format!("/proc/{tid}/status"))?;
-    let line = status.lines().find_map(|l| l.strip_prefix("Tgid:")).context("no Tgid")?;
-    Ok(line.trim().parse()?)
 }
 
 /// Async-signal-safe: runs between fork and exec.
@@ -1325,6 +1143,18 @@ fn recv_fd(sock: RawFd) -> Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timed_sleeps() {
+        let line = |nr: i64, args: [u64; 6]| format!("{nr} {} 0xffff0000 0xaaaa0000", args.map(|a| format!("{a:#x}")).join(" "));
+        assert!(timed(&line(libc::SYS_nanosleep, [1, 0, 0, 0, 0, 0])));
+        assert!(timed(&line(libc::SYS_ppoll, [1, 1, 0x1000, 0, 0, 0])) && !timed(&line(libc::SYS_ppoll, [1, 1, 0, 0, 0, 0])));
+        assert!(timed(&line(libc::SYS_epoll_pwait, [3, 1, 8, 100, 0, 0])) && !timed(&line(libc::SYS_epoll_pwait, [3, 1, 8, 0xffff_ffff, 0, 0])));
+        // FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG with and without a timeout; a wake.
+        assert!(timed(&line(libc::SYS_futex, [1, 137, 0, 0x1000, 0, 0])) && !timed(&line(libc::SYS_futex, [1, 137, 0, 0, 0, 0])));
+        assert!(!timed(&line(libc::SYS_futex, [1, 129, 1, 0x1000, 0, 0])));
+        assert!(!timed(&line(libc::SYS_read, [0, 1, 1, 0, 0, 0])) && !timed("running") && !timed("-1 0xffff0000 0xaaaa0000"));
+    }
 
     #[test]
     fn filter_jumps_land_on_ret() {
@@ -1443,7 +1273,7 @@ mod tests {
         let (path, k) = observe(tid, libc::SYS_chdir, &[f.as_ptr() as u64, 0, 0, 0, 0, 0]);
         assert_eq!(path.as_deref(), Some(d.join("f").as_path()));
         assert!(k.all, "chdir orders against everything");
-        assert!(observe(tid, libc::SYS_clone, &[0; 6]).1.all, "undecoded");
+        assert!(observe(tid, libc::SYS_exit_group, &[0; 6]).1.all, "undecoded");
 
         // symlinkat(target, dirfd, linkpath): writes the link's name, never resolves the target.
         let (path, k) = observe(tid, libc::SYS_symlinkat, &[tgt.as_ptr() as u64, at, new.as_ptr() as u64, 0, 0, 0]);

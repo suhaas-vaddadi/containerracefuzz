@@ -159,8 +159,8 @@ fn hms(s: f64) -> String {
     if s >= 3600 { format!("{}h{:02}m", s / 3600, s / 60 % 60) } else if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
 }
 
-fn hold(thread: &str, nr: i64, p: &Option<PathBuf>) -> String {
-    format!("({thread} {nr} {})", p.as_deref().map_or("-".into(), |p| p.display().to_string()))
+fn hold(nr: i64, p: &Option<PathBuf>) -> String {
+    format!("({nr} {})", p.as_deref().map_or("-".into(), |p| p.display().to_string()))
 }
 
 fn partial(log: &[Decision]) -> usize {
@@ -268,7 +268,7 @@ impl<'a> Sweep<'a> {
                 "-" => None,
                 g => {
                     let id = &g.parse().ok().and_then(|g: usize| s.steps.get(g)).with_context(|| format!("{}/guilty: not a step", f.display()))?.id;
-                    Some((id.thread.clone(), id.nr, id.path.clone()))
+                    Some((id.nr, id.path.clone()))
                 }
             };
             let seeds: Vec<String> = read(&f.join("seeds"))?.lines().filter(|l| of_complete(l, ':')).map(String::from).collect();
@@ -390,10 +390,10 @@ impl<'a> Sweep<'a> {
                             Ok(Confirmed::Yes(g)) => {
                                 let id = g.map(|g| &s.steps[g].id);
                                 row.note = match (g, id) {
-                                    (Some(g), Some(id)) => format!("guilty step {g} {}", hold(&id.thread, id.nr, &id.path)),
+                                    (Some(g), Some(id)) => format!("guilty step {g} {}", hold(id.nr, &id.path)),
                                     _ => "needs more than one hold".into(),
                                 };
-                                found.push((Dedup { guilty: id.map(|id| (id.thread.clone(), id.nr, id.path.clone())), findings: s.findings.clone() }, vec![format!("{seed}:{k}")]));
+                                found.push((Dedup { guilty: id.map(|id| (id.nr, id.path.clone())), findings: s.findings.clone() }, vec![format!("{seed}:{k}")]));
                                 let f = c.dir.join(format!("findings/{}", found.len()));
                                 fs::create_dir_all(&f)?;
                                 fs::write(f.join("schedule"), s.to_string())?;
@@ -573,7 +573,7 @@ pub fn run(c: Campaign) -> Result<i32> {
     }
     println!("findings: {}", found.len());
     for (i, (d, runs)) in found.iter().enumerate() {
-        let guilty = d.guilty.as_ref().map_or("needs more than one hold".into(), |(t, nr, p)| hold(t, *nr, p));
+        let guilty = d.guilty.as_ref().map_or("needs more than one hold".into(), |(nr, p)| hold(*nr, p));
         println!("finding #{}: {} runs, guilty {guilty}, {:?}, {}", i + 1, runs.len(), d.findings, dir.join(format!("findings/{}", i + 1)).display());
     }
     Ok(if stopped { 130 } else if lost { 1 } else if found.is_empty() { 0 } else { 3 })

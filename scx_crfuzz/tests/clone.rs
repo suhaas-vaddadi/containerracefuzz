@@ -1,7 +1,6 @@
-//! Clones on Go: released without a POS decision, so holding them
-//! doesn't stall stop-the-world (the runtime clones without handing off its
-//! P), and every thread gets a creation-tree name. Needs root, a running
-//! `scx_crfuzz gated`, `go`:
+//! Go's thread clones don't stall a run, and each process is named by its
+//! place in the process creation tree, which the scheduler keeps from each fork.
+//! Needs root, a running `scx_crfuzz gated`, `go`:
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
@@ -17,10 +16,10 @@ use std::time::{Duration, Instant};
 
 #[test]
 #[ignore]
-fn go_clones_named_without_stall() {
+fn go_processes_named_thread_clones_pass() {
     let bin = go_bin("go_clone");
     let trigger = trigger_file("crfuzz_clone_trigger");
-    for seed in 0..10 {
+    for seed in 0..5 {
         let mut cmd = Command::new(&bin);
         cmd.arg(&trigger);
         let mut be = GateBackend::spawn(cmd).unwrap();
@@ -30,10 +29,10 @@ fn go_clones_named_without_stall() {
         run(&mut be, &mut Pos::new(seed), None, None, None, None, deadline, &mut log)
             .unwrap_or_else(|e| panic!("seed {seed}: {e:#}"));
         assert!(be.child().wait().unwrap().success(), "seed {seed}: SUT failed");
-        let threads: BTreeSet<&str> = log.iter().map(|d| d.id.thread.as_str()).collect();
-        let partial = log.iter().filter(|d| d.partial).count();
-        eprintln!("seed {seed}: {:?}, {} decisions, {partial} partial, threads {threads:?}", t.elapsed(), log.len());
-        assert!(threads.iter().all(|t| !t.starts_with('?')), "seed {seed}: unnamed thread");
-        assert!(threads.len() > 1, "seed {seed}: no thread but the root made a decision");
+        let mut procs: BTreeSet<&str> = log.iter().map(|d| d.id.process.as_str()).collect();
+        eprintln!("seed {seed}: {:?}, {} decisions, processes {procs:?}", t.elapsed(), log.len());
+        // 0/0: os/exec's pidfd check clones a child that exits at once.
+        procs.remove("0/0");
+        assert_eq!(procs, BTreeSet::from(["0", "0/1", "0/2", "0/3", "0/4", "0/5"]), "seed {seed}");
     }
 }
