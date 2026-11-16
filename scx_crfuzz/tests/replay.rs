@@ -4,12 +4,18 @@
 //!   sudo env PATH=$PATH <test-binary> --ignored --test-threads=1 --nocapture
 #![cfg(target_os = "linux")]
 
+use scx_crfuzz::backend::GateBackend;
+use scx_crfuzz::engine::{project, run, End, Replay};
+use scx_crfuzz::pos::Pos;
+use scx_crfuzz::schedule::Fixed;
 use std::fs;
 use std::os::unix::fs::{chown, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const D: &str = "/tmp/crfuzz_replay";
+const S: &str = "/tmp/crfuzz_scope";
 
 /// crfuzz's stdout; fails unless it exits `code`. Removes the canaries it kept.
 fn crfuzz(args: &[&str], code: i32) -> String {
@@ -79,5 +85,64 @@ fn discover_confirm_minimize() {
     assert!(again.lines().any(|l| l.starts_with("Decision {")), "-v: {again}");
     // The guilty hold is one of the SUT's own on `p`.
     assert!(guilty[0].contains(p_s), "{}", guilty[0]);
+    fs::remove_dir_all(d).unwrap();
+}
+
+/// Only the holds in scope are held, recorded and ordered: the root's first
+/// `cat` opens another file outside it than discovery's, and the sleeps are
+/// swapped, so in/b is held while the expected in/a's process sleeps (the
+/// late wait). The root no longer waits for them, but its exit_group, where
+/// the oracle probes, keeps its recorded place after both.
+#[test]
+#[ignore]
+fn scoped_replay_waits_for_late_steps() {
+    let d = Path::new(S);
+    let _ = fs::remove_dir_all(d);
+    fs::create_dir_all(d.join("in")).unwrap();
+    for f in ["in/a", "in/b", "x", "y"] {
+        fs::write(d.join(f), "").unwrap();
+    }
+    let once = |args: [&str; 4], scope: &[PathBuf], replay: Option<&mut Replay>| {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "cat $0/$3; (sleep $1; cat $0/in/a) & (sleep $2; cat $0/in/b) & $4", S]).args(args);
+        let mut be = GateBackend::spawn(cmd, scope).unwrap();
+        let mut log = Vec::new();
+        let end = run(&mut be, &mut Pos::new(0), &[], None, None, replay, None, Instant::now() + Duration::from_secs(10), &mut log).unwrap();
+        (end, log)
+    };
+    let scope = [d.join("in")];
+    let (end, log) = once(["0", "0.3", "x", "wait"], &scope, None);
+    assert!(matches!(end, End::Exited), "{end:?}");
+    let steps = project(&log);
+    let paths: Vec<_> = steps.iter().filter_map(|s| s.id.path.as_deref()).collect();
+    assert_eq!(paths, [d.join("in/a"), d.join("in/b")], "nothing out of scope is a step");
+    let replay = |scope: &[PathBuf]| {
+        let mut r = Replay { fixed: Fixed { steps: &steps, next: 0, deadline: false }, only: None, diverged: None };
+        once(["0.3", "0", "y", ":"], scope, Some(&mut r))
+    };
+    let (end, log) = replay(&scope);
+    assert!(matches!(end, End::Exited), "{end:?}");
+    let order: Vec<_> = log.iter().filter(|e| e.id.path.as_deref() == Some(&d.join("in/b")) || (e.id.process == "0" && e.id.nr == libc::SYS_exit_group)).map(|e| e.id.nr).collect();
+    assert_eq!(order, [libc::SYS_openat, libc::SYS_exit_group], "the root's exit waits for the late in/b");
+    let end = replay(&[]).0;
+    assert!(matches!(end, End::Diverged(_)), "unscoped, everything else is held and diverges: {end:?}");
+    fs::remove_dir_all(d).unwrap();
+}
+
+/// A relative path from a cwd below a scope directory is in scope.
+#[test]
+#[ignore]
+fn scope_holds_relative_paths_below_it() {
+    let d = Path::new(S);
+    let _ = fs::remove_dir_all(d);
+    fs::create_dir_all(d.join("in/sub")).unwrap();
+    fs::write(d.join("in/sub/f"), "").unwrap();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "cd $0/in/sub && cat f", S]);
+    let mut be = GateBackend::spawn(cmd, &[d.join("in")]).unwrap();
+    let mut log = Vec::new();
+    let end = run(&mut be, &mut Pos::new(0), &[], None, None, None, None, Instant::now() + Duration::from_secs(10), &mut log).unwrap();
+    assert!(matches!(end, End::Exited), "{end:?}");
+    assert!(log.iter().any(|e| e.id.path.as_deref() == Some(Path::new("f"))), "cat's open of f is held");
     fs::remove_dir_all(d).unwrap();
 }

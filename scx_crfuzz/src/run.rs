@@ -228,7 +228,7 @@ impl Runner {
         let mut sut = Command::new(prog);
         sut.args(rest);
         stdio(&mut sut)?;
-        let mut be = GateBackend::spawn(sut)?;
+        let mut be = GateBackend::spawn(sut, &self.cfg.scope)?;
         let mut j = Judge { canary: &canary, alice: self.alice.clone(), reached: None, task: None };
         let until = Instant::now().checked_add(Duration::from_secs(self.cfg.timeout)).context("--timeout too large")?;
         let end = engine::run(&mut be, &mut Pos::new(seed), &self.dirs, mutator, target, replay, Some(&mut j), until, log);
@@ -278,9 +278,9 @@ impl Runner {
     }
 
     /// A seed's baseline, which must leak nothing. Its targets are its holds
-    /// with a known path, decoded keys and a named process, with `--scope`
-    /// only those under a scope directory, one per (callsite, syscall, path,
-    /// occurrence): the engine matches those in any process. None: stopped.
+    /// with a known path, decoded keys and a named process, one per
+    /// (callsite, syscall, path, occurrence): the engine matches those in any
+    /// process. With `--scope`, every hold is in scope. None: stopped.
     pub fn baseline(&self, seed: u64, out: Option<&Path>, log: &mut Vec<Decision>) -> Result<Option<Baseline>> {
         log.clear();
         let t = Instant::now();
@@ -289,12 +289,10 @@ impl Runner {
             b.canary.keep(); // the evidence
             bail!("invalid: the scenario leaks with no mutation: {:?}", b.found);
         }
-        // The scope dirs as events name them (`name::event_path`): `<dir{i}>`.
-        let in_scope = |p: &Path| self.cfg.scope.is_empty() || (0..self.cfg.scope.len()).any(|i| p.starts_with(format!("<dir{i}>")));
         let mut seen = HashSet::new();
         let targets = log
             .iter()
-            .filter(|d| d.id.path.as_deref().is_some_and(in_scope) && !d.keys.all && !d.id.process.starts_with('?'))
+            .filter(|d| d.id.path.is_some() && !d.keys.all && !d.id.process.starts_with('?'))
             .filter(|d| seen.insert((d.id.callsite, d.id.nr, d.id.path.clone(), d.id.n)))
             .map(|d| d.id.clone())
             .collect();

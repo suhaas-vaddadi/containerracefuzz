@@ -22,7 +22,7 @@ fn ms(n: u64) -> Duration {
 /// Spawn the SUT with stdout counted byte-by-byte.
 fn spawn_counted(mut cmd: Command) -> (GateBackend, Arc<AtomicU64>) {
     cmd.stdout(Stdio::piped());
-    let mut be = GateBackend::spawn(cmd).unwrap();
+    let mut be = GateBackend::spawn(cmd, &[]).unwrap();
     let mut out = be.child().stdout.take().unwrap();
     let bytes = Arc::new(AtomicU64::new(0));
     let b = bytes.clone();
@@ -205,7 +205,7 @@ fn sweep_kills_only_dead_owners_runs() {
     assert!(alive(sut), "the SUT died with its owner: nothing to sweep");
     let mut cmd = Command::new("sleep");
     cmd.arg("60");
-    let mut live = GateBackend::spawn(cmd).unwrap();
+    let mut live = GateBackend::spawn(cmd, &[]).unwrap();
     scx_crfuzz::backend::sweep();
     assert!(!alive(sut), "a dead owner's SUT survived the sweep");
     assert!(live.child().try_wait().unwrap().is_none(), "a live owner's SUT was swept");

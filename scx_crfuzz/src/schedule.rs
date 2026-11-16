@@ -128,7 +128,11 @@ pub fn tolerated(only: Option<usize>, d: &Divergence) -> bool {
 }
 
 /// The fixed-schedule policy, POS's replacement in a replay: release the
-/// recorded steps in order.
+/// recorded steps in order. With `--scope` the steps are the events in scope,
+/// and so are the events a replay is handed: the rest pass unheld in both.
+/// Out of scope, a Go runtime's goroutines block on each other between holds
+/// (mutexes, channels) in a different order every run, so no total order of
+/// them replays; the outcome turns on the events in scope.
 pub struct Fixed<'a> {
     pub steps: &'a [Step],
     /// Steps released so far.
@@ -188,7 +192,8 @@ pub struct Config {
     pub timeout: u64,
     /// `--private` directories, absolute: each run sees its own copy.
     pub private: Vec<PathBuf>,
-    /// `--scope` directories, absolute: only holds under one become windows.
+    /// `--scope` directories, absolute: only events that resolve through one
+    /// are held (and so ordered, mutated and recorded).
     pub scope: Vec<PathBuf>,
     /// The `CRFUZZ_*` environment at `run` time (the layout's, SUT's and
     /// mutator's inputs): `replay` sets it again.
@@ -323,7 +328,7 @@ fn unesc_str(s: &str) -> Result<String> {
 
 impl std::fmt::Display for Schedule {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "crfuzz-schedule 3\nseed {}\n{}", self.seed, self.cfg)?;
+        write!(f, "crfuzz-schedule 4\nseed {}\n{}", self.seed, self.cfg)?;
         writeln!(f, "outcome {}", self.class)?;
         if self.deadline {
             writeln!(f, "deadline")?;
@@ -352,7 +357,7 @@ impl std::str::FromStr for Schedule {
 
     fn from_str(text: &str) -> Result<Self> {
         let mut lines = text.lines();
-        ensure!(lines.next() == Some("crfuzz-schedule 3"), "not a crfuzz schedule version 3 (older versions named events without their callsite: rerun discovery)");
+        ensure!(lines.next() == Some("crfuzz-schedule 4"), "not a crfuzz schedule version 4 (older versions also recorded the events out of scope, which now pass unheld: rerun discovery)");
         let mut s = Schedule { seed: 0, cfg: Config::default(), class: Class::Invalid, deadline: false, findings: BTreeSet::new(), steps: vec![] };
         for (i, line) in lines.enumerate() {
             let w: Vec<&str> = line.split(' ').collect();
@@ -531,9 +536,9 @@ mod tests {
 
     #[test]
     fn older_schedules_refused() {
-        for v in 1..3 {
+        for v in 1..4 {
             let e = format!("crfuzz-schedule {v}\nseed 0\nattacker 1:1\ntimeout 30\ncmd /bin/true\noutcome Clean\n").parse::<Schedule>().unwrap_err().to_string();
-            assert!(e.contains("version 3"), "{e}");
+            assert!(e.contains("version 4"), "{e}");
         }
     }
 

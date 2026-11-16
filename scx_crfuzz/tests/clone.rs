@@ -23,7 +23,7 @@ fn go_processes_named_thread_clones_pass() {
     for seed in 0..5 {
         let mut cmd = Command::new(&bin);
         cmd.arg(&trigger);
-        let mut be = GateBackend::spawn(cmd).unwrap();
+        let mut be = GateBackend::spawn(cmd, &[]).unwrap();
         let t = Instant::now();
         let deadline = t + Duration::from_secs(60);
         let mut log = Vec::new();

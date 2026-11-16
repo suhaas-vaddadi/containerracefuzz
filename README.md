@@ -202,8 +202,8 @@ ELF64 executable, no interpreter).
 sudo target/release/scx_crfuzz containerd --seeds 2
 ```
 
-A run takes about 2.5 s and a seed has about 50 windows, so two seeds take
-about 4 minutes (measured on a 6-CPU VM).
+A run takes about 1 s and a seed has about 150 windows, so two seeds take
+about 5 minutes (measured on a 6-CPU VM).
 
 ```
 scx_crfuzz containerd [--dir D] [--image BUSYBOX] [--attacker UID:GID]
@@ -236,7 +236,9 @@ run D/campaign --attacker A [your flags] \
   --mutator D/mut/mutator_all --layout D/layout.sh --scope D/rootfs -- D/sut.sh
 ```
 
-The results are in `D/campaign`, laid out like any `run` directory.
+The results are in `D/campaign`, laid out like any `run` directory. The scope
+is the rootfs by inode, so the container's own path syscalls (`/bin/sh`,
+after `pivot_root`) are in it as well as the runtime's on `D/rootfs/...`.
 
 The mutator reads these variables from the environment, all optional:
 `CRFUZZ_PRIMITIVE` (`swap`, `dangling` or `pivot` for that primitive only,
@@ -316,7 +318,7 @@ use `run DIR --seeds 1 --first-seed S -v`.
 | `--private DIR` | Repeatable. Give each worker its own copy of DIR. Name every directory the runs write: the layout's target, the SUT's state, the mutator's playground. Recorded in the schedule, so `replay` sets it up again. See [Parallel seeds](#parallel-seeds). |
 | `--mutator PROG` | Runs at one window's hold per run, as alice, inside the held task's namespaces, root and cwd. It gets the path as `argv[1]` and `CRFUZZ_PATH`, plus `CRFUZZ_SYSCALL`, `CRFUZZ_SEED` and `CRFUZZ_CANARY`. `CRFUZZ_CANARY` is this run's canary directory. Find the canary there, never by listing `/var/lib/crfuzz`, which at `--jobs` > 1 holds other workers' canaries. PROG must exist inside the task's root, and a script needs a `#!` line. It is killed after 15 s. A failure is logged, never a finding. |
 | `--layout PROG` | Runs as root before **every** run (baseline, discovery, confirm, each minimization) to restore the starting filesystem. If it fails, the run is invalid. |
-| `--scope DIR` | Repeatable. Only holds whose absolute path is under one of the DIRs (where the attacker can act) become windows. Default: every hold with a path. |
+| `--scope DIR` | Repeatable. Only the path syscalls that resolve through one of the DIRs (where the attacker can act) are held: they become windows, are ordered by POS, and are recorded and replayed. Every other one runs on as it traps, in discovery and replay alike. A DIR is matched by inode, so a path reaches it however it is spelled: relative, through a dirfd or a symlink, or from inside a container whose rootfs it is. The root process's `exit_group` is always held (the oracle probes there). Recorded in the schedule. Default: every watched syscall is held. |
 | `--timeout SECS` | End a run still going after SECS (1 to 30, default 30) as a `RuntimeError`. Recorded in the schedule, and `replay` uses it. |
 | `-v` | Print every run's decision log (baseline, discovery, confirm, minimize). Without it, no decision log is printed, and a `replay` that fails says to rerun with `-v`. |
 
@@ -520,7 +522,7 @@ arguments, bytes outside printable ASCII, space and `%` are written as `%XX`.
 An empty string is a lone `%`.
 
 ```
-crfuzz-schedule 3
+crfuzz-schedule 4
 seed 0
 attacker 65534:65534
 mutator /tmp/q/swap.sh            optional
@@ -538,16 +540,17 @@ step 1 0 9d022069a13f27bb 79 0 /tmp/q/alice/p
 ```
 
 The lines from `attacker` to `cmd` are the run's configuration, the same
-lines as `DIR/config`. Older versions named events without their callsite
-and are refused.
+lines as `DIR/config`. There is one `step` per held event: with `--scope`,
+the events in scope and the root's `exit_group`. Version 3 schedules also
+recorded the events out of scope and are refused.
 
 ## How it works
 
 ```
  CMD (SUT) ──seccomp-notify──▶ GateBackend ──▶ engine loop ──▶ oracle
    │  held at path syscalls      │ gate tree      │ POS or        │ canary +
-   │  its tree tracked           │ (sched_ext)    │ fixed         │ probe as
-   └─ in SCHED_EXT               │ while mutator  │ schedule      │ alice
+   │  in scope; its tree         │ (sched_ext)    │ fixed         │ probe as
+   └─ tracked in SCHED_EXT       │ while mutator  │ schedule      │ alice
                                  ▼ runs           ▼               ▼
                            mutator (as alice)   decision log ─▶ schedule file
 ```
@@ -557,11 +560,12 @@ and are refused.
    The scheduler adds every process forked below it (a `sched_process_fork`
    hook), whatever cgroup, session or namespace it moves to. A seccomp
    filter turns each watched path syscall into a user notification, and the
-   thread sleeps until it is answered. The filter is installed without
-   `NO_NEW_PRIVS` (root may), so what the SUT execs keeps its setuid bits,
-   file capabilities and LSM transitions, as outside crfuzz. While the
-   mutator runs, the scheduler refuses to run any task of the tree, so
-   nothing moves.
+   thread sleeps until it is answered. One whose path does not resolve
+   through a `--scope` directory is answered at once. The filter is
+   installed without `NO_NEW_PRIVS` (root may), so what the SUT execs keeps
+   its setuid bits, file capabilities and LSM transitions, as outside crfuzz. While the mutator
+   runs, the scheduler refuses to run any task of the tree, so nothing
+   moves.
 2. **Readout** (`sensor.rs`). The scheduler counts the tree's tasks that are
    runnable or being woken (`ops.runnable` and `ops.quiescent`, plus the
    `sched_waking` and `sched_wakeup` tracepoints for a wakeup in flight to
@@ -595,16 +599,17 @@ and are refused.
    mount point. Afterwards the canary is compared with its starting state.
 6. **Replay and minimization** (`schedule.rs`). Discovery's decisions become
    a schedule. Replay releases the recorded event at each step instead of
-   POS's pick. An event differing from the step only in occurrence (another
-   goroutine of the same code) stands in for it, under the step's name and
-   mutator seed. A step not yet held when every other thread is waits up to
-   1 s for its thread (asleep in a syscall we don't watch). A missing or
-   extra held event is a **divergence**. A Violation is *confirmed* when the
-   replay gives the same outcome class and the same normalized findings
-   (with the canary directory, pids and fd numbers stripped). Minimization
-   replays once per mutated step, with only that mutation on, and reports
-   the **first** step whose run still flags one of the findings: the guilty
-   hold.
+   POS's pick. Events out of scope are never held, so they are in no
+   schedule. An event differing from the step only in
+   occurrence (another goroutine of the same code) stands in for it, under
+   the step's name and mutator seed. A step not yet held when every other
+   thread is waits up to 1 s for its thread (asleep in a syscall we don't
+   watch). A missing or extra held event is a **divergence**. A
+   Violation is *confirmed* when the replay gives the same outcome class and
+   the same normalized findings (with the canary directory, pids and fd
+   numbers stripped). Minimization replays once per mutated step, with only
+   that mutation on, and reports the **first** step whose run still flags one
+   of the findings: the guilty hold.
 7. **Campaign** (`campaign.rs`, `run.rs`). Seeds `S..S+N` run, each with its baseline and
    windows, `--jobs` of them at once. A Violation whose findings and guilty
    `(syscall, path)` match a known finding is counted against it
@@ -631,9 +636,12 @@ a timed sleep` (some thread of the tree was in a `nanosleep`, or in a
 Two goroutines running the same code (one callsite) on one path in one
 process share a counter, so which is occurrence 0 depends on arrival; a
 replay lets either stand in for the other. A process forking from two
-threads at once numbers its children in arrival order. POS priorities hash
-the event name (`pos.rs`), so a seed gives a different order than under
-versions before callsites, and their schedules are refused.
+threads at once numbers its children in arrival order. Out of scope, a Go
+runtime's goroutines block on each other between holds (mutexes, channels)
+in an order no total order of holds can reproduce, which is why only the
+events in scope are held. POS priorities hash the event name (`pos.rs`), so
+a seed gives a different order than under versions before callsites, and
+their schedules are refused.
 
 ### Why a scheduler and not the cgroup freezer
 
@@ -670,7 +678,7 @@ scx_crfuzz/                the scx_crfuzz crate
   build.rs                 builds the BPF skeleton and the static containerd mutator
   src/bpf/main.bpf.c       the gate scheduler: gates, counts, tracks and names a run's tree
   src/gate.rs              loads the gate scheduler; GateMap, a run's client for it
-  src/backend.rs           seccomp-notify hold, tree gate, mutator and probe
+  src/backend.rs           seccomp-notify hold, scope, tree gate, mutator and probe
   src/sensor.rs            the frontier: the scheduler's count, read around a drain
   src/name.rs              event identity: path normalization, callsite
   src/pos.rs               conflict keys, POS
@@ -723,6 +731,10 @@ cli, campaign and gate.
   that class (`sched_setscheduler`), the run ends invalid when it next
   traps. The scheduler tracks 65536 processes over all runs; past that, a
   run ends invalid too.
+- A `--scope` directory is matched by the inode it has when a run starts. If
+  the SUT or the mutator replaces the directory itself during the run, later
+  events under the new one are out of scope. With `--scope`, an event whose
+  path can't be read or walked is out of scope.
 - A process more than 16 generations below the root has no stable name
   (`?<tgid>`).
 - For `run`, the mutator is yours: no default primitives ship with `run`.

@@ -28,7 +28,8 @@ pub enum Frontier {
 /// Complete means the tree read quiet, then the listener was drained, then
 /// it read quiet again. Quiet first: a thread parks only after its
 /// notification is queued, so everything trapped by then is in the drain.
-/// Quiet after: nothing of the tree woke while it was drained.
+/// Quiet after: the drain lets syscalls out of scope run on, and a release
+/// counts its thread busy before it returns.
 pub fn wait_frontier(be: &mut GateBackend, held: &mut Vec<Event>, deadline: Instant, mut idle: bool) -> Result<Frontier> {
     loop {
         let quiet = be.quiet()?;
