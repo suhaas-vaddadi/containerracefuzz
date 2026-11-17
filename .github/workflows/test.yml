@@ -1,5 +1,9 @@
 name: test
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore: ['thesis/**', '.github/workflows/thesis.yml']
+  pull_request:
+    paths-ignore: ['thesis/**', '.github/workflows/thesis.yml']
 jobs:
   pure:
     # The pure layer (naming, POS, schedule). Everything else needs root on an
